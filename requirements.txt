@@ -1,0 +1,2 @@
+pyperclip>=1.8.2
+zeroconf>=0.131.0
