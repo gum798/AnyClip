@@ -36,6 +36,18 @@ def sha256_hex(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def get_local_ipv4() -> Optional[str]:
+    """Best-effort primary IPv4 of this host (the source IP for the default route)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
 @dataclass
 class Config:
     token: str
@@ -325,17 +337,22 @@ class MdnsBeacon:
         self._azc = AsyncZeroconf(ip_version=IPVersion.V4Only)
 
         instance = f"{self.config.name}-{self.node_id[:8]}.{SERVICE_TYPE}"
+        local_ip = get_local_ipv4()
+        addresses = [socket.inet_aton(local_ip)] if local_ip else []
+        server_host = f"anyclip-{self.node_id[:8]}.local."
         self._info = ServiceInfo(
             type_=SERVICE_TYPE,
             name=instance,
             port=self.config.port,
+            addresses=addresses,
+            server=server_host,
             properties={
                 "id": self.node_id,
                 "version": str(PROTOCOL_VERSION),
             },
         )
         await self._azc.async_register_service(self._info)
-        log.info(f"mDNS advertised as {instance!r}")
+        log.info(f"mDNS advertised as {instance!r} ip={local_ip} server={server_host}")
 
         self._browser = AsyncServiceBrowser(
             self._azc.zeroconf, [SERVICE_TYPE], handlers=[self._handler],
