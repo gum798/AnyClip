@@ -232,7 +232,7 @@ class PeerLink:
                 asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT,
             )
         except Exception as exc:
-            log.debug(f"connect to {host}:{port} failed: {exc}")
+            log.info(f"connect to {host}:{port} failed: {exc}")
             return
         log.debug(f"outbound connected to {host}:{port}")
         try:
@@ -328,7 +328,7 @@ class PeerLink:
             writer.write(data)
             await writer.drain()
         except Exception as exc:
-            log.debug(f"send failed: {exc}")
+            log.info(f"send failed (link likely down): {exc}")
 
     async def _recv(self, reader: asyncio.StreamReader) -> Optional[dict]:
         try:
@@ -430,7 +430,7 @@ class MdnsBeacon:
             log.info(f"discovered peer {name!r} at {host}:{port}")
             await self.on_peer(host, port)
         except Exception as exc:
-            log.debug(f"resolve failed: {exc}")
+            log.warning(f"peer resolve failed for {name!r}: {exc}")
 
     async def stop(self) -> None:
         try:
