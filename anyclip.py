@@ -447,6 +447,14 @@ class PeerLink:
             log.warning(f"bad json: {exc}")
             return None
 
+    async def close(self) -> None:
+        """Drop the active link if any. Safe to call multiple times."""
+        async with self._lock:
+            if self._writer is not None:
+                self._safe_close(self._writer)
+                self._writer = None
+                self._peer_node_id = None
+
     async def send_clip(self, text: str) -> None:
         writer = self._writer
         if writer is None or writer.is_closing():
@@ -609,6 +617,7 @@ async def run(config: Config) -> None:
             tasks.append(peer_keepalive(host, port, link))
         await asyncio.gather(*tasks)
     finally:
+        await link.close()
         await beacon.stop()
 
 
