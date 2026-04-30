@@ -175,18 +175,33 @@ class EchoSuppressor:
 
 
 class ClipboardWatcher:
+    READ_FAIL_WARN_AT = 5
+
     def __init__(self, poll_interval: float, on_change) -> None:
         self.poll_interval = poll_interval
         self.on_change = on_change
+        self._consec_read_fails = 0
+        self._read_fail_warned = False
         self._last: Optional[str] = self._safe_paste()
 
-    @staticmethod
-    def _safe_paste() -> Optional[str]:
+    def _safe_paste(self) -> Optional[str]:
         try:
-            return pyperclip.paste()
+            text = pyperclip.paste()
         except Exception as exc:
-            log.debug(f"clipboard read failed: {exc}")
+            self._consec_read_fails += 1
+            log.debug(f"clipboard read failed (#{self._consec_read_fails}): {exc}")
+            if (self._consec_read_fails >= self.READ_FAIL_WARN_AT
+                    and not self._read_fail_warned):
+                log.warning(
+                    f"clipboard read failing: {self._consec_read_fails} consecutive errors "
+                    f"(check OS clipboard permissions / pyperclip backend)"
+                )
+                self._read_fail_warned = True
             return None
+        if self._consec_read_fails:
+            self._consec_read_fails = 0
+            self._read_fail_warned = False
+        return text
 
     async def run(self) -> None:
         while True:
