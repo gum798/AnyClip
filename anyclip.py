@@ -77,6 +77,23 @@ def sha256_hex(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def parse_peer_arg(value: str) -> tuple[str, int]:
+    """Parse a --peer argument: 'host' or 'host:port'."""
+    if ":" in value:
+        host, _, port_s = value.rpartition(":")
+        try:
+            port = int(port_s)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid port in --peer {value!r}")
+    else:
+        host = value
+        port = DEFAULT_PORT
+    host = host.strip()
+    if not host:
+        raise argparse.ArgumentTypeError(f"empty host in --peer {value!r}")
+    return (host, port)
+
+
 def get_local_ipv4() -> Optional[str]:
     """Best-effort primary IPv4 of this host (the source IP for the default route)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,6 +113,7 @@ class Config:
     name: str
     poll_interval: float
     verbose: bool
+    peers: list  # list[tuple[str, int]]; manual fallback peers
 
 
 def parse_args() -> Config:
@@ -116,8 +134,13 @@ def parse_args() -> Config:
                         help="Display name for this node (default: hostname)")
     parser.add_argument("--poll", type=float, default=0.5,
                         help="Clipboard poll interval in seconds (default: 0.5)")
+    parser.add_argument("--peer", type=parse_peer_arg, action="append", default=[],
+                        metavar="HOST[:PORT]",
+                        help="Manual peer fallback. Repeatable; coexists with mDNS. "
+                             "Useful when mDNS is blocked (e.g. corporate Wi-Fi). "
+                             f"Default port: {DEFAULT_PORT}.")
     parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable DEBUG logging")
+                        help="Enable DEBUG logging on the console (file log is always DEBUG)")
     args = parser.parse_args()
     if not args.token:
         sys.stderr.write(
@@ -130,6 +153,7 @@ def parse_args() -> Config:
         name=args.name,
         poll_interval=max(0.1, args.poll),
         verbose=args.verbose,
+        peers=list(args.peer or []),
     )
 
 
@@ -450,6 +474,30 @@ class MdnsBeacon:
             pass
 
 
+async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
+    """Maintain an outbound connection to a manually-configured peer.
+
+    Coexists with mDNS-driven discovery: if the link is already active
+    (from either source), this just polls until it drops, then retries
+    with exponential backoff (1s -> 60s cap). Backoff resets after a
+    session that lasted >5s (treated as 'real' uptime).
+    """
+    backoff = 1.0
+    while True:
+        if link.active:
+            backoff = 1.0
+            await asyncio.sleep(2)
+            continue
+        start = time.monotonic()
+        await link.try_connect(host, port)
+        elapsed = time.monotonic() - start
+        if elapsed > 5.0:
+            backoff = 1.0
+            continue
+        await asyncio.sleep(min(backoff, 60))
+        backoff = min(backoff * 2, 60)
+
+
 async def run(config: Config) -> None:
     setup_logging(config.verbose)
     node_id = str(uuid.uuid4())
@@ -478,9 +526,14 @@ async def run(config: Config) -> None:
     beacon = MdnsBeacon(config, node_id, link.try_connect)
 
     log.info(f"AnyClip starting (node {node_id[:8]}, name={config.name!r})")
+    if config.peers:
+        log.info(f"manual peers: {[f'{h}:{p}' for h, p in config.peers]}")
     try:
         await beacon.start()
-        await asyncio.gather(link.serve(), watcher.run())
+        tasks = [link.serve(), watcher.run()]
+        for host, port in config.peers:
+            tasks.append(peer_keepalive(host, port, link))
+        await asyncio.gather(*tasks)
     finally:
         await beacon.stop()
 
