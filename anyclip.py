@@ -487,10 +487,20 @@ async def run(config: Config) -> None:
 
 def main() -> None:
     config = parse_args()
-    try:
-        asyncio.run(run(config))
-    except KeyboardInterrupt:
-        sys.stderr.write("\nshutting down\n")
+    backoff = 1.0
+    while True:
+        try:
+            asyncio.run(run(config))
+            return
+        except KeyboardInterrupt:
+            sys.stderr.write("\nshutting down\n")
+            return
+        except SystemExit:
+            raise
+        except Exception:
+            log.exception(f"daemon crashed; restarting in {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":
