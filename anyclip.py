@@ -16,6 +16,8 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional
 
 import pyperclip
@@ -30,6 +32,45 @@ HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
 
 log = logging.getLogger("anyclip")
+
+LOG_DIR = Path.home() / ".anyclip"
+LOG_FILE = LOG_DIR / "anyclip.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
+def setup_logging(verbose: bool) -> None:
+    """Configure root logger with a rotating file handler + console handler.
+
+    Idempotent: removes existing handlers first so supervisor restarts do
+    not stack duplicates. File handler is always DEBUG; console respects
+    --verbose.
+    """
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    formatter = logging.Formatter(fmt)
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.setLevel(logging.DEBUG)
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            str(LOG_FILE),
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        log.warning(f"file logging disabled: {exc}")
 
 
 def sha256_hex(data: str) -> str:
@@ -410,10 +451,7 @@ class MdnsBeacon:
 
 
 async def run(config: Config) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if config.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    setup_logging(config.verbose)
     node_id = str(uuid.uuid4())
     suppressor = EchoSuppressor()
 
