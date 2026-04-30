@@ -208,6 +208,48 @@ class ClipboardWatcher:
             log.warning(f"clipboard write failed: {exc}")
 
 
+class AuthGate:
+    """Per-IP cooldown after repeated handshake failures.
+
+    After ``MAX_FAILS`` failed handshakes from the same IP, that IP is
+    blocked for ``COOLDOWN`` seconds. A successful handshake clears the
+    counter. Stale entries (older than COOLDOWN) are swept lazily on
+    each check so the dict cannot grow unbounded.
+    """
+
+    MAX_FAILS = 5
+    COOLDOWN = 60.0
+
+    def __init__(self) -> None:
+        self._fails: dict = {}  # ip -> (count, last_ts)
+        self._lock = asyncio.Lock()
+
+    async def is_blocked(self, ip: str) -> bool:
+        async with self._lock:
+            self._sweep_locked()
+            entry = self._fails.get(ip)
+            if entry is None:
+                return False
+            count, last = entry
+            return count >= self.MAX_FAILS and (time.time() - last) < self.COOLDOWN
+
+    async def record_fail(self, ip: str) -> None:
+        async with self._lock:
+            count, _ = self._fails.get(ip, (0, 0.0))
+            self._fails[ip] = (count + 1, time.time())
+
+    async def record_ok(self, ip: str) -> None:
+        async with self._lock:
+            self._fails.pop(ip, None)
+
+    def _sweep_locked(self) -> None:
+        now = time.time()
+        stale = [ip for ip, (_, last) in self._fails.items()
+                 if now - last >= self.COOLDOWN]
+        for ip in stale:
+            self._fails.pop(ip, None)
+
+
 class PeerLink:
     """Owns the single active TCP link to a peer.
 
@@ -223,6 +265,7 @@ class PeerLink:
         self._peer_node_id: Optional[str] = None
         self._lock = asyncio.Lock()
         self._token_hash = sha256_hex(config.token)
+        self._auth_gate = AuthGate()
 
     @property
     def active(self) -> bool:
@@ -241,6 +284,14 @@ class PeerLink:
     ) -> None:
         peer = writer.get_extra_info("peername")
         log.debug(f"inbound from {peer}")
+        peer_ip = peer[0] if peer else None
+        if peer_ip and await self._auth_gate.is_blocked(peer_ip):
+            log.info(
+                f"auth gate: {peer_ip} blocked "
+                f"(>{AuthGate.MAX_FAILS} failures, cooldown {AuthGate.COOLDOWN:.0f}s)"
+            )
+            self._safe_close(writer)
+            return
         try:
             await self._session(reader, writer, inbound=True)
         except Exception as exc:
@@ -294,8 +345,14 @@ class PeerLink:
         if not hello or hello.get("type") != "hello":
             log.warning("invalid hello, closing")
             return
+        peer_ip = None
+        if inbound:
+            peer = writer.get_extra_info("peername")
+            peer_ip = peer[0] if peer else None
         if hello.get("token") != self._token_hash:
             log.warning(f"auth failed from peer name={hello.get('name')!r}")
+            if peer_ip:
+                await self._auth_gate.record_fail(peer_ip)
             return
         if hello.get("version") != PROTOCOL_VERSION:
             log.warning(f"version mismatch: peer={hello.get('version')}")
@@ -304,6 +361,8 @@ class PeerLink:
         if not isinstance(peer_id, str) or peer_id == self.node_id:
             log.debug("self loopback or bad node_id, dropping")
             return
+        if peer_ip:
+            await self._auth_gate.record_ok(peer_ip)
 
         async with self._lock:
             if self.active:
