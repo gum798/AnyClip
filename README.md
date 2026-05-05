@@ -22,39 +22,54 @@ LAN 안에서 두 컴퓨터의 **텍스트 클립보드를 양방향으로 자�
 - Python 3.9+
 - macOS 또는 Windows (LAN/VPN 으로 같은 네트워크에 있을 것)
 
-## 설치
+## 빠른 시작
+
+양쪽 기기에서 **동일한 토큰**으로 실행하기만 하면 됩니다. 아래는 새 머신에서 처음부터 끝까지의 단일 시퀀스입니다.
+
+### macOS
 
 ```bash
 git clone https://github.com/gum798/AnyClip.git
 cd AnyClip
 python3 -m venv .venv
-# macOS / Linux
 source .venv/bin/activate
-# Windows (PowerShell)
-# .venv\Scripts\Activate.ps1
-
 pip install -r requirements.txt
+
+export ANYCLIP_TOKEN=mysecret
+python anyclip.py --verbose
 ```
 
-## 사용
+### Windows (PowerShell)
 
-양쪽 기기에서 동일한 토큰으로 실행하기만 하면 됩니다.
+```powershell
+git clone https://github.com/gum798/AnyClip.git
+cd AnyClip
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 
-```bash
-# Mac
-python anyclip.py --token mysecret
-
-# Windows
-python anyclip.py --token mysecret
+$env:ANYCLIP_TOKEN = "mysecret"
+python anyclip.py --verbose
 ```
 
-토큰은 환경 변수로도 전달 가능 (`ps`에 노출되지 않아 권장):
+### Windows (cmd)
 
-```bash
-export ANYCLIP_TOKEN=mysecret      # macOS / Linux
-$env:ANYCLIP_TOKEN = "mysecret"    # Windows PowerShell
-python anyclip.py
+```cmd
+git clone https://github.com/gum798/AnyClip.git
+cd AnyClip
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r requirements.txt
+
+set ANYCLIP_TOKEN=mysecret
+python anyclip.py --verbose
 ```
+
+> 토큰은 `--token mysecret`로도 줄 수 있지만, 환경 변수 쪽이 `ps`/`Get-Process` 인자에 노출되지 않아 권장됩니다.
+
+**첫 실행 시**: macOS는 로컬 네트워크 권한 팝업을, Windows는 방화벽 허용 팝업을 띄웁니다 — 둘 다 허용해 주세요.
+
+### 연결 확인
 
 연결되면 다음과 같은 로그가 보입니다:
 
@@ -67,6 +82,16 @@ INFO linked with peer name='desktop' id=7e9b1234 (outbound)
 ```
 
 이제 한쪽에서 텍스트를 복사하면 반대쪽 클립보드에 자동으로 반영됩니다.
+
+종료하려면 실행한 터미널에서 `Ctrl+C`. 다음 실행부터는 `cd AnyClip` 후:
+
+```bash
+# macOS
+source .venv/bin/activate && python anyclip.py --verbose
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1; python anyclip.py --verbose
+```
 
 ### mDNS 차단 환경
 
