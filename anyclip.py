@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import hashlib
 import json
 import logging
 import os
+import signal
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -37,6 +40,159 @@ LOG_DIR = Path.home() / ".anyclip"
 LOG_FILE = LOG_DIR / "anyclip.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
+PID_FILE = LOG_DIR / "anyclip.pid"
+
+
+class FatalStartupError(RuntimeError):
+    """Raised when the daemon cannot start and retrying will not help.
+
+    The supervisor in main() recognises this and exits with the message
+    instead of looping with backoff.
+    """
+
+
+def _process_alive(pid: int) -> bool:
+    """True if the OS reports a process with this pid (best-effort)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by another user.
+        return True
+    except OSError:
+        return False
+
+
+def _is_anyclip_pid(pid: int) -> bool:
+    """Best-effort: does this pid look like an anyclip.py process?
+
+    Used as a guard before we kill anything: we never terminate a process
+    that is not clearly one of our own daemons. On Windows we cannot probe
+    this cheaply without psutil, so we trust the PID-file evidence alone.
+    """
+    if sys.platform == "win32":
+        return True
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "args="],
+            stderr=subprocess.DEVNULL, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "anyclip" in out
+
+
+def _find_listening_pid(port: int) -> Optional[int]:
+    """Best-effort: pid LISTENing on tcp `port`. None on Windows / not found."""
+    if sys.platform == "win32":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            stderr=subprocess.DEVNULL, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            return int(line)
+    return None
+
+
+def _terminate_pid(pid: int) -> bool:
+    """SIGTERM, wait up to 2s, then SIGKILL on POSIX. Returns True if pid is gone."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return not _process_alive(pid)
+    for _ in range(20):
+        time.sleep(0.1)
+        if not _process_alive(pid):
+            return True
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        for _ in range(10):
+            time.sleep(0.1)
+            if not _process_alive(pid):
+                return True
+    return not _process_alive(pid)
+
+
+def prepare_pid_lock(port: int) -> None:
+    """Ensure we are the only anyclip.
+
+    If a previous anyclip is detected (via PID file or via ``lsof`` on the
+    listening port) we terminate it and continue. Foreign processes that
+    happen to hold the port are NEVER killed -- we raise FatalStartupError
+    so the user can decide.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1) PID file from a previous run.
+    if PID_FILE.exists():
+        old_pid = 0
+        try:
+            content = PID_FILE.read_text().strip().split()
+            if content:
+                old_pid = int(content[0])
+        except (OSError, ValueError):
+            old_pid = 0
+        if old_pid and old_pid != os.getpid() and _process_alive(old_pid):
+            log.info(f"another anyclip detected (pid {old_pid} via PID file); terminating")
+            if not _terminate_pid(old_pid):
+                raise FatalStartupError(
+                    f"could not terminate previous anyclip (pid {old_pid}); "
+                    f"please run: kill -9 {old_pid}"
+                )
+            log.info(f"previous anyclip (pid {old_pid}) terminated")
+
+    # 2) Stale state: PID file missing or already-cleared, but the port is held.
+    listener_pid = _find_listening_pid(port)
+    if listener_pid and listener_pid != os.getpid():
+        if _is_anyclip_pid(listener_pid):
+            log.info(
+                f"anyclip listening on tcp/{port} (pid {listener_pid}); terminating"
+            )
+            if not _terminate_pid(listener_pid):
+                raise FatalStartupError(
+                    f"could not terminate anyclip on tcp/{port} (pid {listener_pid}); "
+                    f"please run: kill -9 {listener_pid}"
+                )
+            # Give the OS a moment to release the socket so our bind() succeeds.
+            time.sleep(0.3)
+        else:
+            raise FatalStartupError(
+                f"tcp/{port} is held by a non-anyclip process (pid {listener_pid}); "
+                f"stop that process or pick a different --port"
+            )
+
+    # 3) Record our pid (and chosen port for diagnostics).
+    try:
+        PID_FILE.write_text(f"{os.getpid()} {port}\n")
+    except OSError as exc:
+        log.warning(f"could not write PID file {PID_FILE}: {exc}")
+
+
+def release_pid_lock() -> None:
+    """Remove our PID file, but only if it still points at us."""
+    try:
+        if not PID_FILE.exists():
+            return
+        content = PID_FILE.read_text().strip().split()
+        if content and int(content[0]) == os.getpid():
+            PID_FILE.unlink()
+    except (OSError, ValueError):
+        pass
 
 
 def setup_logging(verbose: bool) -> None:
@@ -287,9 +443,17 @@ class PeerLink:
         return self._writer is not None and not self._writer.is_closing()
 
     async def serve(self) -> None:
-        server = await asyncio.start_server(
-            self._handle_inbound, host="0.0.0.0", port=self.config.port,
-        )
+        try:
+            server = await asyncio.start_server(
+                self._handle_inbound, host="0.0.0.0", port=self.config.port,
+            )
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise FatalStartupError(
+                    f"port {self.config.port} still in use after cleanup attempt; "
+                    f"another process may have grabbed it -- try again or pick --port"
+                ) from exc
+            raise
         log.info(f"listening on tcp/{self.config.port}")
         async with server:
             await server.serve_forever()
@@ -582,6 +746,7 @@ async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
 
 async def run(config: Config) -> None:
     setup_logging(config.verbose)
+    prepare_pid_lock(config.port)
     node_id = str(uuid.uuid4())
     suppressor = EchoSuppressor()
 
@@ -619,6 +784,7 @@ async def run(config: Config) -> None:
     finally:
         await link.close()
         await beacon.stop()
+        release_pid_lock()
 
 
 def main() -> None:
@@ -633,6 +799,9 @@ def main() -> None:
             return
         except SystemExit:
             raise
+        except FatalStartupError as exc:
+            sys.stderr.write(f"\nanyclip: {exc}\n")
+            sys.exit(1)
         except Exception:
             log.exception(f"daemon crashed; restarting in {backoff:.0f}s")
             time.sleep(backoff)

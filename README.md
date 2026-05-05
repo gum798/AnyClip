@@ -163,6 +163,9 @@ python anyclip.py --token mysecret --peer 192.168.0.42 --peer 192.168.0.50
 | `peer resolve failed` | 상대 광고가 IP 없이 떠있음. 양쪽 모두 최신 코드인지 확인 (Phase 1 fix) |
 | `clipboard read failing: 5 consecutive errors` | OS 클립보드 권한 거부 / pyperclip 백엔드 누락. macOS 보호 권한 확인 |
 | Ctrl+C 후에도 데몬이 남음 | 보고해주세요 — 종료 처리는 Phase 2.1 step 7에서 보강됨 |
+| 시작 시 `another anyclip detected ... terminating` | 정상. 이전 anyclip이 살아있어 자동으로 종료시키고 새로 시작합니다 |
+| 시작 시 `tcp/24816 is held by a non-anyclip process` | 다른 프로그램이 24816을 쓰고 있음. 그 프로그램을 끄거나 `--port` 변경 |
+| 시작 시 `could not terminate previous anyclip (pid X)` | 권한 문제 등으로 종료 실패. `kill -9 X` 후 재시도 |
 
 ## 동작 원리
 
