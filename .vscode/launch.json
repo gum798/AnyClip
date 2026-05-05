@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "AnyClip (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/anyclip.py",
+      "console": "integratedTerminal",
+      "args": ["--verbose"],
+      "env": {
+        "ANYCLIP_TOKEN": "anyclip-dev"
+      },
+      "justMyCode": true
+    }
+  ]
+}
