@@ -646,6 +646,11 @@ class MdnsBeacon:
         # retry peers that we discovered earlier but whose link later dropped
         # without a fresh ServiceStateChange.Added event.
         self.known_peers: dict = {}
+        # Best-effort: the IPv4 we baked into the mDNS advertisement at
+        # start(). The network watchdog compares this against the current
+        # source IP and bounces the daemon if the OS reassigns the IP
+        # (zeroconf otherwise keeps shouting into a dead socket -- Errno 49).
+        self.advertised_ip: Optional[str] = None
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -653,6 +658,7 @@ class MdnsBeacon:
 
         instance = f"{self.config.name}-{self.node_id[:8]}.{SERVICE_TYPE}"
         local_ip = get_local_ipv4()
+        self.advertised_ip = local_ip
         addresses = [socket.inet_aton(local_ip)] if local_ip else []
         server_host = f"anyclip-{self.node_id[:8]}.local."
         self._info = ServiceInfo(
@@ -724,6 +730,35 @@ class MdnsBeacon:
                 await self._azc.async_close()
         except Exception:
             pass
+
+
+async def network_watchdog(beacon: "MdnsBeacon", interval: float = 15.0) -> None:
+    """Bounce the daemon when the host IPv4 changes.
+
+    zeroconf binds its multicast sender to whatever IP we advertised at
+    startup. If macOS/Windows later reassigns the IP (Wi-Fi flap, sleep,
+    network switch, VPN toggle) the bound socket becomes invalid and we
+    see a flood of ``Errno 49 Can't assign requested address`` -- mDNS
+    advertise/resolve quietly stops working without crashing the
+    application, so peers keep trying to reach us at the stale IP.
+
+    The cleanest correct response is to restart the whole asyncio runtime
+    so beacon.start() picks up the new IP. Raising RuntimeError out of
+    asyncio.gather() unwinds run()'s finally (mDNS unregister + PID
+    release + listener close) and the supervisor in main() restarts us
+    on its existing 1s -> 60s backoff.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        previous = beacon.advertised_ip
+        if not previous:
+            continue
+        current = get_local_ipv4()
+        if current and current != previous:
+            raise RuntimeError(
+                f"local IPv4 changed: {previous} -> {current}; "
+                f"restarting daemon to re-advertise mDNS"
+            )
 
 
 async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
@@ -826,7 +861,12 @@ async def run(config: Config) -> None:
         log.info(f"manual peers: {[f'{h}:{p}' for h, p in config.peers]}")
     try:
         await beacon.start()
-        tasks = [link.serve(), watcher.run(), mdns_reconnect_loop(beacon, link)]
+        tasks = [
+            link.serve(),
+            watcher.run(),
+            mdns_reconnect_loop(beacon, link),
+            network_watchdog(beacon),
+        ]
         for host, port in config.peers:
             tasks.append(peer_keepalive(host, port, link))
         await asyncio.gather(*tasks)
