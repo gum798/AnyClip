@@ -642,6 +642,10 @@ class MdnsBeacon:
         self._browser: Optional[AsyncServiceBrowser] = None
         self._info: Optional[ServiceInfo] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # peer_node_id -> (host, port). Used by the mdns reconnect loop to
+        # retry peers that we discovered earlier but whose link later dropped
+        # without a fresh ServiceStateChange.Added event.
+        self.known_peers: dict = {}
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -697,6 +701,8 @@ class MdnsBeacon:
                 return
             host = addrs[0]
             port = info.port
+            if isinstance(peer_id, str):
+                self.known_peers[peer_id] = (host, port)
             log.info(f"discovered peer {name!r} at {host}:{port}")
             await self.on_peer(host, port)
         except Exception as exc:
@@ -718,6 +724,49 @@ class MdnsBeacon:
                 await self._azc.async_close()
         except Exception:
             pass
+
+
+async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
+    """Retry mDNS-discovered peers when the link drops.
+
+    The zeroconf browser only fires ServiceStateChange.Added on first
+    sight. If a TCP link dies (e.g. the OS reassigns our IP and we hit
+    EADDRNOTAVAIL on send) but the peer keeps advertising, no new event
+    arrives -- so the only chance to reconnect is to remember every peer
+    we ever resolved and poll them ourselves.
+
+    Backoff is the same shape as peer_keepalive (1s -> 60s, reset after a
+    session that survived 5s). Cheap when the link is up: just a 2s sleep.
+    """
+    backoff = 1.0
+    while True:
+        if link.active:
+            backoff = 1.0
+            await asyncio.sleep(2)
+            continue
+        peers = list(beacon.known_peers.values())
+        if not peers:
+            await asyncio.sleep(2)
+            continue
+        # Try every known peer in turn; stop early if one of them links up.
+        attempted = False
+        for host, port in peers:
+            if link.active:
+                break
+            attempted = True
+            start = time.monotonic()
+            await link.try_connect(host, port)
+            elapsed = time.monotonic() - start
+            if link.active and elapsed > 5.0:
+                backoff = 1.0
+                break
+        if link.active:
+            continue
+        if attempted:
+            await asyncio.sleep(min(backoff, 60))
+            backoff = min(backoff * 2, 60)
+        else:
+            await asyncio.sleep(2)
 
 
 async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
@@ -777,7 +826,7 @@ async def run(config: Config) -> None:
         log.info(f"manual peers: {[f'{h}:{p}' for h, p in config.peers]}")
     try:
         await beacon.start()
-        tasks = [link.serve(), watcher.run()]
+        tasks = [link.serve(), watcher.run(), mdns_reconnect_loop(beacon, link)]
         for host, port in config.peers:
             tasks.append(peer_keepalive(host, port, link))
         await asyncio.gather(*tasks)
