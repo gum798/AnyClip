@@ -33,6 +33,12 @@ MAX_PAYLOAD = 4 * 1024 * 1024  # 4 MiB hard cap per frame
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
+# After a link is registered, only late-arriving handshakes within this
+# window are eligible to *replace* the existing link via the node_id
+# tie-breaker. Anything later is treated as a stale duplicate and dropped
+# untouched, so an established link stops flapping when both sides keep
+# retrying (mDNS rediscovery, peer_keepalive, Windows reconnect, etc).
+RACE_WINDOW_S = 1.5
 
 log = logging.getLogger("anyclip")
 
@@ -434,9 +440,14 @@ class PeerLink:
         self.on_clip = on_clip
         self._writer: Optional[asyncio.StreamWriter] = None
         self._peer_node_id: Optional[str] = None
+        self._linked_at: float = 0.0  # monotonic time when _writer was last set
         self._lock = asyncio.Lock()
         self._token_hash = sha256_hex(config.token)
         self._auth_gate = AuthGate()
+        # In-flight outbound attempts keyed by (host, port). Stops two
+        # background loops (mDNS reconnect + peer_keepalive) from racing
+        # each other into the same address.
+        self._connecting: set = set()
 
     @property
     def active(self) -> bool:
@@ -481,20 +492,28 @@ class PeerLink:
     async def try_connect(self, host: str, port: int) -> None:
         if self.active:
             return
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT,
-            )
-        except Exception as exc:
-            log.info(f"connect to {host}:{port} failed: {exc}")
+        key = (host, port)
+        if key in self._connecting:
+            log.debug(f"connect to {host}:{port} already in flight, skipping")
             return
-        log.debug(f"outbound connected to {host}:{port}")
+        self._connecting.add(key)
         try:
-            await self._session(reader, writer, inbound=False)
-        except Exception as exc:
-            log.debug(f"outbound session ended: {exc}")
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT,
+                )
+            except Exception as exc:
+                log.info(f"connect to {host}:{port} failed: {exc}")
+                return
+            log.debug(f"outbound connected to {host}:{port}")
+            try:
+                await self._session(reader, writer, inbound=False)
+            except Exception as exc:
+                log.debug(f"outbound session ended: {exc}")
+            finally:
+                self._safe_close(writer)
         finally:
-            self._safe_close(writer)
+            self._connecting.discard(key)
 
     @staticmethod
     def _safe_close(writer: asyncio.StreamWriter) -> None:
@@ -545,17 +564,23 @@ class PeerLink:
 
         async with self._lock:
             if self.active:
-                # Both sides connected concurrently. Keep the link where the
-                # smaller node_id is the *outbound* (caller) side.
-                keep_this_outbound = (not inbound) and self.node_id < peer_id
+                # Only treat the new connection as a genuine concurrent
+                # race for a brief window after the existing link came up.
+                # After that, an established link is sticky -- additional
+                # arrivals are dropped without disturbing the live socket.
+                race = (time.monotonic() - self._linked_at) < RACE_WINDOW_S
+                keep_this_outbound = (
+                    race and (not inbound) and self.node_id < peer_id
+                )
                 if keep_this_outbound:
-                    log.debug("tie-breaker: replacing existing link")
+                    log.debug("tie-breaker: replacing existing link (race)")
                     self._safe_close(self._writer)  # type: ignore[arg-type]
                 else:
                     log.debug("tie-breaker: dropping duplicate link")
                     return
             self._writer = writer
             self._peer_node_id = peer_id
+            self._linked_at = time.monotonic()
 
         log.info(
             f"linked with peer name={hello.get('name')!r} "
