@@ -804,7 +804,11 @@ async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
             backoff = 1.0
             await asyncio.sleep(2)
             continue
-        peers = list(beacon.known_peers.values())
+        # Dedup by (host, port). The same physical peer can leave several
+        # stale entries in known_peers because every restart of the remote
+        # daemon mints a new node_id, but the address stays the same -- we
+        # only need to attempt one outbound per address per cycle.
+        peers = list(dict.fromkeys(beacon.known_peers.values()))
         if not peers:
             await asyncio.sleep(2)
             continue
