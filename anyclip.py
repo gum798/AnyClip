@@ -39,6 +39,11 @@ CONNECT_TIMEOUT = 5.0
 # untouched, so an established link stops flapping when both sides keep
 # retrying (mDNS rediscovery, peer_keepalive, Windows reconnect, etc).
 RACE_WINDOW_S = 1.5
+# After this many consecutive failed outbound attempts to the same
+# (host, port) the address is pruned from known_peers. mDNS rediscovery
+# re-adds it automatically. Keeps the daemon from poking forever at a
+# stale IP after the peer DHCP-renewed onto a different address.
+MAX_RECONNECT_FAILS = 3
 
 log = logging.getLogger("anyclip")
 
@@ -671,6 +676,8 @@ class MdnsBeacon:
         # retry peers that we discovered earlier but whose link later dropped
         # without a fresh ServiceStateChange.Added event.
         self.known_peers: dict = {}
+        # (host, port) -> consecutive failure count, for pruning dead addrs.
+        self.address_fails: dict = {}
         # Best-effort: the IPv4 we baked into the mDNS advertisement at
         # start(). The network watchdog compares this against the current
         # source IP and bounces the daemon if the OS reassigns the IP
@@ -734,6 +741,10 @@ class MdnsBeacon:
             port = info.port
             if isinstance(peer_id, str):
                 self.known_peers[peer_id] = (host, port)
+            # Fresh advertisement -> the address is alive; clear any
+            # pending failure count so the reconnect loop will not prune
+            # it on stale data.
+            self.address_fails.pop((host, port), None)
             log.info(f"discovered peer {name!r} at {host}:{port}")
             await self.on_peer(host, port)
         except Exception as exc:
@@ -821,9 +832,27 @@ async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
             start = time.monotonic()
             await link.try_connect(host, port)
             elapsed = time.monotonic() - start
-            if link.active and elapsed > 5.0:
-                backoff = 1.0
+            if link.active:
+                # Successful link -- clear any failure history for this addr.
+                beacon.address_fails.pop((host, port), None)
+                if elapsed > 5.0:
+                    backoff = 1.0
                 break
+            # Failure -- count it, prune the address if it keeps failing.
+            fails = beacon.address_fails.get((host, port), 0) + 1
+            beacon.address_fails[(host, port)] = fails
+            if fails >= MAX_RECONNECT_FAILS:
+                stale_ids = [
+                    nid for nid, addr in beacon.known_peers.items()
+                    if addr == (host, port)
+                ]
+                for nid in stale_ids:
+                    beacon.known_peers.pop(nid, None)
+                beacon.address_fails.pop((host, port), None)
+                log.info(
+                    f"pruned stale peer address {host}:{port} after "
+                    f"{fails} failed attempts; awaiting fresh mDNS discovery"
+                )
         if link.active:
             continue
         if attempted:
