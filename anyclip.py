@@ -657,11 +657,25 @@ class PeerLink:
                 # race for a brief window after the existing link came up.
                 # After that, an established link is sticky -- additional
                 # arrivals are dropped without disturbing the live socket.
+                #
+                # Within the race window, *both* peers must agree on the
+                # same surviving TCP socket. We pick "the smaller node_id
+                # is the outbound side" -- equivalently, the larger node_id
+                # is the inbound side -- so each peer keeps its own end of
+                # the *same* link and drops the other:
+                #
+                #   Side A (smaller id):  keeps its outbound,  drops inbound
+                #   Side B (larger  id):  keeps its inbound,   drops outbound
+                #
+                # The previous version only handled the first row, which
+                # left the larger-id side hugging its dead outbound socket
+                # and produced an immediate "peer disconnected" loop.
                 race = (time.monotonic() - self._linked_at) < RACE_WINDOW_S
-                keep_this_outbound = (
-                    race and (not inbound) and self.node_id < peer_id
+                keep_this_link = race and (
+                    (not inbound and self.node_id < peer_id) or
+                    (inbound and self.node_id > peer_id)
                 )
-                if keep_this_outbound:
+                if keep_this_link:
                     log.debug("tie-breaker: replacing existing link (race)")
                     self._safe_close(self._writer)  # type: ignore[arg-type]
                 else:
