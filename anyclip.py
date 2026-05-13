@@ -244,6 +244,81 @@ def sha256_hex(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+_notify_warned = False
+
+
+def preview(text: str, max_len: int = 80) -> str:
+    """One-line preview suitable for a toast body."""
+    snippet = text.replace("\r", " ").replace("\n", " ").strip()
+    if len(snippet) <= max_len:
+        return snippet or "(empty)"
+    return snippet[:max_len] + "..."
+
+
+def notify(title: str, message: str) -> None:
+    """Show a desktop toast via OS-native tooling.
+
+    macOS: osascript + AppleScript ``display notification``.
+    Windows: PowerShell + System.Windows.Forms.NotifyIcon balloon tip.
+    Other platforms / dispatch errors: silent no-op (with a single warning).
+
+    All dispatch is non-blocking (subprocess.Popen, no wait), so callers
+    can invoke this from the asyncio loop directly. notify_async further
+    isolates the small subprocess.Popen overhead via to_thread.
+    """
+    global _notify_warned
+    try:
+        msg = message[:240]
+        if sys.platform == "darwin":
+            def _osa_escape(s: str) -> str:
+                return s.replace("\\", "\\\\").replace('"', '\\"')
+            script = (
+                f'display notification "{_osa_escape(msg)}" '
+                f'with title "{_osa_escape(title)}"'
+            )
+            subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif sys.platform == "win32":
+            def _ps_escape(s: str) -> str:
+                return s.replace("'", "''")
+            ps = (
+                "[reflection.assembly]::loadwithpartialname("
+                "'System.Windows.Forms') | Out-Null;"
+                "$n = New-Object System.Windows.Forms.NotifyIcon;"
+                "$n.Icon = [System.Drawing.SystemIcons]::Information;"
+                f"$n.BalloonTipTitle = '{_ps_escape(title)}';"
+                f"$n.BalloonTipText  = '{_ps_escape(msg)}';"
+                "$n.Visible = $true;"
+                "$n.ShowBalloonTip(3000);"
+                "Start-Sleep -Seconds 3;"
+                "$n.Dispose()"
+            )
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                 "-Command", ps],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        # other platforms: silently skip
+    except Exception as exc:
+        if not _notify_warned:
+            log.warning(f"notify failed (further warnings silenced): {exc}")
+            _notify_warned = True
+
+
+async def notify_async(title: str, message: str) -> None:
+    """Dispatch notify() on a worker thread so the asyncio loop is never
+    blocked by the small subprocess spawn cost."""
+    try:
+        await asyncio.to_thread(notify, title, message)
+    except Exception:
+        pass
+
+
 def parse_peer_arg(value: str) -> tuple[str, int]:
     """Parse a --peer argument: 'host' or 'host:port'."""
     if ":" in value:
@@ -281,6 +356,7 @@ class Config:
     poll_interval: float
     verbose: bool
     peers: list  # list[tuple[str, int]]; manual fallback peers
+    no_notify: bool
 
 
 def parse_args() -> Config:
@@ -308,6 +384,8 @@ def parse_args() -> Config:
                              f"Default port: {DEFAULT_PORT}.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable DEBUG logging on the console (file log is always DEBUG)")
+    parser.add_argument("--no-notify", action="store_true",
+                        help="Suppress desktop toast notifications on clipboard sync")
     args = parser.parse_args()
     if not args.token:
         sys.stderr.write(
@@ -321,6 +399,7 @@ def parse_args() -> Config:
         poll_interval=max(0.1, args.poll),
         verbose=args.verbose,
         peers=list(args.peer or []),
+        no_notify=args.no_notify,
     )
 
 
@@ -445,6 +524,7 @@ class PeerLink:
         self.on_clip = on_clip
         self._writer: Optional[asyncio.StreamWriter] = None
         self._peer_node_id: Optional[str] = None
+        self._peer_name: Optional[str] = None  # peer's display name (from hello)
         self._linked_at: float = 0.0  # monotonic time when _writer was last set
         self._lock = asyncio.Lock()
         self._token_hash = sha256_hex(config.token)
@@ -457,6 +537,10 @@ class PeerLink:
     @property
     def active(self) -> bool:
         return self._writer is not None and not self._writer.is_closing()
+
+    @property
+    def peer_name(self) -> Optional[str]:
+        return self._peer_name
 
     async def serve(self) -> None:
         try:
@@ -585,6 +669,7 @@ class PeerLink:
                     return
             self._writer = writer
             self._peer_node_id = peer_id
+            self._peer_name = hello.get("name") or peer_id[:8]
             self._linked_at = time.monotonic()
 
         log.info(
@@ -608,6 +693,7 @@ class PeerLink:
                 if self._writer is writer:
                     self._writer = None
                     self._peer_node_id = None
+                    self._peer_name = None
             log.info("peer disconnected")
 
     async def _send(self, writer: asyncio.StreamWriter, obj: dict) -> None:
@@ -648,6 +734,7 @@ class PeerLink:
                 self._safe_close(self._writer)
                 self._writer = None
                 self._peer_node_id = None
+                self._peer_name = None
 
     async def send_clip(self, text: str) -> None:
         writer = self._writer
@@ -895,10 +982,18 @@ async def run(config: Config) -> None:
     # Forward declaration for the closure below.
     watcher: ClipboardWatcher
 
+    notify_enabled = not config.no_notify and sys.platform in ("darwin", "win32")
+
     async def on_remote_clip(text: str) -> None:
         suppressor.mark_received(text)
         watcher.update_local(text)
-        log.info(f"<- received {len(text)} chars")
+        peer = link.peer_name or "peer"
+        log.info(f"<- received {len(text)} chars from {peer!r}")
+        if notify_enabled:
+            await notify_async(
+                title=f"AnyClip ← {peer}",
+                message=preview(text),
+            )
 
     link = PeerLink(config, node_id, on_remote_clip)
 
@@ -909,7 +1004,13 @@ async def run(config: Config) -> None:
             log.debug("skip echo of just-received clip")
             return
         await link.send_clip(text)
-        log.info(f"-> sent {len(text)} chars")
+        peer = link.peer_name or "peer"
+        log.info(f"-> sent {len(text)} chars to {peer!r}")
+        if notify_enabled:
+            await notify_async(
+                title=f"AnyClip → {peer}",
+                message=preview(text),
+            )
 
     watcher = ClipboardWatcher(config.poll_interval, on_local_change)
     beacon = MdnsBeacon(config, node_id, link.try_connect)
