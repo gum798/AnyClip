@@ -230,6 +230,12 @@ def setup_logging(verbose: bool) -> None:
     for handler in list(root.handlers):
         root.removeHandler(handler)
     root.setLevel(logging.DEBUG)
+    # Silence third-party DEBUG noise that would otherwise drown our own
+    # output in --verbose mode (PIL chunk parsing fires on every poll;
+    # zeroconf is chatty on the cache layer; asyncio prints selector picks).
+    for noisy in ("PIL", "PIL.PngImagePlugin", "PIL.Image",
+                  "zeroconf", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
 
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
