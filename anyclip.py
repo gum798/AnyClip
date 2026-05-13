@@ -217,6 +217,24 @@ def release_pid_lock() -> None:
         pass
 
 
+def clear_received_dir() -> None:
+    """Empty ``~/.anyclip/received/`` of any inbound clipboard files.
+
+    Called on startup (post-PID-lock) and on graceful shutdown so disk
+    use does not grow unbounded across restarts. A SIGKILL skips the
+    finally cleanup; the next startup picks up the slack.
+    """
+    target = LOG_DIR / "received"
+    if not target.exists():
+        return
+    for entry in target.iterdir():
+        try:
+            if entry.is_file() or entry.is_symlink():
+                entry.unlink()
+        except OSError as exc:
+            log.debug(f"could not remove {entry}: {exc}")
+
+
 def setup_logging(verbose: bool) -> None:
     """Configure root logger with a rotating file handler + console handler.
 
@@ -1380,6 +1398,7 @@ async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
 async def run(config: Config) -> None:
     setup_logging(config.verbose)
     prepare_pid_lock(config.port)
+    clear_received_dir()
     node_id = str(uuid.uuid4())
     suppressor = EchoSuppressor()
 
@@ -1501,6 +1520,7 @@ async def run(config: Config) -> None:
         await link.close()
         await beacon.stop()
         release_pid_lock()
+        clear_received_dir()
 
 
 def main() -> None:
