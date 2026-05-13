@@ -925,7 +925,16 @@ async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
                 if elapsed > 5.0:
                     backoff = 1.0
                 break
-            # Failure -- count it, prune the address if it keeps failing.
+            # Link is not active *right now*, but if the call took longer
+            # than 5 s the handshake clearly succeeded and the session was
+            # up for a real time before dropping. That is a healthy peer
+            # whose link happened to die after the fact (a tie-breaker
+            # winner taking over, a transient network blip, ...) so we
+            # explicitly do NOT count it toward the prune threshold.
+            if elapsed > 5.0:
+                beacon.address_fails.pop((host, port), None)
+                continue
+            # Real fast-fail (no route, refused, tie-breaker drop in ms).
             fails = beacon.address_fails.get((host, port), 0) + 1
             beacon.address_fails[(host, port)] = fails
             if fails >= MAX_RECONNECT_FAILS:
