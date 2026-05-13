@@ -295,6 +295,80 @@ def grab_clipboard_image() -> Optional[bytes]:
         return None
 
 
+def grab_clipboard_files() -> list:
+    """Return absolute file paths currently on the clipboard, or [].
+
+    macOS  -> osascript: ``the clipboard as «class furl»`` (single item).
+    Windows-> PowerShell: ``Get-Clipboard -Format FileDropList``.
+    Other  -> always [].
+    """
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'try\n'
+                 '\treturn POSIX path of (the clipboard as «class furl»)\n'
+                 'on error\n'
+                 '\treturn ""\n'
+                 'end try'],
+                capture_output=True, text=True, timeout=3,
+            )
+            path = result.stdout.strip()
+            return [path] if path else []
+        except Exception:
+            return []
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Clipboard -Format FileDropList | "
+                 "ForEach-Object { $_.FullName }"],
+                capture_output=True, text=True, timeout=3,
+                creationflags=0x08000000,
+            )
+            return [line.strip() for line in result.stdout.splitlines()
+                    if line.strip()]
+        except Exception:
+            return []
+    return []
+
+
+def set_clipboard_file(path: str) -> bool:
+    """Place a single file reference on the system clipboard.
+
+    macOS  -> AppleScript ``POSIX file``.
+    Windows-> PowerShell ``Set-Clipboard -Path``.
+    Other  -> no-op (False).
+    """
+    abs_path = str(Path(path).resolve())
+    if sys.platform == "darwin":
+        try:
+            esc = abs_path.replace("\\", "\\\\").replace('"', '\\"')
+            script = f'set the clipboard to (POSIX file "{esc}")'
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except Exception as exc:
+            log.warning(f"set_clipboard_file (macOS) failed: {exc}")
+            return False
+    if sys.platform == "win32":
+        try:
+            esc = abs_path.replace("'", "''")
+            ps = f"Set-Clipboard -Path '{esc}'"
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, timeout=5,
+                creationflags=0x08000000,
+            )
+            return result.returncode == 0
+        except Exception as exc:
+            log.warning(f"set_clipboard_file (Windows) failed: {exc}")
+            return False
+    return False
+
+
 def set_clipboard_image(png_bytes: bytes) -> bool:
     """Best-effort: place a PNG image on the system clipboard.
 
@@ -556,6 +630,19 @@ class ClipboardWatcher:
         initial_image = grab_clipboard_image()
         if initial_image is not None:
             self._last_image_hash = sha256_bytes(initial_image)
+        # File path on the clipboard: cache (path, size, mtime) so we do
+        # not re-read megabytes of bytes off disk every poll cycle.
+        self._last_file_fp: Optional[tuple] = None
+        self._last_file_hash: Optional[str] = None
+        self._oversize_file_warned = False
+        # Seed file baseline as well.
+        for _path in grab_clipboard_files() or []:
+            try:
+                stat = os.stat(_path)
+            except OSError:
+                continue
+            self._last_file_fp = (_path, stat.st_size, stat.st_mtime_ns)
+            break
 
     def _safe_paste(self) -> Optional[str]:
         try:
@@ -599,7 +686,51 @@ class ClipboardWatcher:
                     except Exception as exc:
                         log.exception(f"on_change(image) handler failed: {exc}")
 
+            # File path. osascript/PowerShell is comparatively expensive,
+            # so we only read the bytes off disk when the (path, size,
+            # mtime) fingerprint changes, not on every poll.
+            await self._check_file_clipboard()
+
             await asyncio.sleep(self.poll_interval)
+
+    async def _check_file_clipboard(self) -> None:
+        files = await asyncio.to_thread(grab_clipboard_files)
+        if not files:
+            return
+        # Only the first file is synced -- multi-file is intentional scope-out.
+        path = files[0]
+        try:
+            stat = await asyncio.to_thread(os.stat, path)
+        except OSError:
+            return
+        fp = (path, stat.st_size, stat.st_mtime_ns)
+        if fp == self._last_file_fp:
+            return  # nothing new on the clipboard
+        # Refuse files that would not fit in a single frame after base64.
+        # Reserve ~256 KB for JSON envelope and the b64 1.34x inflation.
+        budget = int((MAX_PAYLOAD - 256 * 1024) * 0.74)
+        if stat.st_size > budget:
+            if not self._oversize_file_warned:
+                log.warning(
+                    f"file {path!r} too large to sync "
+                    f"({stat.st_size} bytes > limit {budget}); skipping"
+                )
+                self._oversize_file_warned = True
+            # Still update the fingerprint so we do not keep re-warning.
+            self._last_file_fp = fp
+            return
+        self._oversize_file_warned = False
+        try:
+            data = await asyncio.to_thread(Path(path).read_bytes)
+        except OSError as exc:
+            log.debug(f"file read failed for {path!r}: {exc}")
+            return
+        self._last_file_fp = fp
+        self._last_file_hash = sha256_bytes(data)
+        try:
+            await self.on_change("file", (os.path.basename(path), data))
+        except Exception as exc:
+            log.exception(f"on_change(file) handler failed: {exc}")
 
     def update_local_text(self, text: str) -> None:
         """Set the local text clipboard without re-triggering on_change."""
@@ -622,6 +753,40 @@ class ClipboardWatcher:
         ok = set_clipboard_image(png_bytes)
         if not ok:
             log.warning("clipboard write (image) failed or unsupported on this OS")
+        return ok
+
+    def update_local_file(self, name: str, data: bytes) -> bool:
+        """Save the received file under ~/.anyclip/received/ and put a
+        clipboard reference to it on the system clipboard.
+
+        Updates the fingerprint baseline so the very file we just wrote
+        is not picked up as a fresh local change on the next poll.
+        """
+        # Sanitize the name -- accept basename only and strip anything
+        # that would land outside the target directory.
+        safe = os.path.basename(name).strip() or "received.bin"
+        # Drop characters that are awkward on either OS.
+        safe = "".join(
+            c if c.isalnum() or c in "._- " else "_" for c in safe
+        )
+        target_dir = LOG_DIR / "received"
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / safe
+            target.write_bytes(data)
+        except OSError as exc:
+            log.warning(f"file write to {target_dir} failed: {exc}")
+            return False
+        self._last_file_hash = sha256_bytes(data)
+        # Update fingerprint so the next poll does not echo this back.
+        try:
+            stat = target.stat()
+            self._last_file_fp = (str(target), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            self._last_file_fp = None
+        ok = set_clipboard_file(str(target))
+        if not ok:
+            log.warning("clipboard write (file) failed or unsupported on this OS")
         return ok
 
 
@@ -864,6 +1029,16 @@ class PeerLink:
                             log.warning(f"bad image payload from peer: {exc}")
                             continue
                         await self.on_clip("image", png)
+                    elif kind == "file" and isinstance(content, str):
+                        try:
+                            raw = base64.b64decode(content, validate=True)
+                        except Exception as exc:
+                            log.warning(f"bad file payload from peer: {exc}")
+                            continue
+                        name = msg.get("name") or "received.bin"
+                        if not isinstance(name, str):
+                            name = "received.bin"
+                        await self.on_clip("file", (name, raw))
                     else:
                         log.debug(f"ignoring clip with kind={kind!r}")
                 else:
@@ -943,6 +1118,24 @@ class PeerLink:
                 "hash": sha256_bytes(bytes(content)),
                 "ts": time.time(),
                 "bytes": len(content),
+            }
+        elif kind == "file":
+            # content is expected to be (name, raw_bytes)
+            if not isinstance(content, tuple) or len(content) != 2:
+                return
+            name, raw = content
+            if not isinstance(name, str) or not isinstance(raw, (bytes, bytearray)):
+                return
+            raw_b = bytes(raw)
+            encoded = base64.b64encode(raw_b).decode("ascii")
+            payload = {
+                "type": "clip",
+                "kind": "file",
+                "name": name,
+                "content": encoded,
+                "hash": sha256_bytes(raw_b),
+                "ts": time.time(),
+                "bytes": len(raw_b),
             }
         else:
             log.debug(f"send_clip: unknown kind {kind!r}, dropping")
@@ -1221,6 +1414,23 @@ async def run(config: Config) -> None:
                     title=f"AnyClip ← {peer}",
                     message=f"image ({len(png)//1024} KB)",
                 )
+        elif kind == "file":
+            assert isinstance(data, tuple) and len(data) == 2
+            name, raw = data
+            raw_b = bytes(raw)
+            suppressor.mark_received("file", sha256_bytes(raw_b))
+            ok = await asyncio.to_thread(
+                watcher.update_local_file, name, raw_b,
+            )
+            log.info(
+                f"<- received file {name!r} {len(raw_b)} bytes from {peer!r} "
+                f"({'written to clipboard' if ok else 'WRITE FAILED'})"
+            )
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip ← {peer}",
+                    message=f"file: {name} ({len(raw_b)//1024} KB)",
+                )
 
     link = PeerLink(config, node_id, on_remote_clip)
 
@@ -1253,6 +1463,21 @@ async def run(config: Config) -> None:
                 await notify_async(
                     title=f"AnyClip → {peer}",
                     message=f"image ({len(png)//1024} KB)",
+                )
+        elif kind == "file":
+            assert isinstance(data, tuple) and len(data) == 2
+            name, raw = data
+            raw_b = bytes(raw)
+            if not suppressor.should_send("file", sha256_bytes(raw_b)):
+                log.debug("skip echo of just-received file")
+                return
+            await link.send_clip("file", (name, raw_b))
+            peer = link.peer_name or "peer"
+            log.info(f"-> sent file {name!r} {len(raw_b)} bytes to {peer!r}")
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip → {peer}",
+                    message=f"file: {name} ({len(raw_b)//1024} KB)",
                 )
 
     watcher = ClipboardWatcher(config.poll_interval, on_local_change)
