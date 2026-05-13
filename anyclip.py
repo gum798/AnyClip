@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import errno
 import hashlib
+import io
 import json
 import logging
 import os
@@ -16,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,9 +30,17 @@ import pyperclip
 from zeroconf import IPVersion, ServiceInfo, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
+try:
+    from PIL import Image, ImageGrab
+    _PIL_OK = True
+except Exception:
+    Image = None  # type: ignore[assignment]
+    ImageGrab = None  # type: ignore[assignment]
+    _PIL_OK = False
+
 SERVICE_TYPE = "_anyclip._tcp.local."
 PROTOCOL_VERSION = 1
-MAX_PAYLOAD = 4 * 1024 * 1024  # 4 MiB hard cap per frame
+MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB hard cap per frame (enough for typical PNGs)
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
@@ -244,6 +255,106 @@ def sha256_hex(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def grab_clipboard_image() -> Optional[bytes]:
+    """Return PNG bytes of an image currently on the clipboard, or None.
+
+    macOS / Windows only. PIL.ImageGrab returns None if the clipboard does
+    not hold a bitmap. Any backend exception is swallowed -- we just treat
+    that as 'no image right now'.
+    """
+    if not _PIL_OK or ImageGrab is None:
+        return None
+    try:
+        result = ImageGrab.grabclipboard()
+    except Exception:
+        return None
+    if result is None:
+        return None
+    # On some platforms ImageGrab returns a list of file paths (when the
+    # clipboard holds file references rather than a bitmap). We ignore
+    # those -- we only sync inline images.
+    if isinstance(result, list):
+        return None
+    if not hasattr(result, "save"):
+        return None
+    try:
+        buf = io.BytesIO()
+        result.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def set_clipboard_image(png_bytes: bytes) -> bool:
+    """Best-effort: place a PNG image on the system clipboard.
+
+    macOS: AppleScript reads a temp file in as ``«class PNGf»``.
+    Windows: PowerShell + System.Windows.Forms.Clipboard.SetImage.
+    Other platforms: no-op (returns False).
+    """
+    if sys.platform == "darwin":
+        path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+                fh.write(png_bytes)
+                path = fh.name
+            script = (
+                f'set the clipboard to '
+                f'(read POSIX file "{path}" as «class PNGf»)'
+            )
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except Exception as exc:
+            log.warning(f"set_clipboard_image (macOS) failed: {exc}")
+            return False
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    if sys.platform == "win32":
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+                fh.write(png_bytes)
+                path = fh.name
+            ps_path = path.replace("'", "''")
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "Add-Type -AssemblyName System.Drawing;"
+                f"$img = [System.Drawing.Image]::FromFile('{ps_path}');"
+                "[System.Windows.Forms.Clipboard]::SetImage($img);"
+                "$img.Dispose()"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-WindowStyle", "Hidden",
+                 "-Command", ps],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=8,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            return result.returncode == 0
+        except Exception as exc:
+            log.warning(f"set_clipboard_image (Windows) failed: {exc}")
+            return False
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    return False
+
+
 _notify_warned = False
 
 
@@ -404,20 +515,22 @@ def parse_args() -> Config:
 
 
 class EchoSuppressor:
-    """Tracks the hash of the last text received from a peer.
+    """Tracks the hash of the last item received from a peer per kind.
 
     The clipboard poller consults this before sending so we don't
-    bounce a peer's update right back at them.
+    bounce a peer's update right back at them. Text and image are
+    tracked separately so an inbound text never accidentally masks
+    an outbound image (and vice versa).
     """
 
     def __init__(self) -> None:
-        self.last_received_hash: Optional[str] = None
+        self._last: dict = {}  # kind -> hash
 
-    def mark_received(self, text: str) -> None:
-        self.last_received_hash = sha256_hex(text)
+    def mark_received(self, kind: str, payload_hash: str) -> None:
+        self._last[kind] = payload_hash
 
-    def should_send(self, text: str) -> bool:
-        return sha256_hex(text) != self.last_received_hash
+    def should_send(self, kind: str, payload_hash: str) -> bool:
+        return self._last.get(kind) != payload_hash
 
 
 class ClipboardWatcher:
@@ -425,10 +538,18 @@ class ClipboardWatcher:
 
     def __init__(self, poll_interval: float, on_change) -> None:
         self.poll_interval = poll_interval
-        self.on_change = on_change
+        self.on_change = on_change  # async def (kind: str, data) -> None
         self._consec_read_fails = 0
         self._read_fail_warned = False
-        self._last: Optional[str] = self._safe_paste()
+        self._last_text: Optional[str] = self._safe_paste()
+        # Track raw PNG bytes hash to compare against the next grab without
+        # re-hashing megabytes on every poll cycle.
+        self._last_image_hash: Optional[str] = None
+        # Seed image baseline so we do not fire a spurious initial send for
+        # whatever happens to be on the clipboard when we start.
+        initial_image = grab_clipboard_image()
+        if initial_image is not None:
+            self._last_image_hash = sha256_bytes(initial_image)
 
     def _safe_paste(self) -> Optional[str]:
         try:
@@ -451,22 +572,51 @@ class ClipboardWatcher:
 
     async def run(self) -> None:
         while True:
+            # Text path.
             text = self._safe_paste()
-            if text is not None and text != self._last:
-                self._last = text
+            if text is not None and text != self._last_text:
+                self._last_text = text
                 try:
-                    await self.on_change(text)
+                    await self.on_change("text", text)
                 except Exception as exc:
-                    log.exception(f"on_change handler failed: {exc}")
+                    log.exception(f"on_change(text) handler failed: {exc}")
+
+            # Image path. Run in a thread because grabclipboard + PNG
+            # encode can take 10s of ms on large bitmaps.
+            png = await asyncio.to_thread(grab_clipboard_image)
+            if png is not None:
+                h = sha256_bytes(png)
+                if h != self._last_image_hash:
+                    self._last_image_hash = h
+                    try:
+                        await self.on_change("image", png)
+                    except Exception as exc:
+                        log.exception(f"on_change(image) handler failed: {exc}")
+
             await asyncio.sleep(self.poll_interval)
 
-    def update_local(self, text: str) -> None:
-        """Set the local clipboard without re-triggering on_change."""
-        self._last = text
+    def update_local_text(self, text: str) -> None:
+        """Set the local text clipboard without re-triggering on_change."""
+        self._last_text = text
         try:
             pyperclip.copy(text)
         except Exception as exc:
-            log.warning(f"clipboard write failed: {exc}")
+            log.warning(f"clipboard write (text) failed: {exc}")
+
+    def update_local_image(self, png_bytes: bytes) -> bool:
+        """Set the local image clipboard without re-triggering on_change.
+
+        Returns True on success. False means the host platform has no
+        write backend (Linux without PIL+xclip etc.) or the OS-native
+        helper failed.
+        """
+        # Update our baseline *before* writing, so even if the OS write
+        # races with our poller we will not echo the same image back.
+        self._last_image_hash = sha256_bytes(png_bytes)
+        ok = set_clipboard_image(png_bytes)
+        if not ok:
+            log.warning("clipboard write (image) failed or unsupported on this OS")
+        return ok
 
 
 class AuthGate:
@@ -697,9 +847,19 @@ class PeerLink:
                 if msg is None:
                     break
                 if msg.get("type") == "clip":
+                    kind = msg.get("kind", "text")
                     content = msg.get("content")
-                    if isinstance(content, str):
-                        await self.on_clip(content)
+                    if kind == "text" and isinstance(content, str):
+                        await self.on_clip("text", content)
+                    elif kind == "image" and isinstance(content, str):
+                        try:
+                            png = base64.b64decode(content, validate=True)
+                        except Exception as exc:
+                            log.warning(f"bad image payload from peer: {exc}")
+                            continue
+                        await self.on_clip("image", png)
+                    else:
+                        log.debug(f"ignoring clip with kind={kind!r}")
                 else:
                     log.debug(f"ignoring message type: {msg.get('type')}")
         finally:
@@ -750,16 +910,38 @@ class PeerLink:
                 self._peer_node_id = None
                 self._peer_name = None
 
-    async def send_clip(self, text: str) -> None:
+    async def send_clip(self, kind: str, content) -> None:
+        """Send a clipboard payload. kind=='text' expects str, kind=='image'
+        expects raw PNG bytes (will be base64-encoded on the wire)."""
         writer = self._writer
         if writer is None or writer.is_closing():
             return
-        await self._send(writer, {
-            "type": "clip",
-            "content": text,
-            "hash": sha256_hex(text),
-            "ts": time.time(),
-        })
+        if kind == "text":
+            if not isinstance(content, str):
+                return
+            payload = {
+                "type": "clip",
+                "kind": "text",
+                "content": content,
+                "hash": sha256_hex(content),
+                "ts": time.time(),
+            }
+        elif kind == "image":
+            if not isinstance(content, (bytes, bytearray)):
+                return
+            encoded = base64.b64encode(bytes(content)).decode("ascii")
+            payload = {
+                "type": "clip",
+                "kind": "image",
+                "content": encoded,
+                "hash": sha256_bytes(bytes(content)),
+                "ts": time.time(),
+                "bytes": len(content),
+            }
+        else:
+            log.debug(f"send_clip: unknown kind {kind!r}, dropping")
+            return
+        await self._send(writer, payload)
 
 
 class MdnsBeacon:
@@ -1007,33 +1189,65 @@ async def run(config: Config) -> None:
 
     notify_enabled = not config.no_notify and sys.platform in ("darwin", "win32")
 
-    async def on_remote_clip(text: str) -> None:
-        suppressor.mark_received(text)
-        watcher.update_local(text)
+    async def on_remote_clip(kind: str, data) -> None:
         peer = link.peer_name or "peer"
-        log.info(f"<- received {len(text)} chars from {peer!r}")
-        if notify_enabled:
-            await notify_async(
-                title=f"AnyClip ← {peer}",
-                message=preview(text),
+        if kind == "text":
+            assert isinstance(data, str)
+            suppressor.mark_received("text", sha256_hex(data))
+            watcher.update_local_text(data)
+            log.info(f"<- received text {len(data)} chars from {peer!r}")
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip ← {peer}",
+                    message=preview(data),
+                )
+        elif kind == "image":
+            assert isinstance(data, (bytes, bytearray))
+            png = bytes(data)
+            suppressor.mark_received("image", sha256_bytes(png))
+            ok = await asyncio.to_thread(watcher.update_local_image, png)
+            log.info(
+                f"<- received image {len(png)} bytes from {peer!r} "
+                f"({'written to clipboard' if ok else 'WRITE FAILED'})"
             )
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip ← {peer}",
+                    message=f"image ({len(png)//1024} KB)",
+                )
 
     link = PeerLink(config, node_id, on_remote_clip)
 
-    async def on_local_change(text: str) -> None:
+    async def on_local_change(kind: str, data) -> None:
         if not link.active:
             return
-        if not suppressor.should_send(text):
-            log.debug("skip echo of just-received clip")
-            return
-        await link.send_clip(text)
-        peer = link.peer_name or "peer"
-        log.info(f"-> sent {len(text)} chars to {peer!r}")
-        if notify_enabled:
-            await notify_async(
-                title=f"AnyClip → {peer}",
-                message=preview(text),
-            )
+        if kind == "text":
+            assert isinstance(data, str)
+            if not suppressor.should_send("text", sha256_hex(data)):
+                log.debug("skip echo of just-received text")
+                return
+            await link.send_clip("text", data)
+            peer = link.peer_name or "peer"
+            log.info(f"-> sent text {len(data)} chars to {peer!r}")
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip → {peer}",
+                    message=preview(data),
+                )
+        elif kind == "image":
+            assert isinstance(data, (bytes, bytearray))
+            png = bytes(data)
+            if not suppressor.should_send("image", sha256_bytes(png)):
+                log.debug("skip echo of just-received image")
+                return
+            await link.send_clip("image", png)
+            peer = link.peer_name or "peer"
+            log.info(f"-> sent image {len(png)} bytes to {peer!r}")
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip → {peer}",
+                    message=f"image ({len(png)//1024} KB)",
+                )
 
     watcher = ClipboardWatcher(config.poll_interval, on_local_change)
     beacon = MdnsBeacon(config, node_id, link.try_connect)
