@@ -633,6 +633,13 @@ class EchoSuppressor:
 
 class ClipboardWatcher:
     READ_FAIL_WARN_AT = 5
+    # OS screenshot tools (notably macOS Screenshot.app) drop several
+    # representations of the same capture onto the clipboard in quick
+    # succession (raw bitmap, TIFF, PNG, ...). Each grab can pick up a
+    # different one and re-encode it to PNG with a different size/hash,
+    # which used to fire 2-3 sends per logical capture. We ignore image
+    # changes that arrive within this many seconds of the previous send.
+    IMAGE_COOLDOWN_S = 1.0
 
     def __init__(self, poll_interval: float, on_change) -> None:
         self.poll_interval = poll_interval
@@ -643,6 +650,9 @@ class ClipboardWatcher:
         # Track raw PNG bytes hash to compare against the next grab without
         # re-hashing megabytes on every poll cycle.
         self._last_image_hash: Optional[str] = None
+        # monotonic time of the last image we actually dispatched, used to
+        # collapse the multi-representation flood right after a screenshot.
+        self._last_image_send_at: float = 0.0
         # Seed image baseline so we do not fire a spurious initial send for
         # whatever happens to be on the clipboard when we start.
         initial_image = grab_clipboard_image()
@@ -683,14 +693,22 @@ class ClipboardWatcher:
 
     async def run(self) -> None:
         while True:
-            # Text path.
+            # Text path. Empty strings are still treated as a "change"
+            # for baseline purposes (so we do not keep re-detecting them)
+            # but they are NOT propagated to the peer -- macOS Screenshot
+            # briefly clears the clipboard during a capture, and we used
+            # to send that as a spurious empty-text frame that surfaced
+            # on the remote side as an "(empty)" toast.
             text = self._safe_paste()
             if text is not None and text != self._last_text:
                 self._last_text = text
-                try:
-                    await self.on_change("text", text)
-                except Exception as exc:
-                    log.exception(f"on_change(text) handler failed: {exc}")
+                if text:
+                    try:
+                        await self.on_change("text", text)
+                    except Exception as exc:
+                        log.exception(f"on_change(text) handler failed: {exc}")
+                else:
+                    log.debug("clipboard cleared (empty text); not propagating")
 
             # Image path. Run in a thread because grabclipboard + PNG
             # encode can take 10s of ms on large bitmaps.
@@ -698,11 +716,24 @@ class ClipboardWatcher:
             if png is not None:
                 h = sha256_bytes(png)
                 if h != self._last_image_hash:
-                    self._last_image_hash = h
-                    try:
-                        await self.on_change("image", png)
-                    except Exception as exc:
-                        log.exception(f"on_change(image) handler failed: {exc}")
+                    now = time.monotonic()
+                    if now - self._last_image_send_at < self.IMAGE_COOLDOWN_S:
+                        # Same logical capture re-encoded by another
+                        # NSPasteboard representation -- absorb the new
+                        # hash silently and drop the send.
+                        elapsed = now - self._last_image_send_at
+                        log.debug(
+                            f"image change within {elapsed:.2f}s of last "
+                            f"send (< {self.IMAGE_COOLDOWN_S}s cooldown), dropping"
+                        )
+                        self._last_image_hash = h
+                    else:
+                        self._last_image_hash = h
+                        self._last_image_send_at = now
+                        try:
+                            await self.on_change("image", png)
+                        except Exception as exc:
+                            log.exception(f"on_change(image) handler failed: {exc}")
 
             # File path. osascript/PowerShell is comparatively expensive,
             # so we only read the bytes off disk when the (path, size,
