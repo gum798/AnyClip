@@ -1244,7 +1244,14 @@ class MdnsBeacon:
 
     def _handler(self, zeroconf, service_type, name, state_change) -> None:
         # zeroconf invokes this from its own thread; bounce onto our loop.
-        if state_change != ServiceStateChange.Added:
+        # We handle BOTH Added and Updated. Without Updated we never see
+        # a peer come back after the prune logic dropped it: once the
+        # zeroconf cache learned about the service the first time, every
+        # subsequent re-announcement from the peer arrives as Updated,
+        # not Added, so a missed-Added would lock us out indefinitely.
+        if state_change not in (
+            ServiceStateChange.Added, ServiceStateChange.Updated,
+        ):
             return
         loop = self._loop
         if loop is None:
