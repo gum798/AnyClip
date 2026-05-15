@@ -941,6 +941,7 @@ class PeerLink:
             )
             self._safe_close(writer)
             return
+        self._enable_keepalive(writer)
         try:
             await self._session(reader, writer, inbound=True)
         except Exception as exc:
@@ -965,6 +966,7 @@ class PeerLink:
                 log.info(f"connect to {host}:{port} failed: {exc}")
                 return
             log.debug(f"outbound connected to {host}:{port}")
+            self._enable_keepalive(writer)
             try:
                 await self._session(reader, writer, inbound=False)
             except Exception as exc:
@@ -980,6 +982,29 @@ class PeerLink:
             writer.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
+        """Turn on TCP keepalive so the OS reaps silent zombies in ~30s.
+
+        Windows ignores the per-socket tuning (its KeepAliveTime is a
+        registry value defaulting to ~2 h) -- the tie-breaker stale-link
+        replacement handles that gap. On macOS the symbolic constant for
+        KEEPIDLE is not in Python stdlib, so we use the raw value 0x10.
+        """
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if sys.platform == "linux":
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            elif sys.platform == "darwin":
+                sock.setsockopt(socket.IPPROTO_TCP, 0x10, 15)  # TCP_KEEPALIVE
+        except OSError as exc:
+            log.debug(f"keepalive setup failed: {exc}")
 
     async def _session(
         self,
@@ -1023,34 +1048,43 @@ class PeerLink:
 
         async with self._lock:
             if self.active:
-                # Only treat the new connection as a genuine concurrent
-                # race for a brief window after the existing link came up.
-                # After that, an established link is sticky -- additional
-                # arrivals are dropped without disturbing the live socket.
+                # Two distinct cases:
                 #
-                # Within the race window, *both* peers must agree on the
-                # same surviving TCP socket. We pick "the smaller node_id
-                # is the outbound side" -- equivalently, the larger node_id
-                # is the inbound side -- so each peer keeps its own end of
-                # the *same* link and drops the other:
+                # (a) Genuine concurrent connect race. Both peers must agree
+                #     on the same surviving socket -- "smaller node_id keeps
+                #     outbound, larger node_id keeps inbound" -- so each
+                #     peer keeps its own end of the *same* TCP link and
+                #     drops the other.
                 #
-                #   Side A (smaller id):  keeps its outbound,  drops inbound
-                #   Side B (larger  id):  keeps its inbound,   drops outbound
+                # (b) Post-race-window arrival. The peer would not be
+                #     re-handshaking with us if its end of the existing
+                #     link were healthy (mdns_reconnect_loop and
+                #     peer_keepalive only fire on link.active==False on
+                #     their side). So a fresh, fully-authenticated handshake
+                #     after RACE_WINDOW_S is itself proof the existing link
+                #     is a zombie (silent TCP death: peer crash, force-kill,
+                #     Wi-Fi flap with no FIN/RST). Replace it.
                 #
-                # The previous version only handled the first row, which
-                # left the larger-id side hugging its dead outbound socket
-                # and produced an immediate "peer disconnected" loop.
+                # Without (b) the larger-id side ends up hugging a dead
+                # writer whose `is_closing()` still reports False, and
+                # every retry from the peer loops "linked -> peer
+                # disconnected" until the peer prunes our address.
                 race = (time.monotonic() - self._linked_at) < RACE_WINDOW_S
-                keep_this_link = race and (
-                    (not inbound and self.node_id < peer_id) or
-                    (inbound and self.node_id > peer_id)
-                )
-                if keep_this_link:
+                if race:
+                    keep_this_link = (
+                        (not inbound and self.node_id < peer_id) or
+                        (inbound and self.node_id > peer_id)
+                    )
+                    if not keep_this_link:
+                        log.debug("tie-breaker: dropping duplicate link (race)")
+                        return
                     log.debug("tie-breaker: replacing existing link (race)")
-                    self._safe_close(self._writer)  # type: ignore[arg-type]
                 else:
-                    log.debug("tie-breaker: dropping duplicate link")
-                    return
+                    log.info(
+                        f"tie-breaker: stale link to {self._peer_name!r} "
+                        f"replaced by fresh handshake from {hello.get('name')!r}"
+                    )
+                self._safe_close(self._writer)  # type: ignore[arg-type]
             self._writer = writer
             self._peer_node_id = peer_id
             self._peer_name = hello.get("name") or peer_id[:8]
