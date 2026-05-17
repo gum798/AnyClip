@@ -1100,7 +1100,8 @@ class PeerLink:
                 msg = await self._recv(reader)
                 if msg is None:
                     break
-                if msg.get("type") == "clip":
+                msg_type = msg.get("type")
+                if msg_type == "clip":
                     kind = msg.get("kind", "text")
                     content = msg.get("content")
                     if kind == "text" and isinstance(content, str):
@@ -1124,8 +1125,16 @@ class PeerLink:
                         await self.on_clip("file", (name, raw))
                     else:
                         log.debug(f"ignoring clip with kind={kind!r}")
+                elif msg_type == "ping":
+                    # Reply with a pong; the actual liveness test is on
+                    # the send side -- if drain fails the TCP socket is
+                    # dead and _recv returns None next loop.
+                    await self._send(writer, {"type": "pong", "ts": time.time()})
+                elif msg_type == "pong":
+                    # Presence is enough -- the link sent SOMETHING.
+                    pass
                 else:
-                    log.debug(f"ignoring message type: {msg.get('type')}")
+                    log.debug(f"ignoring message type: {msg_type!r}")
         finally:
             async with self._lock:
                 if self._writer is writer:
@@ -1173,6 +1182,17 @@ class PeerLink:
                 self._writer = None
                 self._peer_node_id = None
                 self._peer_name = None
+
+    async def send_ping(self) -> None:
+        """App-layer keepalive frame. Drives traffic on an otherwise idle
+        link so a silently-dead TCP socket surfaces as a send failure +
+        EOF on the next recv -- important on Windows where the OS
+        KeepAliveTime defaults to ~2h.
+        """
+        writer = self._writer
+        if writer is None or writer.is_closing():
+            return
+        await self._send(writer, {"type": "ping", "ts": time.time()})
 
     async def send_clip(self, kind: str, content) -> None:
         """Send a clipboard payload. kind=='text' expects str, kind=='image'
@@ -1322,6 +1342,35 @@ class MdnsBeacon:
         except Exception as exc:
             log.warning(f"peer resolve failed for {name!r}: {exc}")
 
+    async def refresh(self) -> None:
+        """Re-announce our service and re-issue the browse query.
+
+        Used by ``idle_link_watchdog`` to recover from stale zeroconf
+        multicast state (network blip without IP change, sleep/wake,
+        Wi-Fi roam) WITHOUT bouncing the whole asyncio runtime. If even
+        this fails to bring a peer back, the watchdog escalates to a
+        full daemon restart via the supervisor.
+        """
+        if self._azc is None or self._info is None:
+            return
+        try:
+            await self._azc.async_update_service(self._info)
+            log.debug("mDNS: re-announced service")
+        except Exception as exc:
+            log.warning(f"mDNS re-announce failed: {exc}")
+        try:
+            if self._browser is not None:
+                await self._browser.async_cancel()
+        except Exception:
+            pass
+        try:
+            self._browser = AsyncServiceBrowser(
+                self._azc.zeroconf, [SERVICE_TYPE], handlers=[self._handler],
+            )
+            log.debug("mDNS: browser re-issued")
+        except Exception as exc:
+            log.warning(f"mDNS browser re-issue failed: {exc}")
+
     async def stop(self) -> None:
         try:
             if self._browser is not None:
@@ -1367,6 +1416,65 @@ async def network_watchdog(beacon: "MdnsBeacon", interval: float = 15.0) -> None
                 f"local IPv4 changed: {previous} -> {current}; "
                 f"restarting daemon to re-advertise mDNS"
             )
+
+
+async def idle_link_watchdog(
+    beacon: "MdnsBeacon",
+    link: "PeerLink",
+    idle_threshold: float = 60.0,
+    refresh_attempts_before_bounce: int = 3,
+) -> None:
+    """Self-heal mDNS when the link sits dead for too long.
+
+    network_watchdog only fires on IP change. If Wi-Fi blips but the
+    IP survives, zeroconf's multicast socket can end up silently
+    unbound (no Errno, no exception) and stop delivering peer
+    advertisements. mdns_reconnect_loop can't help because it depends
+    on `known_peers`, which were pruned the last time the link died.
+
+    Recovery escalation:
+      1..refresh_attempts: call beacon.refresh() to re-announce + re-issue
+         the browse query. Cheap; reuses the existing AsyncZeroconf.
+      attempts+1: raise RuntimeError to unwind asyncio.gather() and let
+         the supervisor restart the whole runtime with a fresh zeroconf
+         socket. Same trick as network_watchdog.
+
+    Counter resets whenever the link comes back up.
+    """
+    consecutive_idle = 0
+    while True:
+        await asyncio.sleep(idle_threshold)
+        if link.active:
+            consecutive_idle = 0
+            continue
+        consecutive_idle += 1
+        elapsed = idle_threshold * consecutive_idle
+        if consecutive_idle <= refresh_attempts_before_bounce:
+            log.info(
+                f"link idle {elapsed:.0f}s; refreshing mDNS "
+                f"(attempt {consecutive_idle}/{refresh_attempts_before_bounce})"
+            )
+            await beacon.refresh()
+        else:
+            raise RuntimeError(
+                f"link idle > {elapsed:.0f}s with no recovery after "
+                f"{refresh_attempts_before_bounce} mDNS refresh attempts; "
+                f"bouncing daemon to re-bind zeroconf"
+            )
+
+
+async def link_ping_loop(link: "PeerLink", interval: float = 30.0) -> None:
+    """Send an app-layer ping on the active link every `interval` seconds.
+
+    Drives traffic so a silently-dead TCP socket surfaces as a send
+    failure -- without this, on Windows the OS keepalive defaults to
+    ~2h and the link can sit half-dead for hours before either side
+    notices.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        if link.active:
+            await link.send_ping()
 
 
 async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
@@ -1584,6 +1692,8 @@ async def run(config: Config) -> None:
             watcher.run(),
             mdns_reconnect_loop(beacon, link),
             network_watchdog(beacon),
+            idle_link_watchdog(beacon, link),
+            link_ping_loop(link),
         ]
         for host, port in config.peers:
             tasks.append(peer_keepalive(host, port, link))
