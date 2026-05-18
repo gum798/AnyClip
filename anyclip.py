@@ -1999,6 +1999,20 @@ async def run(config: Config) -> None:
 
 
 def main() -> None:
+    # Short-circuit CLI flags (token save, autostart install/uninstall/
+    # status) need to run argparse regardless of GUI mode, otherwise
+    # `AnyClip.exe --save-token X` would silently launch the tray
+    # instead of saving and exiting. parse_args() handles these via
+    # sys.exit() internally, so the call never returns when one is
+    # present.
+    _short_circuit_flags = (
+        "--save-token", "--install-autostart",
+        "--uninstall-autostart", "--autostart-status",
+    )
+    if any(f in sys.argv for f in _short_circuit_flags):
+        parse_args()
+        return  # unreachable -- parse_args exits
+
     # GUI mode routing happens *before* full argparse so the menubar
     # entry point does not require --token on the command line (the
     # onboarding dialog supplies it). The argparse pass still runs
