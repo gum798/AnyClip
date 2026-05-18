@@ -8,12 +8,21 @@ the app off the Dock so only the menubar icon is visible.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from setuptools import setup
 
 APP = ["anyclip.py"]
 DATA_FILES: list = []
+
+# Sparkle public key. The matching private key lives in the
+# SPARKLE_PRIVATE_KEY GitHub Actions Secret; the public half is
+# injected at build time via SPARKLE_PUBLIC_KEY so it never lives in
+# git history. The maintainer generates the pair once with Sparkle's
+# `generate_keys` tool (see docs/SPARKLE-SETUP.md) and sets this env
+# var both locally and on the CI runner.
+SPARKLE_PUBLIC_KEY = os.environ.get("SPARKLE_PUBLIC_KEY", "")
 
 PLIST = {
     "CFBundleName": "AnyClip",
@@ -33,6 +42,13 @@ PLIST = {
     # Sonoma's Local Network permission dialog name the service.
     "NSBonjourServices": ["_anyclip._tcp"],
     "LSMinimumSystemVersion": "14.0",
+    # Sparkle auto-update wiring. The feed URL is GitHub Pages on the
+    # main repo; the public key is what users' Sparkle uses to verify
+    # the EdDSA signature on each downloaded .dmg.
+    "SUFeedURL": "https://gum798.github.io/AnyClip/appcast.xml",
+    "SUPublicEDKey": SPARKLE_PUBLIC_KEY,
+    "SUEnableAutomaticChecks": True,
+    "SUScheduledCheckInterval": 86400,  # daily
 }
 
 OPTIONS = {
@@ -40,6 +56,14 @@ OPTIONS = {
     "plist": PLIST,
     # macOS .app Finder/About icon. Built by build/icon/build.sh.
     "iconfile": "app/icons/anyclip.icns",
+    # Bundle Sparkle.framework when SPARKLE_FRAMEWORK_PATH is set. CI
+    # downloads Sparkle.framework into a known location and exports
+    # this var before running py2app; local source-checkout builds
+    # without auto-update support set it empty and Sparkle is omitted.
+    "frameworks": (
+        [os.environ["SPARKLE_FRAMEWORK_PATH"]]
+        if os.environ.get("SPARKLE_FRAMEWORK_PATH") else []
+    ),
     # `packages` ensures the entire local module set is copied (the
     # daemon imports them at runtime via `app.menubar_mac.launch_gui`).
     # The `app` package already contains the `icons/` subfolder; py2app

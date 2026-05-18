@@ -34,10 +34,24 @@ jobs:
       - name: Run pytest
         run: pytest tests/ -v
 
-      - name: Build .app with py2app
+      - name: Download Sparkle.framework
+        env:
+          SPARKLE_VERSION: "2.6.4"
         run: |
-          # py2app's alias mode pulls in dev paths; `--no-strip` is just
-          # the default safer option for first-time builds.
+          set -e
+          curl -L -o Sparkle.tar.xz \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          mkdir -p sparkle
+          tar -xJf Sparkle.tar.xz -C sparkle
+          # Resolve framework path for setup.py + sign_update path for
+          # the signing step below.
+          echo "SPARKLE_FRAMEWORK_PATH=$(pwd)/sparkle/Sparkle.framework" >> "$GITHUB_ENV"
+          echo "SPARKLE_BIN_DIR=$(pwd)/sparkle/bin" >> "$GITHUB_ENV"
+
+      - name: Build .app with py2app
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+        run: |
           python setup.py py2app
 
       - name: Package .dmg via hdiutil
@@ -50,10 +64,71 @@ jobs:
             -ov -format UDZO \
             dist/AnyClip-${{ github.ref_name }}.dmg
 
+      - name: Sign .dmg with sign_update (EdDSA)
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -e
+          # sign_update reads the private key from stdin or from a
+          # path; we hand it via stdin so the secret never lands on
+          # disk on the runner.
+          echo "$SPARKLE_PRIVATE_KEY" > /tmp/sparkle_ed_priv
+          SIG=$("$SPARKLE_BIN_DIR/sign_update" \
+            -f /tmp/sparkle_ed_priv \
+            "dist/AnyClip-${{ github.ref_name }}.dmg")
+          rm -f /tmp/sparkle_ed_priv
+          echo "Sparkle signature line: $SIG"
+          echo "$SIG" > dist/sparkle-signature.txt
+
+      - name: Update appcast.xml on gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          DMG="dist/AnyClip-${TAG}.dmg"
+          SIG_LINE="$(cat dist/sparkle-signature.txt)"
+          LENGTH="$(stat -f%z "$DMG")"
+          PUBDATE="$(LC_ALL=C date -u +'%a, %d %b %Y %H:%M:%S %z')"
+
+          # Check out gh-pages (created on first release if missing).
+          git fetch origin gh-pages || true
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add /tmp/gh-pages origin/gh-pages
+          else
+            mkdir -p /tmp/gh-pages
+            (cd /tmp/gh-pages && git init -b gh-pages && \
+              git remote add origin "https://github.com/${{ github.repository }}.git")
+          fi
+          cp docs/appcast.template.xml /tmp/gh-pages/appcast.xml.template
+          # Substitute placeholders -- sed -i differs between mac/linux,
+          # use a portable form.
+          python - <<PYEOF
+          import os, pathlib, re
+          tpl = pathlib.Path("/tmp/gh-pages/appcast.xml.template").read_text()
+          out = (tpl
+            .replace("{{VERSION}}", "${VERSION}")
+            .replace("{{TAG}}", "${TAG}")
+            .replace("{{DMG_LENGTH}}", "${LENGTH}")
+            .replace("{{SIG_LINE}}", '''${SIG_LINE}''')
+            .replace("{{PUBDATE}}", "${PUBDATE}")
+            .replace("{{REPO}}", "${{ github.repository }}"))
+          pathlib.Path("/tmp/gh-pages/appcast.xml").write_text(out)
+          PYEOF
+          (cd /tmp/gh-pages && \
+            git config user.email "release-bot@anyclip" && \
+            git config user.name "AnyClip Release Bot" && \
+            git add appcast.xml && \
+            git commit -m "appcast: ${TAG}" && \
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:gh-pages)
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AnyClip-${{ github.ref_name }}.dmg
+          files: |
+            dist/AnyClip-${{ github.ref_name }}.dmg
+            dist/sparkle-signature.txt
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

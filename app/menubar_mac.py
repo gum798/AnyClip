@@ -135,6 +135,9 @@ class AnyClipMenubarApp:
         self.open_logs_item = rumps_mod.MenuItem(
             "Open Logs", callback=self._open_logs,
         )
+        self.check_updates_item = rumps_mod.MenuItem(
+            "Check for Updates…", callback=self._check_updates,
+        )
         self.quit_item = rumps_mod.MenuItem("Quit", callback=self._quit)
         self._lan_settings_item: Optional["object"] = None
 
@@ -145,9 +148,18 @@ class AnyClipMenubarApp:
             self.token_item,
             self.start_at_login_item,
             self.open_logs_item,
+            self.check_updates_item,
             None,
             self.quit_item,
         ]
+
+        # Start Sparkle (no-op outside the .app bundle).
+        try:
+            from app.updater_bridge import init_updater
+
+            init_updater()
+        except Exception:
+            log.exception("updater init failed; continuing without auto-update")
 
         self.timer = rumps_mod.Timer(self._tick, 0.5)
         self.timer.start()
@@ -235,6 +247,20 @@ class AnyClipMenubarApp:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def _check_updates(self, _sender) -> None:
+        try:
+            from app.updater_bridge import check_for_updates, is_active
+
+            if not is_active():
+                self.rumps.alert(
+                    "Updates unavailable",
+                    "Auto-update is only active in the packaged .app build.",
+                )
+                return
+            check_for_updates()
+        except Exception:
+            log.exception("check-for-updates failed")
 
     def _open_lan_settings(self, _sender) -> None:
         subprocess.Popen(

@@ -1,0 +1,29 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"
+     xmlns:dc="http://purl.org/dc/elements/1.1/"
+     version="2.0">
+  <channel>
+    <title>AnyClip</title>
+    <link>https://gum798.github.io/{{REPO}}/appcast.xml</link>
+    <description>AnyClip macOS release feed</description>
+    <language>en</language>
+
+    <item>
+      <title>Version {{VERSION}}</title>
+      <pubDate>{{PUBDATE}}</pubDate>
+      <sparkle:version>{{VERSION}}</sparkle:version>
+      <sparkle:shortVersionString>{{VERSION}}</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[
+        <p>See the
+          <a href="https://github.com/{{REPO}}/releases/tag/{{TAG}}">release notes</a>.
+        </p>
+      ]]></description>
+      <enclosure
+        url="https://github.com/{{REPO}}/releases/download/{{TAG}}/AnyClip-{{TAG}}.dmg"
+        length="{{DMG_LENGTH}}"
+        type="application/octet-stream"
+        {{SIG_LINE}} />
+    </item>
+  </channel>
+</rss>
