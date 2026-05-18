@@ -1559,10 +1559,6 @@ class MdnsBeacon:
             ServiceStateChange.Added, ServiceStateChange.Updated,
         ):
             return
-        # Any mDNS activity for our service type proves Local Network
-        # is not silently blocked on macOS. Bump before dispatch so
-        # the probe sees the evidence even if resolve() races slow.
-        self.events_seen += 1
         loop = self._loop
         if loop is None:
             return
@@ -1581,7 +1577,14 @@ class MdnsBeacon:
                 props[key] = val
             peer_id = props.get("id")
             if peer_id == self.node_id:
-                return  # ourselves
+                # Self-loopback discovery does not prove network is
+                # alive (the zeroconf cache resolves locally even when
+                # Local Network multicast is blocked). Do not count it.
+                return
+            # Resolving a *non-self* peer means a multicast Added/Updated
+            # actually crossed the network -- the strongest signal we
+            # have that Local Network is not silently revoked.
+            self.events_seen += 1
             addrs = info.parsed_addresses()
             if not addrs or not info.port:
                 return
