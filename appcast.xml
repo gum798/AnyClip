@@ -10,7 +10,7 @@
 
     <item>
       <title>Version 0.9.0-rc1</title>
-      <pubDate>Mon, 18 May 2026 06:35:09 +0000</pubDate>
+      <pubDate>Mon, 18 May 2026 06:42:02 +0000</pubDate>
       <sparkle:version>0.9.0-rc1</sparkle:version>
       <sparkle:shortVersionString>0.9.0-rc1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
@@ -23,12 +23,12 @@
         url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc1/AnyClip-v0.9.0-rc1.dmg"
         sparkle:os="macos"
         type="application/octet-stream"
-        sparkle:edSignature="Yqjar/26KRtmK+KzZ91LFOesndJC65R+cPbzdDQ+mYqPXOJgtxocb++imGIwpvVQ/uWflNpJxtx3kGQSqqfsDw==" length="51557427" />
+        sparkle:edSignature="d8YU5P2Ji1UCq4Y/xfV+id0TlUR6fUwYvl+pQL6FdSU3A3BYhOV/Dktc/0pOe/+xT5Zz+ly+7iuPOvonJ1IzAg==" length="51557409" />
       <enclosure
         url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc1/AnyClip-v0.9.0-rc1-windows-x64.zip"
         sparkle:os="windows"
         type="application/octet-stream"
-        sparkle:edSignature="O/aBQEpcOrRYASpiLeJonE2zpAFxdSoINDVhy1zWSlmn/89c1+TSbv3X8cia72VBNKeWsBJucwNMV80kAlArBw==" length="23076517" />
+        sparkle:edSignature="uADasDXGaG3RCg62f/es321zzY5gt/LW7moCRp0yeQ/cIg0PELcQwxJx4XrNq5Q+9xEzdWRtlOwMNAMjbGN/DA==" length="23076583" />
     </item>
   </channel>
 </rss>
