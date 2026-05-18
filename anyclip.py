@@ -30,6 +30,7 @@ import pyperclip
 from zeroconf import IPVersion, ServiceInfo, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
+import config_store
 from version_negotiator import (
     Compatibility,
     VersionInfo,
@@ -592,9 +593,18 @@ def parse_args() -> Config:
     env_token = os.environ.get("ANYCLIP_TOKEN")
     parser.add_argument(
         "--token",
-        default=env_token,
+        default=None,
         help="Shared secret. Both peers must use the same value. "
-             "Falls back to ANYCLIP_TOKEN env var.",
+             "Falls back to ANYCLIP_TOKEN env var, then to "
+             "~/.anyclip/config.json (see --save-token).",
+    )
+    parser.add_argument(
+        "--save-token",
+        metavar="TOKEN",
+        default=None,
+        help="Persist the given token to ~/.anyclip/config.json (0600) "
+             "and exit. Subsequent runs do not need --token or "
+             "ANYCLIP_TOKEN. Use '-' to read the token from stdin.",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"TCP port to listen on (default: {DEFAULT_PORT})")
@@ -612,13 +622,51 @@ def parse_args() -> Config:
     parser.add_argument("--no-notify", action="store_true",
                         help="Suppress desktop toast notifications on clipboard sync")
     args = parser.parse_args()
-    if not args.token:
+
+    # --save-token short-circuits everything else.
+    if args.save_token is not None:
+        token_to_save = args.save_token
+        if token_to_save == "-":
+            token_to_save = sys.stdin.read().strip()
+        if not token_to_save:
+            sys.stderr.write("error: --save-token requires a non-empty value\n")
+            sys.exit(2)
+        config_store.save(config_store.Config(token=token_to_save))
         sys.stderr.write(
-            "error: --token is required (or set ANYCLIP_TOKEN env var)\n"
+            f"anyclip: token saved to {config_store.config_path()} (0600)\n"
+        )
+        sys.exit(0)
+
+    # Token resolution priority: CLI flag > env var > on-disk config.
+    token: Optional[str] = args.token
+    token_source = "cli" if token else None
+    if not token and env_token:
+        token = env_token
+        token_source = "env"
+    if not token:
+        stored = config_store.load()
+        if stored is not None:
+            token = stored.token
+            token_source = "config"
+
+    if not token:
+        sys.stderr.write(
+            "error: no token configured. Provide one of:\n"
+            "  --token <TOKEN>\n"
+            "  ANYCLIP_TOKEN environment variable\n"
+            "  anyclip --save-token <TOKEN>   (persists to ~/.anyclip/config.json)\n"
         )
         sys.exit(2)
+
+    if token_source == "config":
+        # Logging is not configured yet at parse_args() time, so defer
+        # the INFO line to run() via the stash on args. We attach it to
+        # the returned Config via a small module-level signal instead of
+        # widening the dataclass schema.
+        _token_loaded_from_config.set(True)
+
     return Config(
-        token=args.token,
+        token=token,
         port=args.port,
         name=args.name,
         poll_interval=max(0.1, args.poll),
@@ -626,6 +674,24 @@ def parse_args() -> Config:
         peers=list(args.peer or []),
         no_notify=args.no_notify,
     )
+
+
+class _BoolSignal:
+    """Tiny module-level latch so parse_args() can hand a one-bit signal
+    to run() without widening the public Config dataclass schema.
+    """
+
+    def __init__(self) -> None:
+        self._v = False
+
+    def set(self, value: bool) -> None:
+        self._v = value
+
+    def get(self) -> bool:
+        return self._v
+
+
+_token_loaded_from_config = _BoolSignal()
 
 
 class EchoSuppressor:
@@ -1642,6 +1708,8 @@ async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
 
 async def run(config: Config) -> None:
     setup_logging(config.verbose)
+    if _token_loaded_from_config.get():
+        log.info(f"token loaded from config ({config_store.config_path()})")
     prepare_pid_lock(config.port)
     clear_received_dir()
     node_id = str(uuid.uuid4())
