@@ -34,9 +34,12 @@ _winsparkle_dll: Optional["object"] = None
 def _try_load_sparkle():
     """Return the SUUpdaterController class or None.
 
-    PyObjC loads frameworks by name; it walks NSBundle search paths,
-    which inside a py2app bundle include Contents/Frameworks. Outside
-    the bundle the load fails and we return None.
+    NSBundle does not auto-scan Contents/Frameworks/ for arbitrary
+    bundle identifiers, so we first try the bundle-ID lookup (works
+    when the framework was already loaded by another process) and
+    then fall back to an explicit bundleWithPath_ pointing at the
+    .app's Contents/Frameworks/Sparkle.framework. Outside a packaged
+    bundle (running from source) both paths fail and we return None.
     """
     try:
         import objc  # type: ignore[import-not-found]
@@ -45,11 +48,24 @@ def _try_load_sparkle():
         log.debug("PyObjC not available; updater disabled")
         return None
     try:
-        # Standard Sparkle bundle ID.
         bundle = NSBundle.bundleWithIdentifier_("org.sparkle-project.Sparkle")
         if bundle is None:
-            log.info("Sparkle.framework not in NSBundle search path; updater disabled")
-            return None
+            main_bundle = NSBundle.mainBundle()
+            if main_bundle is not None:
+                sparkle_path = (
+                    main_bundle.bundlePath()
+                    + "/Contents/Frameworks/Sparkle.framework"
+                )
+                bundle = NSBundle.bundleWithPath_(sparkle_path)
+                if bundle is None:
+                    log.info(
+                        "Sparkle.framework not found at %s; updater disabled",
+                        sparkle_path,
+                    )
+                    return None
+            else:
+                log.info("no main NSBundle; updater disabled")
+                return None
         if not bundle.load():
             log.info("Sparkle.framework failed to load; updater disabled")
             return None
