@@ -30,6 +30,13 @@ import pyperclip
 from zeroconf import IPVersion, ServiceInfo, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
+from version_negotiator import (
+    Compatibility,
+    VersionInfo,
+    link_allowed,
+    negotiate,
+)
+
 try:
     from PIL import Image, ImageGrab
     _PIL_OK = True
@@ -39,7 +46,16 @@ except Exception:
     _PIL_OK = False
 
 SERVICE_TYPE = "_anyclip._tcp.local."
-PROTOCOL_VERSION = 1
+# Single source of truth for the app build. Injected into handshake JSON
+# and mDNS TXT so peers can show "peer needs update" hints. Bump in lockstep
+# with releases. PROTOCOL_MAJOR/MINOR are independent: PROTOCOL_MAJOR is the
+# wire-compat key (mismatch = refuse link), PROTOCOL_MINOR is informational.
+APP_VERSION = "1.0.0"
+PROTOCOL_MAJOR = 1
+PROTOCOL_MINOR = 0
+# Legacy alias: pre-1.0 peers send a single `version` int. New code treats
+# it as equivalent to protocol_major so old<->new handshakes still link.
+PROTOCOL_VERSION = PROTOCOL_MAJOR
 MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB hard cap per frame (enough for typical PNGs)
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
@@ -1017,7 +1033,13 @@ class PeerLink:
             "token": self._token_hash,
             "node_id": self.node_id,
             "name": self.config.name,
+            # `version` is the legacy single-int field; kept for old peers
+            # that only know about it. New peers also read the explicit
+            # protocol_major/minor + app_version fields below.
             "version": PROTOCOL_VERSION,
+            "app_version": APP_VERSION,
+            "protocol_major": PROTOCOL_MAJOR,
+            "protocol_minor": PROTOCOL_MINOR,
         })
         try:
             hello = await asyncio.wait_for(self._recv(reader), timeout=HANDSHAKE_TIMEOUT)
@@ -1036,9 +1058,46 @@ class PeerLink:
             if peer_ip:
                 await self._auth_gate.record_fail(peer_ip)
             return
-        if hello.get("version") != PROTOCOL_VERSION:
-            log.warning(f"version mismatch: peer={hello.get('version')}")
+        # Parse peer's version info with backward-compat defaults: an old
+        # peer only sends `version`, so treat that as protocol_major and
+        # assume protocol_minor=0 / unknown app_version.
+        peer_proto_major_raw = hello.get("protocol_major")
+        if not isinstance(peer_proto_major_raw, int):
+            peer_proto_major_raw = hello.get("version", 0)
+            if not isinstance(peer_proto_major_raw, int):
+                peer_proto_major_raw = 0
+        peer_proto_minor_raw = hello.get("protocol_minor", 0)
+        if not isinstance(peer_proto_minor_raw, int):
+            peer_proto_minor_raw = 0
+        peer_app_version = hello.get("app_version")
+        if not isinstance(peer_app_version, str) or not peer_app_version:
+            peer_app_version = "unknown"
+
+        peer_version = VersionInfo(
+            app_version=peer_app_version,
+            protocol_major=peer_proto_major_raw,
+            protocol_minor=peer_proto_minor_raw,
+        )
+        local_version = VersionInfo(
+            app_version=APP_VERSION,
+            protocol_major=PROTOCOL_MAJOR,
+            protocol_minor=PROTOCOL_MINOR,
+        )
+        compat = negotiate(local_version, peer_version)
+        if not link_allowed(compat):
+            log.warning(
+                f"version refused: local proto={PROTOCOL_MAJOR}.{PROTOCOL_MINOR} "
+                f"app={APP_VERSION} vs peer proto="
+                f"{peer_version.protocol_major}.{peer_version.protocol_minor} "
+                f"app={peer_version.app_version} -> {compat.value}"
+            )
             return
+        if compat != Compatibility.COMPATIBLE:
+            log.info(
+                f"version mismatch (link kept): {compat.value} "
+                f"local proto={PROTOCOL_MAJOR}.{PROTOCOL_MINOR} vs peer proto="
+                f"{peer_version.protocol_major}.{peer_version.protocol_minor}"
+            )
         peer_id = hello.get("node_id")
         if not isinstance(peer_id, str) or peer_id == self.node_id:
             log.debug("self loopback or bad node_id, dropping")
@@ -1092,7 +1151,9 @@ class PeerLink:
 
         log.info(
             f"linked with peer name={hello.get('name')!r} "
-            f"id={peer_id[:8]} ({'inbound' if inbound else 'outbound'})"
+            f"id={peer_id[:8]} ({'inbound' if inbound else 'outbound'}) "
+            f"peer_app_version={peer_version.app_version} "
+            f"peer_proto={peer_version.protocol_major}.{peer_version.protocol_minor}"
         )
 
         try:
@@ -1286,7 +1347,11 @@ class MdnsBeacon:
             server=server_host,
             properties={
                 "id": self.node_id,
+                # legacy alias; new peers prefer protocol_major below
                 "version": str(PROTOCOL_VERSION),
+                "app_version": APP_VERSION,
+                "protocol_major": str(PROTOCOL_MAJOR),
+                "protocol_minor": str(PROTOCOL_MINOR),
             },
         )
         await self._azc.async_register_service(self._info)
