@@ -16,7 +16,12 @@ a = Analysis(
     ['anyclip.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    # Bundle the tray PNGs alongside `app/` so the runtime path
+    # `app/icons/tray/*.png` resolves inside the PyInstaller bundle.
+    datas=[
+        ('app/icons/anyclip.ico', 'app/icons'),
+        ('app/icons/tray', 'app/icons/tray'),
+    ],
     hiddenimports=[
         'anyclip',
         'app',
@@ -62,8 +67,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # Slice 8 swaps this for a real .ico.
-    icon=None,
+    icon='app/icons/anyclip.ico',
 )
 
 coll = COLLECT(

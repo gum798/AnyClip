@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from queue import Empty
 from typing import Optional
 
@@ -25,6 +26,9 @@ import anyclip
 import autostart
 import config_store
 import peer_state
+
+ICONS_DIR = Path(__file__).resolve().parent / "icons"
+TRAY_DIR = ICONS_DIR / "tray"
 
 log = logging.getLogger("anyclip.tray_win")
 
@@ -80,16 +84,27 @@ def launch_gui() -> None:
 
 
 def _make_status_icon(Image, ImageDraw, kind: str):
-    """Render a 64x64 placeholder icon coloured per state.
+    """Return the per-state tray image.
 
-    Slice 8 swaps these for real assets. Until then the colour is
-    enough to tell the three states apart in the tray.
+    Prefers the built monochrome PNG from `app/icons/tray/`. Falls
+    back to a coloured placeholder if the asset is missing so the
+    tray icon is never empty on a broken bundle.
     """
+    name = {"linked": "linked", "searching": "searching"}.get(kind, "error")
+    # @2x first for HiDPI; pystray scales to the OS-requested size.
+    for candidate in (TRAY_DIR / f"{name}@2x.png", TRAY_DIR / f"{name}.png"):
+        if candidate.exists():
+            try:
+                return Image.open(candidate).convert("RGBA")
+            except Exception:
+                log.exception("tray asset load failed: %s", candidate)
+                break
+    # Fallback: coloured disc so the user still sees a state change.
     colour = {
-        "linked": (52, 168, 83, 255),     # green
-        "searching": (251, 188, 5, 255),  # amber
-        "error": (234, 67, 53, 255),      # red
-        "idle": (154, 160, 166, 255),     # grey
+        "linked": (52, 168, 83, 255),
+        "searching": (251, 188, 5, 255),
+        "error": (234, 67, 53, 255),
+        "idle": (154, 160, 166, 255),
     }.get(kind, (154, 160, 166, 255))
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)

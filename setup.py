@@ -38,8 +38,14 @@ PLIST = {
 OPTIONS = {
     "argv_emulation": False,
     "plist": PLIST,
+    # macOS .app Finder/About icon. Built by build/icon/build.sh.
+    "iconfile": "app/icons/anyclip.icns",
     # `packages` ensures the entire local module set is copied (the
     # daemon imports them at runtime via `app.menubar_mac.launch_gui`).
+    # The `app` package already contains the `icons/` subfolder; py2app
+    # copies non-Python files inside a `packages` entry for free, so
+    # the tray PDFs travel with the bundle without a separate data_files
+    # block.
     "packages": [
         "app",
         "pyperclip",
