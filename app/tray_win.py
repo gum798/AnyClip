@@ -28,7 +28,7 @@ import config_store
 import peer_state
 
 ICONS_DIR = Path(__file__).resolve().parent / "icons"
-TRAY_DIR = ICONS_DIR / "tray"
+APP_ICON_ICO = ICONS_DIR / "anyclip.ico"
 
 log = logging.getLogger("anyclip.tray_win")
 
@@ -83,39 +83,24 @@ def launch_gui() -> None:
     tray.run()
 
 
-def _make_status_icon(Image, ImageDraw, kind: str):
-    """Return the per-state tray image.
+def _load_app_icon(Image, ImageDraw):
+    """Return the single AnyClip tray image (state-independent).
 
-    Prefers the built monochrome PNG from `app/icons/tray/`. Falls
-    back to a coloured placeholder if the asset is missing so the
-    tray icon is never empty on a broken bundle.
+    Matches the macOS menubar's "show one icon always" UX. State info
+    lives in the tray tooltip + menu items instead of state-coloured
+    icons. Falls back to a coloured disc if the bundled .ico cannot
+    be read so the tray is never empty.
     """
-    # idle is treated as "still looking" so the tray does not flash
-    # the error glyph during the brief window between launch and the
-    # first PeerDiscovered event.
-    name = {
-        "linked": "linked",
-        "searching": "searching",
-        "idle": "searching",
-    }.get(kind, "error")
-    # @2x first for HiDPI; pystray scales to the OS-requested size.
-    for candidate in (TRAY_DIR / f"{name}@2x.png", TRAY_DIR / f"{name}.png"):
-        if candidate.exists():
-            try:
-                return Image.open(candidate).convert("RGBA")
-            except Exception:
-                log.exception("tray asset load failed: %s", candidate)
-                break
-    # Fallback: coloured disc so the user still sees a state change.
-    colour = {
-        "linked": (52, 168, 83, 255),
-        "searching": (251, 188, 5, 255),
-        "error": (234, 67, 53, 255),
-        "idle": (154, 160, 166, 255),
-    }.get(kind, (154, 160, 166, 255))
+    if APP_ICON_ICO.exists():
+        try:
+            return Image.open(APP_ICON_ICO).convert("RGBA")
+        except Exception:
+            log.exception("app icon load failed: %s", APP_ICON_ICO)
+    # Last-resort fallback so a packaging mistake never leaves the
+    # tray empty.
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.ellipse((6, 6, 58, 58), fill=colour)
+    draw.ellipse((6, 6, 58, 58), fill=(26, 115, 232, 255))
     return img
 
 
@@ -131,7 +116,7 @@ class AnyClipTrayApp:
 
         self.icon = pystray_mod.Icon(
             "AnyClip",
-            icon=_make_status_icon(Image, ImageDraw, "idle"),
+            icon=_load_app_icon(Image, ImageDraw),
             title="AnyClip — idle",
             menu=self._build_menu(),
         )
@@ -210,8 +195,9 @@ class AnyClipTrayApp:
             self._stop.wait(0.5)
 
     def _apply_state(self, state: peer_state.State) -> None:
+        # Tray icon is constant (single AnyClip glyph); state info
+        # lives in the tooltip + menu items only.
         self._current_state = state
-        self.icon.icon = _make_status_icon(self.Image, self.ImageDraw, state.kind)
         title = self._status_label()
         try:
             self.icon.title = f"AnyClip — {title}"

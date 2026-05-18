@@ -24,26 +24,12 @@ import config_store
 import peer_state
 
 ICONS_DIR = Path(__file__).resolve().parent / "icons"
-TRAY_DIR = ICONS_DIR / "tray"
 
-
-def _tray_icon_for(kind: str) -> Optional[str]:
-    """Return absolute path to the tray PDF for the given state.
-
-    Falls back to None if the asset is missing so the GUI keeps
-    running with its current title-string fallback rather than
-    crashing on a packaging mistake.
-    """
-    # idle is treated as "still looking" so the menubar does not flash
-    # the error glyph during the brief window between launch and the
-    # first PeerDiscovered event.
-    name = {
-        "linked": "linked",
-        "searching": "searching",
-        "idle": "searching",
-    }.get(kind, "error")
-    pdf = TRAY_DIR / f"{name}.pdf"
-    return str(pdf) if pdf.exists() else None
+# The menubar title is a single static "@" character per user request.
+# All state distinction lives in the dropdown menu items (Status label,
+# Last Sync, "Open Local Network Settings" appears on error_local_network)
+# so the menubar stays visually quiet.
+MENUBAR_TITLE = "@"
 
 log = logging.getLogger("anyclip.menubar_mac")
 
@@ -117,15 +103,13 @@ class AnyClipMenubarApp:
         self.rumps = rumps_mod
         self.supervisor = supervisor
 
-        # Template image: monochrome PDF that macOS auto-inverts for
-        # light/dark menubar. Falls back to the unicode glyph title if
-        # the asset is missing so the menubar is never blank.
-        initial_icon = _tray_icon_for("searching")
+        # No tray icon: the menubar shows a single "@" glyph and stays
+        # there regardless of state. State changes are reflected in the
+        # dropdown menu items only.
         self.app = rumps_mod.App(
             "AnyClip",
-            icon=initial_icon,
-            template=True,
-            title=None if initial_icon else "📋",
+            icon=None,
+            title=MENUBAR_TITLE,
             quit_button=None,
         )
         self.status_item = rumps_mod.MenuItem("Status: idle")
@@ -188,29 +172,18 @@ class AnyClipMenubarApp:
 
     def _apply_state(self, state: peer_state.State) -> None:
         kind = state.kind
-        icon_path = _tray_icon_for(kind)
-        if icon_path is not None:
-            # rumps preserves `template` across icon swaps when the
-            # App was constructed with template=True, so light/dark
-            # auto-inversion stays in effect.
-            self.app.icon = icon_path
-            self.app.title = None
+        # Menubar title stays "@" regardless of state -- state info
+        # lives in the dropdown menu items below.
         if kind == "linked":
-            if icon_path is None:
-                self.app.title = "📋"
             self.status_item.title = f"Linked: {state.peer_name or 'peer'}"
             self.last_sync_item.title = (
                 f"Linked since: {time.strftime('%H:%M:%S')}"
             )
             self._remove_lan_settings_item()
         elif kind == "searching":
-            if icon_path is None:
-                self.app.title = "📋…"
             self.status_item.title = "Searching for peer"
             self._remove_lan_settings_item()
         elif kind == "error":
-            if icon_path is None:
-                self.app.title = "📋⚠"
             reason = state.reason or "unknown"
             self.status_item.title = f"Error: {reason}"
             if reason == "local_network":
@@ -218,8 +191,6 @@ class AnyClipMenubarApp:
             else:
                 self._remove_lan_settings_item()
         else:
-            if icon_path is None:
-                self.app.title = "📋"
             self.status_item.title = "Idle"
             self._remove_lan_settings_item()
 

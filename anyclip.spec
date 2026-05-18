@@ -15,7 +15,6 @@ block_cipher = None
 
 _datas = [
     ('app/icons/anyclip.ico', 'app/icons'),
-    ('app/icons/tray', 'app/icons/tray'),
 ]
 # WinSparkle.dll is dropped into app/ by the release workflow's
 # download step. PyInstaller copies it into the bundle root so the
