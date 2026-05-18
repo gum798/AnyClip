@@ -11,7 +11,11 @@
     <item>
       <title>Version {{VERSION}}</title>
       <pubDate>{{PUBDATE}}</pubDate>
-      <sparkle:version>{{VERSION}}</sparkle:version>
+      <!-- sparkle:version must match CFBundleVersion in the installed
+           app. We render the Unix-timestamp build number here so
+           Sparkle's monotonic comparison reliably detects newer
+           releases regardless of semver pre-release suffixes. -->
+      <sparkle:version>{{BUILD_NUMBER}}</sparkle:version>
       <sparkle:shortVersionString>{{VERSION}}</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <description><![CDATA[

@@ -24,19 +24,24 @@ DATA_FILES: list = []
 # var both locally and on the CI runner.
 SPARKLE_PUBLIC_KEY = os.environ.get("SPARKLE_PUBLIC_KEY", "")
 
-# Build version. CI exports this from the git tag (stripped of leading
-# "v") so Sparkle can compare the running app's
-# CFBundleShortVersionString against `sparkle:version` in appcast.xml.
-# Local source builds default to a dev marker that always appears
-# older than any real release, so a dev copy will always see updates
-# offered (useful when smoke-testing the update path).
+# Two version strings, deliberately separate:
+#  - BUILD_VERSION (CFBundleShortVersionString) is the human-facing
+#    semver string -- "0.9.0-rc1", "1.0.0", etc.
+#  - BUILD_NUMBER (CFBundleVersion) is the *Sparkle comparison key*.
+#    Sparkle (and Apple) require this to be monotonically increasing
+#    across releases; semver suffixes like "-rc1" / "-rc2" tie when
+#    Sparkle parses them, so we use a separate counter that always
+#    grows. CI exports it as a Unix timestamp captured at build time
+#    (see release.yml). Local source builds get a low default so an
+#    installed release always wins.
 BUILD_VERSION = os.environ.get("ANYCLIP_BUILD_VERSION", "0.0.0-dev")
+BUILD_NUMBER = os.environ.get("ANYCLIP_BUILD_NUMBER", "0")
 
 PLIST = {
     "CFBundleName": "AnyClip",
     "CFBundleDisplayName": "AnyClip",
     "CFBundleIdentifier": "io.github.gum798.anyclip",
-    "CFBundleVersion": BUILD_VERSION,
+    "CFBundleVersion": BUILD_NUMBER,
     "CFBundleShortVersionString": BUILD_VERSION,
     # No Dock icon, no Cmd-Tab presence: this is a menubar-only app.
     "LSUIElement": True,

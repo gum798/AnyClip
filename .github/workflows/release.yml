@@ -59,9 +59,14 @@ jobs:
           # comparison sees "0.9.0-rc1" not "v0.9.0-rc1".
           ANYCLIP_BUILD_VERSION: ${{ github.ref_name == 'main' && '0.0.0-dev' || github.ref_name }}
         run: |
-          # github.ref_name keeps the leading "v" for tag pushes; strip it.
           export ANYCLIP_BUILD_VERSION="${ANYCLIP_BUILD_VERSION#v}"
-          echo "Building version: $ANYCLIP_BUILD_VERSION"
+          # Monotonic build number for Sparkle's comparison key.
+          # Captured once here so the same value reaches setup.py
+          # (CFBundleVersion) and the appcast renderer below.
+          BUILD_NUMBER=$(date -u +%s)
+          export ANYCLIP_BUILD_NUMBER="$BUILD_NUMBER"
+          echo "ANYCLIP_BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "Building version: $ANYCLIP_BUILD_VERSION (build $BUILD_NUMBER)"
           python setup.py py2app
 
       - name: Package .dmg via hdiutil
@@ -95,6 +100,9 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
 
+      - name: Save build number for appcast job
+        run: echo "${{ env.ANYCLIP_BUILD_NUMBER }}" > dist/build-number.txt
+
       - name: Persist macOS metadata for appcast job
         uses: actions/upload-artifact@v4
         with:
@@ -102,6 +110,7 @@ jobs:
           path: |
             dist/AnyClip-${{ github.ref_name }}.dmg
             dist/macos-signature.txt
+            dist/build-number.txt
 
   windows:
     name: Windows x64 build
@@ -217,12 +226,14 @@ jobs:
 
           mac_sig_line = pathlib.Path("dist-macos/macos-signature.txt").read_text().strip()
           win_sig_line = pathlib.Path("dist-windows/windows-signature.txt").read_text().strip()
+          build_number = pathlib.Path("dist-macos/build-number.txt").read_text().strip()
 
           pubdate = datetime.now(tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
 
           tpl = pathlib.Path("docs/appcast.template.xml").read_text()
           out = (tpl
                  .replace("{{VERSION}}", version)
+                 .replace("{{BUILD_NUMBER}}", build_number)
                  .replace("{{TAG}}", tag)
                  .replace("{{REPO}}", repo)
                  .replace("{{PAGES_URL}}", pages_url)
