@@ -90,7 +90,14 @@ def _make_status_icon(Image, ImageDraw, kind: str):
     back to a coloured placeholder if the asset is missing so the
     tray icon is never empty on a broken bundle.
     """
-    name = {"linked": "linked", "searching": "searching"}.get(kind, "error")
+    # idle is treated as "still looking" so the tray does not flash
+    # the error glyph during the brief window between launch and the
+    # first PeerDiscovered event.
+    name = {
+        "linked": "linked",
+        "searching": "searching",
+        "idle": "searching",
+    }.get(kind, "error")
     # @2x first for HiDPI; pystray scales to the OS-requested size.
     for candidate in (TRAY_DIR / f"{name}@2x.png", TRAY_DIR / f"{name}.png"):
         if candidate.exists():
@@ -219,17 +226,42 @@ class AnyClipTrayApp:
     # ---- menu actions ---------------------------------------------------
 
     def _on_token(self, _icon, _item) -> None:
+        stored = config_store.load()
+        current = stored.token if stored is not None else "(no token configured)"
         path = config_store.config_path()
         try:
             from tkinter import messagebox
 
-            messagebox.showinfo(
+            # askyesno: Yes -> Reset, No -> just informational close.
+            do_reset = messagebox.askyesno(
                 "AnyClip token",
-                f"The shared token lives in:\n{path}\n\n"
-                "To reset it, quit AnyClip, delete that file, and reopen.",
+                f"Current token:\n{current}\n\n"
+                f"Stored at: {path}\n\n"
+                "Press Yes to reset and generate a new token "
+                "(your other device will stop syncing until you "
+                "paste the new token there).",
             )
+            if not do_reset:
+                return
+            confirm = messagebox.askyesno(
+                "Reset token?",
+                "This will replace the current token. Your other "
+                "device will stop syncing until you paste the new "
+                "token there. Proceed?",
+            )
+            if not confirm:
+                return
+            new_token = config_store.generate_token()
+            config_store.save(config_store.Config(token=new_token))
+            messagebox.showinfo(
+                "Token reset",
+                f"New token saved:\n{new_token}\n\n"
+                "AnyClip will now quit. Relaunch to apply, then "
+                "paste this token on your other device.",
+            )
+            self._on_quit(_icon, _item)
         except Exception:
-            log.info(f"AnyClip token stored at {path}")
+            log.exception("token dialog failed; token stored at %s", path)
 
     def _on_toggle_autostart(self, _icon, item) -> None:
         backend = autostart.get_backend()

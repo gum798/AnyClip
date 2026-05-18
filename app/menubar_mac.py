@@ -34,7 +34,14 @@ def _tray_icon_for(kind: str) -> Optional[str]:
     running with its current title-string fallback rather than
     crashing on a packaging mistake.
     """
-    name = {"linked": "linked", "searching": "searching"}.get(kind, "error")
+    # idle is treated as "still looking" so the menubar does not flash
+    # the error glyph during the brief window between launch and the
+    # first PeerDiscovered event.
+    name = {
+        "linked": "linked",
+        "searching": "searching",
+        "idle": "searching",
+    }.get(kind, "error")
     pdf = TRAY_DIR / f"{name}.pdf"
     return str(pdf) if pdf.exists() else None
 
@@ -219,15 +226,52 @@ class AnyClipMenubarApp:
     # ---- menu actions ---------------------------------------------------
 
     def _show_token_info(self, _sender) -> None:
+        stored = config_store.load()
+        current = stored.token if stored is not None else "(no token configured)"
         path = config_store.config_path()
-        self.rumps.alert(
+        # rumps.alert second/third params are button titles. Cancel
+        # returns 0; OK returns 1. We use Cancel as the destructive
+        # Reset button so the default Enter key lands on the safe
+        # "Close" action.
+        response = self.rumps.alert(
             title="AnyClip token",
             message=(
-                "The shared token lives in:\n"
-                f"{path}\n\n"
-                "To reset it, quit AnyClip, delete that file, and reopen."
+                f"Current token (select to copy):\n{current}\n\n"
+                f"Stored at: {path}\n\n"
+                "Reset generates a new random token, saves it, and "
+                "quits AnyClip. The other device must re-onboard with "
+                "the new token before sync resumes."
+            ),
+            ok="Close",
+            cancel="Reset…",
+        )
+        if response == 1:
+            return  # Close
+        # Second confirmation -- this is destructive (peer link breaks).
+        confirm = self.rumps.alert(
+            title="Reset token?",
+            message=(
+                "This will replace the current token with a fresh one. "
+                "Your other device will stop syncing until you paste "
+                "the new token there."
+            ),
+            ok="Reset",
+            cancel="Cancel",
+        )
+        if confirm != 1:
+            return
+        new_token = config_store.generate_token()
+        config_store.save(config_store.Config(token=new_token))
+        self.rumps.alert(
+            title="Token reset",
+            message=(
+                "New token saved:\n"
+                f"{new_token}\n\n"
+                "AnyClip will now quit. Relaunch to apply, then "
+                "paste this token on your other device."
             ),
         )
+        self._quit(None)
 
     def _toggle_autostart(self, sender) -> None:
         backend = autostart.get_backend()
