@@ -30,6 +30,7 @@ import pyperclip
 from zeroconf import IPVersion, ServiceInfo, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
+import autostart
 import config_store
 import peer_state
 import permission_probe
@@ -651,6 +652,23 @@ def parse_args() -> Config:
              "and exit. Subsequent runs do not need --token or "
              "ANYCLIP_TOKEN. Use '-' to read the token from stdin.",
     )
+    parser.add_argument(
+        "--install-autostart",
+        action="store_true",
+        help="Register AnyClip to launch at user login and exit. "
+             "macOS: ~/Library/LaunchAgents/com.anyclip.plist. "
+             "Windows: HKCU Run key.",
+    )
+    parser.add_argument(
+        "--uninstall-autostart",
+        action="store_true",
+        help="Remove the autostart entry and exit.",
+    )
+    parser.add_argument(
+        "--autostart-status",
+        action="store_true",
+        help="Print whether AnyClip is registered to launch at login, then exit.",
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"TCP port to listen on (default: {DEFAULT_PORT})")
     parser.add_argument("--name", default=socket.gethostname(),
@@ -667,6 +685,27 @@ def parse_args() -> Config:
     parser.add_argument("--no-notify", action="store_true",
                         help="Suppress desktop toast notifications on clipboard sync")
     args = parser.parse_args()
+
+    # Autostart management short-circuits the daemon: invoking any of
+    # these does the registry/plist op and exits without starting up.
+    if args.autostart_status:
+        backend = autostart.get_backend()
+        state = "enabled" if backend.is_enabled() else "disabled"
+        sys.stdout.write(f"autostart: {state}\n")
+        sys.exit(0)
+    if args.install_autostart:
+        backend = autostart.get_backend()
+        backend.enable(
+            executable_path=sys.executable,
+            args=[os.path.abspath(sys.argv[0]), "--headless"],
+        )
+        sys.stderr.write("anyclip: autostart enabled\n")
+        sys.exit(0)
+    if args.uninstall_autostart:
+        backend = autostart.get_backend()
+        backend.disable()
+        sys.stderr.write("anyclip: autostart disabled\n")
+        sys.exit(0)
 
     # --save-token short-circuits everything else.
     if args.save_token is not None:
