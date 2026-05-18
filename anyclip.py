@@ -1536,9 +1536,12 @@ class MdnsBeacon:
             },
         )
         await self._azc.async_register_service(self._info)
-        # Successful advertisement counts as positive mDNS evidence: the
-        # OS allowed us to multicast. permission_probe consults this.
-        self.events_seen += 1
+        # Note: we deliberately do NOT bump self.events_seen here.
+        # `async_register_service` returns successfully even when the
+        # macOS Local Network permission has been revoked -- the OS
+        # silently drops the multicast packets. The only signal that
+        # actually proves the network half is healthy is an *inbound*
+        # mDNS service-state-change in `_handler` below.
         log.info(f"mDNS advertised as {instance!r} ip={local_ip} server={server_host}")
 
         self._browser = AsyncServiceBrowser(
