@@ -31,6 +31,15 @@ from zeroconf import IPVersion, ServiceInfo, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
 import config_store
+import peer_state
+from peer_state import (
+    DaemonEvent,
+    HandshakeFailed,
+    LinkDown,
+    LinkUp,
+    PeerDiscovered,
+    PermissionMissing,
+)
 from version_negotiator import (
     Compatibility,
     VersionInfo,
@@ -80,6 +89,41 @@ LOG_FILE = LOG_DIR / "anyclip.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 PID_FILE = LOG_DIR / "anyclip.pid"
+
+# UI shell subscribes to this queue to drive the menubar/tray state
+# machine (see peer_state.reduce). In headless mode no one reads from
+# the queue; emit_event() drops on full so the daemon never blocks or
+# leaks memory even after running for days without a subscriber.
+EVENT_QUEUE_MAX = 256
+_event_bus: Optional["asyncio.Queue[DaemonEvent]"] = None
+
+
+def init_event_bus() -> "asyncio.Queue[DaemonEvent]":
+    """Create the daemon-event queue. Call once from run() after the
+    asyncio loop has started so the queue is bound to the running loop.
+    """
+    global _event_bus
+    _event_bus = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
+    return _event_bus
+
+
+def emit_event(event: DaemonEvent) -> None:
+    """Best-effort fire-and-forget event publish.
+
+    Drops silently if the bus is not initialised (headless tests) or
+    full (no subscriber draining). This keeps emit sites free of
+    error handling and means the daemon stays correct even if the GUI
+    shell crashes and stops consuming.
+    """
+    bus = _event_bus
+    if bus is None:
+        return
+    try:
+        bus.put_nowait(event)
+    except asyncio.QueueFull:
+        # Lossy drop: prefer to drop the new event so a stalled
+        # subscriber still sees the older history rather than nothing.
+        log.debug("event queue full, dropping %s", type(event).__name__)
 
 
 class FatalStartupError(RuntimeError):
@@ -1107,13 +1151,22 @@ class PeerLink:
             "protocol_major": PROTOCOL_MAJOR,
             "protocol_minor": PROTOCOL_MINOR,
         })
+        peer_ip_for_emit = ""
+        try:
+            peer = writer.get_extra_info("peername")
+            if peer:
+                peer_ip_for_emit = peer[0]
+        except Exception:
+            pass
         try:
             hello = await asyncio.wait_for(self._recv(reader), timeout=HANDSHAKE_TIMEOUT)
         except asyncio.TimeoutError:
             log.warning("handshake timeout")
+            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason="timeout"))
             return
         if not hello or hello.get("type") != "hello":
             log.warning("invalid hello, closing")
+            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason="invalid"))
             return
         peer_ip = None
         if inbound:
@@ -1123,6 +1176,7 @@ class PeerLink:
             log.warning(f"auth failed from peer name={hello.get('name')!r}")
             if peer_ip:
                 await self._auth_gate.record_fail(peer_ip)
+            emit_event(HandshakeFailed(addr=peer_ip or peer_ip_for_emit, reason="auth"))
             return
         # Parse peer's version info with backward-compat defaults: an old
         # peer only sends `version`, so treat that as protocol_major and
@@ -1157,6 +1211,7 @@ class PeerLink:
                 f"{peer_version.protocol_major}.{peer_version.protocol_minor} "
                 f"app={peer_version.app_version} -> {compat.value}"
             )
+            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason=f"version:{compat.value}"))
             return
         if compat != Compatibility.COMPATIBLE:
             log.info(
@@ -1221,6 +1276,10 @@ class PeerLink:
             f"peer_app_version={peer_version.app_version} "
             f"peer_proto={peer_version.protocol_major}.{peer_version.protocol_minor}"
         )
+        emit_event(LinkUp(
+            peer_name=str(hello.get("name") or peer_id[:8]),
+            peer_id=peer_id,
+        ))
 
         try:
             while True:
@@ -1264,11 +1323,14 @@ class PeerLink:
                     log.debug(f"ignoring message type: {msg_type!r}")
         finally:
             async with self._lock:
-                if self._writer is writer:
+                was_active = self._writer is writer
+                if was_active:
                     self._writer = None
                     self._peer_node_id = None
                     self._peer_name = None
             log.info("peer disconnected")
+            if was_active:
+                emit_event(LinkDown(reason="peer disconnected"))
 
     async def _send(self, writer: asyncio.StreamWriter, obj: dict) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1469,6 +1531,7 @@ class MdnsBeacon:
             # it on stale data.
             self.address_fails.pop((host, port), None)
             log.info(f"discovered peer {name!r} at {host}:{port}")
+            emit_event(PeerDiscovered(name=str(name), addr=f"{host}:{port}"))
             await self.on_peer(host, port)
         except Exception as exc:
             log.warning(f"peer resolve failed for {name!r}: {exc}")
@@ -1710,6 +1773,7 @@ async def run(config: Config) -> None:
     setup_logging(config.verbose)
     if _token_loaded_from_config.get():
         log.info(f"token loaded from config ({config_store.config_path()})")
+    init_event_bus()
     prepare_pid_lock(config.port)
     clear_received_dir()
     node_id = str(uuid.uuid4())
