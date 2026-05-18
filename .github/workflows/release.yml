@@ -198,10 +198,10 @@ jobs:
 
           tag = os.environ["TAG"]
           version = tag.lstrip("v")
-          repo = os.environ["REPO"]
+          repo = os.environ["REPO"]  # "owner/name"
+          owner, repo_name = repo.split("/", 1)
+          pages_url = f"https://{owner}.github.io/{repo_name}/appcast.xml"
 
-          dmg = pathlib.Path(f"dist-macos/AnyClip-{tag}.dmg")
-          zip_ = pathlib.Path(f"dist-windows/AnyClip-{tag}-windows-x64.zip")
           mac_sig_line = pathlib.Path("dist-macos/macos-signature.txt").read_text().strip()
           win_sig_line = pathlib.Path("dist-windows/windows-signature.txt").read_text().strip()
 
@@ -212,9 +212,8 @@ jobs:
                  .replace("{{VERSION}}", version)
                  .replace("{{TAG}}", tag)
                  .replace("{{REPO}}", repo)
+                 .replace("{{PAGES_URL}}", pages_url)
                  .replace("{{PUBDATE}}", pubdate)
-                 .replace("{{DMG_LENGTH}}", str(dmg.stat().st_size))
-                 .replace("{{ZIP_LENGTH}}", str(zip_.stat().st_size))
                  .replace("{{MAC_SIG_LINE}}", mac_sig_line)
                  .replace("{{WIN_SIG_LINE}}", win_sig_line))
           pathlib.Path("appcast.xml").write_text(out)

@@ -4,7 +4,7 @@
      version="2.0">
   <channel>
     <title>AnyClip</title>
-    <link>https://gum798.github.io/{{REPO}}/appcast.xml</link>
+    <link>{{PAGES_URL}}</link>
     <description>AnyClip auto-update feed (macOS + Windows)</description>
     <language>en</language>
 
@@ -22,7 +22,6 @@
       <enclosure
         url="https://github.com/{{REPO}}/releases/download/{{TAG}}/AnyClip-{{TAG}}.dmg"
         sparkle:os="macos"
-        length="{{DMG_LENGTH}}"
         type="application/octet-stream"
         {{MAC_SIG_LINE}} />
       <enclosure
