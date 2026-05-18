@@ -32,6 +32,7 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
 import config_store
 import peer_state
+import permission_probe
 from peer_state import (
     DaemonEvent,
     HandshakeFailed,
@@ -1457,6 +1458,10 @@ class MdnsBeacon:
         # source IP and bounces the daemon if the OS reassigns the IP
         # (zeroconf otherwise keeps shouting into a dead socket -- Errno 49).
         self.advertised_ip: Optional[str] = None
+        # Read by permission_probe to decide if Local Network is silently
+        # blocked. Bumped on every successful service register and on every
+        # mDNS state change we handle (Added/Updated).
+        self.events_seen: int = 0
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -1483,6 +1488,9 @@ class MdnsBeacon:
             },
         )
         await self._azc.async_register_service(self._info)
+        # Successful advertisement counts as positive mDNS evidence: the
+        # OS allowed us to multicast. permission_probe consults this.
+        self.events_seen += 1
         log.info(f"mDNS advertised as {instance!r} ip={local_ip} server={server_host}")
 
         self._browser = AsyncServiceBrowser(
@@ -1500,6 +1508,10 @@ class MdnsBeacon:
             ServiceStateChange.Added, ServiceStateChange.Updated,
         ):
             return
+        # Any mDNS activity for our service type proves Local Network
+        # is not silently blocked on macOS. Bump before dispatch so
+        # the probe sees the evidence even if resolve() races slow.
+        self.events_seen += 1
         loop = self._loop
         if loop is None:
             return
@@ -1769,6 +1781,34 @@ async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
         backoff = min(backoff * 2, 60)
 
 
+async def _run_permission_probe(beacon: "MdnsBeacon") -> None:
+    """One-shot macOS Local Network self-diagnosis.
+
+    Runs once 30 seconds after startup. If no mDNS evidence has been
+    seen by then we treat it as the user having revoked the Local
+    Network permission and emit `PermissionMissing` so the UI shell
+    can show its "Local Network blocked" warning. On other platforms
+    this coroutine is never scheduled; the call site gates on
+    sys.platform.
+    """
+    result = await permission_probe.probe(
+        events_seen_fn=lambda: beacon.events_seen,
+        has_network_fn=lambda: get_local_ipv4() is not None,
+        wait_seconds=30.0,
+    )
+    if result == permission_probe.Result.BLOCKED_LOCAL_NETWORK:
+        log.warning(
+            "permission probe: no mDNS activity in 30s -- "
+            "Local Network permission likely blocked"
+        )
+        emit_event(PermissionMissing(kind="local_network"))
+    elif result == permission_probe.Result.NO_NETWORK:
+        log.warning("permission probe: no active network interface")
+        emit_event(PermissionMissing(kind="no_network"))
+    else:
+        log.debug("permission probe: ok")
+
+
 async def run(config: Config) -> None:
     setup_logging(config.verbose)
     if _token_loaded_from_config.get():
@@ -1894,6 +1934,8 @@ async def run(config: Config) -> None:
         ]
         for host, port in config.peers:
             tasks.append(peer_keepalive(host, port, link))
+        if sys.platform == "darwin":
+            tasks.append(_run_permission_probe(beacon))
         await asyncio.gather(*tasks)
     finally:
         await link.close()
