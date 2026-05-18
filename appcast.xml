@@ -9,26 +9,26 @@
     <language>en</language>
 
     <item>
-      <title>Version 0.9.0-rc1</title>
-      <pubDate>Mon, 18 May 2026 06:42:02 +0000</pubDate>
-      <sparkle:version>0.9.0-rc1</sparkle:version>
-      <sparkle:shortVersionString>0.9.0-rc1</sparkle:shortVersionString>
+      <title>Version 0.9.0-rc2</title>
+      <pubDate>Mon, 18 May 2026 06:45:49 +0000</pubDate>
+      <sparkle:version>0.9.0-rc2</sparkle:version>
+      <sparkle:shortVersionString>0.9.0-rc2</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <description><![CDATA[
         <p>See the
-          <a href="https://github.com/gum798/AnyClip/releases/tag/v0.9.0-rc1">release notes</a>.
+          <a href="https://github.com/gum798/AnyClip/releases/tag/v0.9.0-rc2">release notes</a>.
         </p>
       ]]></description>
       <enclosure
-        url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc1/AnyClip-v0.9.0-rc1.dmg"
+        url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc2/AnyClip-v0.9.0-rc2.dmg"
         sparkle:os="macos"
         type="application/octet-stream"
-        sparkle:edSignature="d8YU5P2Ji1UCq4Y/xfV+id0TlUR6fUwYvl+pQL6FdSU3A3BYhOV/Dktc/0pOe/+xT5Zz+ly+7iuPOvonJ1IzAg==" length="51557409" />
+        sparkle:edSignature="dt9ECqQvT9eXU/0aPNmjgxjORTVZoj1Uq5hmdjBwv9f4AzyLxstM+3+RhgIJiwbxjwGoN/q7i6BrBpm8R6lVDA==" length="51557769" />
       <enclosure
-        url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc1/AnyClip-v0.9.0-rc1-windows-x64.zip"
+        url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc2/AnyClip-v0.9.0-rc2-windows-x64.zip"
         sparkle:os="windows"
         type="application/octet-stream"
-        sparkle:edSignature="uADasDXGaG3RCg62f/es321zzY5gt/LW7moCRp0yeQ/cIg0PELcQwxJx4XrNq5Q+9xEzdWRtlOwMNAMjbGN/DA==" length="23076583" />
+        sparkle:edSignature="NIq30wh92sHoifjUg+nlKPH1NSctoeSty19rc7exO6uFzJra0RnYeqtG+1af8TVr7RG6Olte5mX19OjU2S0AAA==" length="23076842" />
     </item>
   </channel>
 </rss>
