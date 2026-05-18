@@ -30,6 +30,49 @@ import peer_state
 ICONS_DIR = Path(__file__).resolve().parent / "icons"
 APP_ICON_ICO = ICONS_DIR / "anyclip.ico"
 
+# Win32 MessageBoxW button flags.
+_MB_OK = 0x0
+_MB_YESNO = 0x4
+_MB_ICONINFORMATION = 0x40
+_MB_ICONQUESTION = 0x20
+_MB_ICONWARNING = 0x30
+# MessageBoxW return values.
+_IDOK = 1
+_IDYES = 6
+_IDNO = 7
+
+
+def _native_yesno(title: str, text: str) -> bool:
+    """Win32 MessageBox with Yes/No buttons. Returns True for Yes.
+
+    Used instead of tkinter.messagebox because pystray invokes menu
+    callbacks on a worker thread, and tkinter modal dialogs only
+    work from the main thread on Windows. MessageBoxW is a synchronous
+    native API and is safe to call from any thread.
+    """
+    try:
+        import ctypes
+
+        result = ctypes.windll.user32.MessageBoxW(
+            0, text, title, _MB_YESNO | _MB_ICONQUESTION,
+        )
+        return result == _IDYES
+    except Exception:
+        log.exception("MessageBoxW failed; treating as No")
+        return False
+
+
+def _native_info(title: str, text: str) -> None:
+    """Win32 MessageBox with a single OK button."""
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            0, text, title, _MB_OK | _MB_ICONINFORMATION,
+        )
+    except Exception:
+        log.exception("MessageBoxW (info) failed")
+
 log = logging.getLogger("anyclip.tray_win")
 
 
@@ -215,39 +258,36 @@ class AnyClipTrayApp:
         stored = config_store.load()
         current = stored.token if stored is not None else "(no token configured)"
         path = config_store.config_path()
-        try:
-            from tkinter import messagebox
-
-            # askyesno: Yes -> Reset, No -> just informational close.
-            do_reset = messagebox.askyesno(
-                "AnyClip token",
-                f"Current token:\n{current}\n\n"
-                f"Stored at: {path}\n\n"
-                "Press Yes to reset and generate a new token "
-                "(your other device will stop syncing until you "
-                "paste the new token there).",
-            )
-            if not do_reset:
-                return
-            confirm = messagebox.askyesno(
-                "Reset token?",
-                "This will replace the current token. Your other "
-                "device will stop syncing until you paste the new "
-                "token there. Proceed?",
-            )
-            if not confirm:
-                return
-            new_token = config_store.generate_token()
-            config_store.save(config_store.Config(token=new_token))
-            messagebox.showinfo(
-                "Token reset",
-                f"New token saved:\n{new_token}\n\n"
-                "AnyClip will now quit. Relaunch to apply, then "
-                "paste this token on your other device.",
-            )
-            self._on_quit(_icon, _item)
-        except Exception:
-            log.exception("token dialog failed; token stored at %s", path)
+        # pystray invokes menu callbacks on a worker thread; use Win32
+        # MessageBoxW directly so the dialog is responsive (tkinter
+        # would freeze).
+        do_reset = _native_yesno(
+            "AnyClip token",
+            f"Current token:\n{current}\n\n"
+            f"Stored at: {path}\n\n"
+            "Press Yes to reset and generate a new token "
+            "(your other device will stop syncing until you "
+            "paste the new token there).",
+        )
+        if not do_reset:
+            return
+        confirm = _native_yesno(
+            "Reset token?",
+            "This will replace the current token. Your other "
+            "device will stop syncing until you paste the new "
+            "token there. Proceed?",
+        )
+        if not confirm:
+            return
+        new_token = config_store.generate_token()
+        config_store.save(config_store.Config(token=new_token))
+        _native_info(
+            "Token reset",
+            f"New token saved:\n{new_token}\n\n"
+            "AnyClip will now quit. Relaunch to apply, then "
+            "paste this token on your other device.",
+        )
+        self._on_quit(_icon, _item)
 
     def _on_toggle_autostart(self, _icon, item) -> None:
         backend = autostart.get_backend()
@@ -277,16 +317,11 @@ class AnyClipTrayApp:
             from app.updater_bridge import check_for_updates, is_active
 
             if not is_active():
-                try:
-                    from tkinter import messagebox
-
-                    messagebox.showinfo(
-                        "Updates unavailable",
-                        "Auto-update is only active in the packaged "
-                        ".exe build.",
-                    )
-                except Exception:
-                    pass
+                _native_info(
+                    "Updates unavailable",
+                    "Auto-update is only active in the packaged "
+                    ".exe build.",
+                )
                 return
             check_for_updates()
         except Exception:
