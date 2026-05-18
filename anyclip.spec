@@ -9,19 +9,28 @@ layout: faster startup and smaller diffs in autoupdate downloads than
 only the tray icon.
 """
 
+import os
+
 block_cipher = None
+
+_datas = [
+    ('app/icons/anyclip.ico', 'app/icons'),
+    ('app/icons/tray', 'app/icons/tray'),
+]
+# WinSparkle.dll is dropped into app/ by the release workflow's
+# download step. PyInstaller copies it into the bundle root so the
+# runtime ctypes.CDLL("WinSparkle.dll") resolution works. The file is
+# absent in plain source checkouts, so we conditionally include it
+# rather than failing the build outright.
+if os.path.exists('app/WinSparkle.dll'):
+    _datas.append(('app/WinSparkle.dll', '.'))
 
 
 a = Analysis(
     ['anyclip.py'],
     pathex=['.'],
     binaries=[],
-    # Bundle the tray PNGs alongside `app/` so the runtime path
-    # `app/icons/tray/*.png` resolves inside the PyInstaller bundle.
-    datas=[
-        ('app/icons/anyclip.ico', 'app/icons'),
-        ('app/icons/tray', 'app/icons/tray'),
-    ],
+    datas=_datas,
     hiddenimports=[
         'anyclip',
         'app',

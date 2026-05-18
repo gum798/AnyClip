@@ -140,6 +140,12 @@ class AnyClipTrayApp:
     def run(self) -> None:
         self._ticker.start()
         try:
+            from app.updater_bridge import init_updater
+
+            init_updater()
+        except Exception:
+            log.exception("updater init failed; continuing without auto-update")
+        try:
             self.icon.run()
         finally:
             self._stop.set()
@@ -161,6 +167,7 @@ class AnyClipTrayApp:
                 checked=lambda item: autostart.get_backend().is_enabled(),
             ),
             mi("Open Logs", self._on_open_logs),
+            mi("Check for Updates…", self._on_check_updates),
             pm.SEPARATOR,
             mi("Quit", self._on_quit),
         )
@@ -247,9 +254,35 @@ class AnyClipTrayApp:
             stderr=subprocess.DEVNULL,
         )
 
+    def _on_check_updates(self, _icon, _item) -> None:
+        try:
+            from app.updater_bridge import check_for_updates, is_active
+
+            if not is_active():
+                try:
+                    from tkinter import messagebox
+
+                    messagebox.showinfo(
+                        "Updates unavailable",
+                        "Auto-update is only active in the packaged "
+                        ".exe build.",
+                    )
+                except Exception:
+                    pass
+                return
+            check_for_updates()
+        except Exception:
+            log.exception("check-for-updates failed")
+
     def _on_quit(self, _icon, _item) -> None:
         try:
             self.supervisor.stop(timeout=3.0)
         except Exception:
             log.exception("supervisor stop failed")
+        try:
+            from app.updater_bridge import shutdown as updater_shutdown
+
+            updater_shutdown()
+        except Exception:
+            pass
         self.icon.stop()

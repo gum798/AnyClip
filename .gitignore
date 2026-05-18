@@ -10,3 +10,15 @@ venv/
 # OMC working artifacts (local only)
 .omc/
 .claude/
+
+# Build outputs + downloaded frameworks (CI-only, never committed)
+build/icon/anyclip.iconset/
+dist/
+build/lib*/
+*.egg-info/
+sparkle/
+winsparkle/
+Sparkle.tar.xz
+WinSparkle.zip
+app/WinSparkle.dll
+.pytest_cache/

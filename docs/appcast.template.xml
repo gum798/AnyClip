@@ -5,7 +5,7 @@
   <channel>
     <title>AnyClip</title>
     <link>https://gum798.github.io/{{REPO}}/appcast.xml</link>
-    <description>AnyClip macOS release feed</description>
+    <description>AnyClip auto-update feed (macOS + Windows)</description>
     <language>en</language>
 
     <item>
@@ -21,9 +21,15 @@
       ]]></description>
       <enclosure
         url="https://github.com/{{REPO}}/releases/download/{{TAG}}/AnyClip-{{TAG}}.dmg"
+        sparkle:os="macos"
         length="{{DMG_LENGTH}}"
         type="application/octet-stream"
-        {{SIG_LINE}} />
+        {{MAC_SIG_LINE}} />
+      <enclosure
+        url="https://github.com/{{REPO}}/releases/download/{{TAG}}/AnyClip-{{TAG}}-windows-x64.zip"
+        sparkle:os="windows"
+        type="application/octet-stream"
+        {{WIN_SIG_LINE}} />
     </item>
   </channel>
 </rss>

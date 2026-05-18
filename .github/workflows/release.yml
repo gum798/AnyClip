@@ -1,8 +1,13 @@
 name: Release
 
-# Build + publish AnyClip when a v* tag is pushed. Sparkle/WinSparkle
-# auto-update wiring lives in slice-10/11; this slice ships the raw
-# .dmg + .exe assets so users can already download a release.
+# Build + publish AnyClip when a v* tag is pushed.
+# - macos job: builds .app -> .dmg, signs with Sparkle's sign_update.
+# - windows job: builds .exe (one-folder zipped), signs with Python
+#   ed25519 against the same private key (WinSparkle understands the
+#   same EdDSA signature format).
+# - appcast job: runs after both build jobs, renders appcast.xml with
+#   both enclosures into a single <item>, and pushes to gh-pages so
+#   the Sparkle and WinSparkle feeds stay in lockstep.
 
 on:
   push:
@@ -10,12 +15,15 @@ on:
       - "v*"
 
 permissions:
-  contents: write  # needed to create + upload to GitHub Releases
+  contents: write
+
+env:
+  SPARKLE_VERSION: "2.6.4"
+  WINSPARKLE_VERSION: "0.8.3"
 
 jobs:
   macos:
     name: macOS arm64 build
-    # macos-14 = Apple Silicon (arm64). Slice scope: arm64 only.
     runs-on: macos-14
     steps:
       - name: Checkout
@@ -35,24 +43,19 @@ jobs:
         run: pytest tests/ -v
 
       - name: Download Sparkle.framework
-        env:
-          SPARKLE_VERSION: "2.6.4"
         run: |
           set -e
           curl -L -o Sparkle.tar.xz \
             "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
           mkdir -p sparkle
           tar -xJf Sparkle.tar.xz -C sparkle
-          # Resolve framework path for setup.py + sign_update path for
-          # the signing step below.
           echo "SPARKLE_FRAMEWORK_PATH=$(pwd)/sparkle/Sparkle.framework" >> "$GITHUB_ENV"
           echo "SPARKLE_BIN_DIR=$(pwd)/sparkle/bin" >> "$GITHUB_ENV"
 
       - name: Build .app with py2app
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
-        run: |
-          python setup.py py2app
+        run: python setup.py py2app
 
       - name: Package .dmg via hdiutil
         run: |
@@ -62,76 +65,36 @@ jobs:
             -volname AnyClip \
             -srcfolder dist/dmg-root \
             -ov -format UDZO \
-            dist/AnyClip-${{ github.ref_name }}.dmg
+            "dist/AnyClip-${{ github.ref_name }}.dmg"
 
       - name: Sign .dmg with sign_update (EdDSA)
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           set -e
-          # sign_update reads the private key from stdin or from a
-          # path; we hand it via stdin so the secret never lands on
-          # disk on the runner.
           echo "$SPARKLE_PRIVATE_KEY" > /tmp/sparkle_ed_priv
-          SIG=$("$SPARKLE_BIN_DIR/sign_update" \
+          "$SPARKLE_BIN_DIR/sign_update" \
             -f /tmp/sparkle_ed_priv \
-            "dist/AnyClip-${{ github.ref_name }}.dmg")
+            "dist/AnyClip-${{ github.ref_name }}.dmg" \
+            > dist/macos-signature.txt
           rm -f /tmp/sparkle_ed_priv
-          echo "Sparkle signature line: $SIG"
-          echo "$SIG" > dist/sparkle-signature.txt
+          cat dist/macos-signature.txt
 
-      - name: Update appcast.xml on gh-pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
-          DMG="dist/AnyClip-${TAG}.dmg"
-          SIG_LINE="$(cat dist/sparkle-signature.txt)"
-          LENGTH="$(stat -f%z "$DMG")"
-          PUBDATE="$(LC_ALL=C date -u +'%a, %d %b %Y %H:%M:%S %z')"
-
-          # Check out gh-pages (created on first release if missing).
-          git fetch origin gh-pages || true
-          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
-            git worktree add /tmp/gh-pages origin/gh-pages
-          else
-            mkdir -p /tmp/gh-pages
-            (cd /tmp/gh-pages && git init -b gh-pages && \
-              git remote add origin "https://github.com/${{ github.repository }}.git")
-          fi
-          cp docs/appcast.template.xml /tmp/gh-pages/appcast.xml.template
-          # Substitute placeholders -- sed -i differs between mac/linux,
-          # use a portable form.
-          python - <<PYEOF
-          import os, pathlib, re
-          tpl = pathlib.Path("/tmp/gh-pages/appcast.xml.template").read_text()
-          out = (tpl
-            .replace("{{VERSION}}", "${VERSION}")
-            .replace("{{TAG}}", "${TAG}")
-            .replace("{{DMG_LENGTH}}", "${LENGTH}")
-            .replace("{{SIG_LINE}}", '''${SIG_LINE}''')
-            .replace("{{PUBDATE}}", "${PUBDATE}")
-            .replace("{{REPO}}", "${{ github.repository }}"))
-          pathlib.Path("/tmp/gh-pages/appcast.xml").write_text(out)
-          PYEOF
-          (cd /tmp/gh-pages && \
-            git config user.email "release-bot@anyclip" && \
-            git config user.name "AnyClip Release Bot" && \
-            git add appcast.xml && \
-            git commit -m "appcast: ${TAG}" && \
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:gh-pages)
-
-      - name: Upload to Release
+      - name: Upload macOS asset to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/AnyClip-${{ github.ref_name }}.dmg
-            dist/sparkle-signature.txt
+          files: dist/AnyClip-${{ github.ref_name }}.dmg
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+
+      - name: Persist macOS metadata for appcast job
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            dist/AnyClip-${{ github.ref_name }}.dmg
+            dist/macos-signature.txt
 
   windows:
     name: Windows x64 build
@@ -149,24 +112,135 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
+          pip install cryptography
 
       - name: Run pytest
         run: pytest tests/ -v
 
+      - name: Download WinSparkle
+        shell: pwsh
+        run: |
+          $ws = "WinSparkle-${env:WINSPARKLE_VERSION}"
+          $url = "https://github.com/vslavik/winsparkle/releases/download/v${env:WINSPARKLE_VERSION}/${ws}.zip"
+          Invoke-WebRequest -Uri $url -OutFile WinSparkle.zip
+          Expand-Archive -Path WinSparkle.zip -DestinationPath winsparkle -Force
+          # PyInstaller datas: copy WinSparkle.dll next to our package
+          # so the runtime sys._MEIPASS resolution finds it.
+          $dll = Get-ChildItem -Path winsparkle -Recurse -Filter "WinSparkle.dll" | Where-Object { $_.FullName -like "*Release*x64*" } | Select-Object -First 1
+          if (-not $dll) {
+            $dll = Get-ChildItem -Path winsparkle -Recurse -Filter "WinSparkle.dll" | Select-Object -First 1
+          }
+          Copy-Item -Path $dll.FullName -Destination app\WinSparkle.dll -Force
+
       - name: Build .exe with PyInstaller
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
         run: pyinstaller anyclip.spec --noconfirm
 
-      - name: Zip dist for upload
+      - name: Zip dist
+        shell: pwsh
         run: |
           Compress-Archive `
             -Path dist/AnyClip/* `
-            -DestinationPath dist/AnyClip-${{ github.ref_name }}-windows-x64.zip
-        shell: pwsh
+            -DestinationPath "dist/AnyClip-${{ github.ref_name }}-windows-x64.zip"
 
-      - name: Upload to Release
+      - name: Sign zip with Python ed25519
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        shell: pwsh
+        run: |
+          python -c "import os, base64, pathlib; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; priv = Ed25519PrivateKey.from_private_bytes(base64.b64decode(os.environ['SPARKLE_PRIVATE_KEY'])); data = pathlib.Path('dist/AnyClip-${{ github.ref_name }}-windows-x64.zip').read_bytes(); sig = priv.sign(data); pathlib.Path('dist/windows-signature.txt').write_text('sparkle:edSignature=' + chr(34) + base64.b64encode(sig).decode() + chr(34) + ' length=' + chr(34) + str(len(data)) + chr(34))"
+          Get-Content dist/windows-signature.txt
+
+      - name: Upload Windows asset to Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/AnyClip-${{ github.ref_name }}-windows-x64.zip
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+
+      - name: Persist Windows metadata for appcast job
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            dist/AnyClip-${{ github.ref_name }}-windows-x64.zip
+            dist/windows-signature.txt
+
+  appcast:
+    name: Publish appcast.xml to gh-pages
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download macOS metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: dist-macos
+
+      - name: Download Windows metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist-windows
+
+      - name: Render appcast.xml
+        run: |
+          python - <<'PYEOF'
+          import os
+          import pathlib
+          import re
+          from datetime import datetime, timezone
+
+          tag = os.environ["TAG"]
+          version = tag.lstrip("v")
+          repo = os.environ["REPO"]
+
+          dmg = pathlib.Path(f"dist-macos/AnyClip-{tag}.dmg")
+          zip_ = pathlib.Path(f"dist-windows/AnyClip-{tag}-windows-x64.zip")
+          mac_sig_line = pathlib.Path("dist-macos/macos-signature.txt").read_text().strip()
+          win_sig_line = pathlib.Path("dist-windows/windows-signature.txt").read_text().strip()
+
+          pubdate = datetime.now(tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+          tpl = pathlib.Path("docs/appcast.template.xml").read_text()
+          out = (tpl
+                 .replace("{{VERSION}}", version)
+                 .replace("{{TAG}}", tag)
+                 .replace("{{REPO}}", repo)
+                 .replace("{{PUBDATE}}", pubdate)
+                 .replace("{{DMG_LENGTH}}", str(dmg.stat().st_size))
+                 .replace("{{ZIP_LENGTH}}", str(zip_.stat().st_size))
+                 .replace("{{MAC_SIG_LINE}}", mac_sig_line)
+                 .replace("{{WIN_SIG_LINE}}", win_sig_line))
+          pathlib.Path("appcast.xml").write_text(out)
+          print(out)
+          PYEOF
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+
+      - name: Push appcast.xml to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git fetch origin gh-pages || true
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add /tmp/gh-pages origin/gh-pages
+          else
+            mkdir /tmp/gh-pages
+            (cd /tmp/gh-pages && git init -b gh-pages && \
+              git remote add origin "https://github.com/${{ github.repository }}.git")
+          fi
+          cp appcast.xml /tmp/gh-pages/appcast.xml
+          (cd /tmp/gh-pages && \
+            git config user.email "release-bot@anyclip" && \
+            git config user.name "AnyClip Release Bot" && \
+            git add appcast.xml && \
+            git commit -m "appcast: ${{ github.ref_name }}" && \
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:gh-pages)
