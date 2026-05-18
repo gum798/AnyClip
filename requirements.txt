@@ -1,3 +1,10 @@
 pyperclip>=1.8.2
 zeroconf>=0.131.0
 Pillow>=10.0.0
+# macOS-only GUI shell (rumps for menubar, PyObjC for NSAlert/onboarding).
+# Conditional markers keep `pip install -r requirements.txt` working on
+# Windows where these wheels do not exist.
+rumps>=0.4.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+# Windows-only tray shell.
+pystray>=0.19.5; sys_platform == "win32"

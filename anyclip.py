@@ -684,6 +684,13 @@ def parse_args() -> Config:
                         help="Enable DEBUG logging on the console (file log is always DEBUG)")
     parser.add_argument("--no-notify", action="store_true",
                         help="Suppress desktop toast notifications on clipboard sync")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Skip the menubar/tray GUI and run as a plain daemon. "
+             "Default when the GUI dependencies (rumps/pystray) are "
+             "unavailable.",
+    )
     args = parser.parse_args()
 
     # Autostart management short-circuits the daemon: invoking any of
@@ -1984,6 +1991,22 @@ async def run(config: Config) -> None:
 
 
 def main() -> None:
+    # GUI mode routing happens *before* full argparse so the menubar
+    # entry point does not require --token on the command line (the
+    # onboarding dialog supplies it). The argparse pass still runs
+    # later for the headless path so all existing flags keep working.
+    headless_flag = "--headless" in sys.argv
+    if not headless_flag and sys.platform == "darwin":
+        try:
+            from app.menubar_mac import launch_gui
+        except ImportError as exc:
+            sys.stderr.write(
+                f"anyclip: GUI deps unavailable ({exc}); "
+                "falling back to headless mode\n"
+            )
+        else:
+            launch_gui()
+            return
     config = parse_args()
     backoff = 1.0
     while True:
