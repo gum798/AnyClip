@@ -1996,16 +1996,26 @@ def main() -> None:
     # onboarding dialog supplies it). The argparse pass still runs
     # later for the headless path so all existing flags keep working.
     headless_flag = "--headless" in sys.argv
-    if not headless_flag and sys.platform == "darwin":
-        try:
-            from app.menubar_mac import launch_gui
-        except ImportError as exc:
-            sys.stderr.write(
-                f"anyclip: GUI deps unavailable ({exc}); "
-                "falling back to headless mode\n"
-            )
-        else:
-            launch_gui()
+    if not headless_flag:
+        gui_entry = None
+        if sys.platform == "darwin":
+            try:
+                from app.menubar_mac import launch_gui as gui_entry  # type: ignore
+            except ImportError as exc:
+                sys.stderr.write(
+                    f"anyclip: macOS GUI deps unavailable ({exc}); "
+                    "falling back to headless mode\n"
+                )
+        elif sys.platform == "win32":
+            try:
+                from app.tray_win import launch_gui as gui_entry  # type: ignore
+            except ImportError as exc:
+                sys.stderr.write(
+                    f"anyclip: Windows GUI deps unavailable ({exc}); "
+                    "falling back to headless mode\n"
+                )
+        if gui_entry is not None:
+            gui_entry()
             return
     config = parse_args()
     backoff = 1.0
