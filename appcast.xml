@@ -4,13 +4,13 @@
      version="2.0">
   <channel>
     <title>AnyClip</title>
-    <link>https://gum798.github.io/gum798/AnyClip/appcast.xml</link>
+    <link>https://gum798.github.io/AnyClip/appcast.xml</link>
     <description>AnyClip auto-update feed (macOS + Windows)</description>
     <language>en</language>
 
     <item>
       <title>Version 0.9.0-rc1</title>
-      <pubDate>Mon, 18 May 2026 05:58:24 +0000</pubDate>
+      <pubDate>Mon, 18 May 2026 06:02:46 +0000</pubDate>
       <sparkle:version>0.9.0-rc1</sparkle:version>
       <sparkle:shortVersionString>0.9.0-rc1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
@@ -22,14 +22,13 @@
       <enclosure
         url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc1/AnyClip-v0.9.0-rc1.dmg"
         sparkle:os="macos"
-        length="48549992"
         type="application/octet-stream"
-        sparkle:edSignature="DLvUOUnun71E4d7zPx2awUJfirVIpnXqcC11MHyu0T+sx9sXWEoFjGWzJ0eTi/KOTpD2Ff0ImMXKsyKzDi01Cg==" length="48549992" />
+        sparkle:edSignature="FqaEqJ+tf3J+wYLmxCKITyo+tzPMTF5UT4NU3lDWIhPFTMF+NSrC8wv5behbhMH7zER+RJTArIQUKp13X2X5DQ==" length="51556343" />
       <enclosure
         url="https://github.com/gum798/AnyClip/releases/download/v0.9.0-rc1/AnyClip-v0.9.0-rc1-windows-x64.zip"
         sparkle:os="windows"
         type="application/octet-stream"
-        sparkle:edSignature="e6Xh/LTZ8qrqbwfzSdtvTYt+LFAXzNW05domNRMXfQrCE7SNsxVdphPFLIdTq4jmqAK4ZvOlLqn6jVuW1cjdBg==" length="23073179" />
+        sparkle:edSignature="lEuSbqTsSLmISGPwgoJqNdUYMpQ75whli4CVas1XwbpWKDEqUXC8gkuJmkhBvDbZw5A+1vQbzeNT+SR36oz5Bg==" length="23075159" />
     </item>
   </channel>
 </rss>
