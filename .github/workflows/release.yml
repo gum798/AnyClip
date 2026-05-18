@@ -55,7 +55,14 @@ jobs:
       - name: Build .app with py2app
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
-        run: python setup.py py2app
+          # Strip leading "v" from the tag so Sparkle's semver
+          # comparison sees "0.9.0-rc1" not "v0.9.0-rc1".
+          ANYCLIP_BUILD_VERSION: ${{ github.ref_name == 'main' && '0.0.0-dev' || github.ref_name }}
+        run: |
+          # github.ref_name keeps the leading "v" for tag pushes; strip it.
+          export ANYCLIP_BUILD_VERSION="${ANYCLIP_BUILD_VERSION#v}"
+          echo "Building version: $ANYCLIP_BUILD_VERSION"
+          python setup.py py2app
 
       - name: Package .dmg via hdiutil
         run: |
@@ -135,7 +142,13 @@ jobs:
       - name: Build .exe with PyInstaller
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
-        run: pyinstaller anyclip.spec --noconfirm
+          ANYCLIP_BUILD_VERSION: ${{ github.ref_name == 'main' && '0.0.0-dev' || github.ref_name }}
+        shell: pwsh
+        run: |
+          # Strip leading "v" so WinSparkle's semver compares cleanly.
+          $env:ANYCLIP_BUILD_VERSION = $env:ANYCLIP_BUILD_VERSION -replace '^v',''
+          Write-Output "Building version: $env:ANYCLIP_BUILD_VERSION"
+          pyinstaller anyclip.spec --noconfirm
 
       - name: Zip dist
         shell: pwsh

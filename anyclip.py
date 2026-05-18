@@ -62,7 +62,9 @@ SERVICE_TYPE = "_anyclip._tcp.local."
 # and mDNS TXT so peers can show "peer needs update" hints. Bump in lockstep
 # with releases. PROTOCOL_MAJOR/MINOR are independent: PROTOCOL_MAJOR is the
 # wire-compat key (mismatch = refuse link), PROTOCOL_MINOR is informational.
-APP_VERSION = "1.0.0"
+# CI exports ANYCLIP_BUILD_VERSION from the git tag (without leading "v");
+# local source runs default to a dev marker so handshake logs stay readable.
+APP_VERSION = os.environ.get("ANYCLIP_BUILD_VERSION", "0.0.0-dev")
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR = 0
 # Legacy alias: pre-1.0 peers send a single `version` int. New code treats

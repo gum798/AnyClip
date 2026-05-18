@@ -24,12 +24,20 @@ DATA_FILES: list = []
 # var both locally and on the CI runner.
 SPARKLE_PUBLIC_KEY = os.environ.get("SPARKLE_PUBLIC_KEY", "")
 
+# Build version. CI exports this from the git tag (stripped of leading
+# "v") so Sparkle can compare the running app's
+# CFBundleShortVersionString against `sparkle:version` in appcast.xml.
+# Local source builds default to a dev marker that always appears
+# older than any real release, so a dev copy will always see updates
+# offered (useful when smoke-testing the update path).
+BUILD_VERSION = os.environ.get("ANYCLIP_BUILD_VERSION", "0.0.0-dev")
+
 PLIST = {
     "CFBundleName": "AnyClip",
     "CFBundleDisplayName": "AnyClip",
     "CFBundleIdentifier": "io.github.gum798.anyclip",
-    "CFBundleVersion": "1.0.0",
-    "CFBundleShortVersionString": "1.0.0",
+    "CFBundleVersion": BUILD_VERSION,
+    "CFBundleShortVersionString": BUILD_VERSION,
     # No Dock icon, no Cmd-Tab presence: this is a menubar-only app.
     "LSUIElement": True,
     # macOS Sonoma+: the user must approve Local Network access. The
