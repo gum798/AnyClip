@@ -36,6 +36,15 @@ _MB_YESNO = 0x4
 _MB_ICONINFORMATION = 0x40
 _MB_ICONQUESTION = 0x20
 _MB_ICONWARNING = 0x30
+# Force the message box to the top + bring it to the foreground so a
+# pystray-thread dialog actually receives input focus. Without these
+# flags the box can render but the OS may keep input focus on the
+# Explorer notification area, so button clicks land on whatever was
+# behind the dialog.
+_MB_TOPMOST = 0x40000
+_MB_SETFOREGROUND = 0x10000
+_MB_SYSTEMMODAL = 0x1000
+_DIALOG_FLAGS = _MB_TOPMOST | _MB_SETFOREGROUND | _MB_SYSTEMMODAL
 # MessageBoxW return values.
 _IDOK = 1
 _IDYES = 6
@@ -54,7 +63,8 @@ def _native_yesno(title: str, text: str) -> bool:
         import ctypes
 
         result = ctypes.windll.user32.MessageBoxW(
-            0, text, title, _MB_YESNO | _MB_ICONQUESTION,
+            0, text, title,
+            _MB_YESNO | _MB_ICONQUESTION | _DIALOG_FLAGS,
         )
         return result == _IDYES
     except Exception:
@@ -68,7 +78,8 @@ def _native_info(title: str, text: str) -> None:
         import ctypes
 
         ctypes.windll.user32.MessageBoxW(
-            0, text, title, _MB_OK | _MB_ICONINFORMATION,
+            0, text, title,
+            _MB_OK | _MB_ICONINFORMATION | _DIALOG_FLAGS,
         )
     except Exception:
         log.exception("MessageBoxW (info) failed")
