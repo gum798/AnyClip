@@ -15,6 +15,7 @@ venv/
 build/icon/anyclip.iconset/
 dist/
 build/lib*/
+build/bdist*/
 *.egg-info/
 sparkle/
 winsparkle/

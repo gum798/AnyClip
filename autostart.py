@@ -214,3 +214,34 @@ def default_executable_path() -> str:
     for the CLI `--install-autostart` path.
     """
     return f"{sys.executable} {os.path.abspath(sys.argv[0])}"
+
+
+def default_launch_command() -> tuple[str, List[str]]:
+    """Return (executable, args) suitable for autostart registration.
+
+    When running inside a py2app .app bundle, sys.executable points at
+    `Contents/MacOS/python` -- a stub that requires the bundled
+    Python.framework. Registering that path directly is fragile (any
+    code-signing or relocation breakage leaves launchd in a KeepAlive
+    crash loop). Prefer the `Contents/MacOS/AnyClip` launcher instead,
+    which py2app generates with the right rpath and which boots the
+    menubar GUI without needing `--headless`.
+    """
+    if sys.platform == "darwin":
+        exe = Path(sys.executable).resolve()
+        # py2app stub layout: <bundle>.app/Contents/MacOS/python
+        if (
+            exe.name == "python"
+            and exe.parent.name == "MacOS"
+            and exe.parent.parent.name == "Contents"
+            and exe.parent.parent.parent.suffix == ".app"
+        ):
+            launcher = exe.parent / "AnyClip"
+            if launcher.exists():
+                return str(launcher), []
+    # PyInstaller-frozen builds expose the single launcher as sys.executable;
+    # passing sys.argv[0] (which equals sys.executable) again would double-quote
+    # the .exe into its own argument list.
+    if getattr(sys, "frozen", False):
+        return sys.executable, []
+    return sys.executable, [os.path.abspath(sys.argv[0]), "--headless"]

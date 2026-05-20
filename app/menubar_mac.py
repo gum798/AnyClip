@@ -250,10 +250,8 @@ class AnyClipMenubarApp:
             backend.disable()
             sender.state = 0
         else:
-            backend.enable(
-                executable_path=sys.executable,
-                args=[os.path.abspath(sys.argv[0]), "--headless"],
-            )
+            exe, extra = autostart.default_launch_command()
+            backend.enable(executable_path=exe, args=extra)
             sender.state = 1
 
     def _open_logs(self, _sender) -> None:

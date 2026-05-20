@@ -305,10 +305,8 @@ class AnyClipTrayApp:
         if backend.is_enabled():
             backend.disable()
         else:
-            backend.enable(
-                executable_path=sys.executable,
-                args=[os.path.abspath(sys.argv[0]), "--headless"],
-            )
+            exe, extra = autostart.default_launch_command()
+            backend.enable(executable_path=exe, args=extra)
         try:
             self.icon.update_menu()
         except Exception:

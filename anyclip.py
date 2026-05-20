@@ -704,10 +704,8 @@ def parse_args() -> Config:
         sys.exit(0)
     if args.install_autostart:
         backend = autostart.get_backend()
-        backend.enable(
-            executable_path=sys.executable,
-            args=[os.path.abspath(sys.argv[0]), "--headless"],
-        )
+        exe, extra = autostart.default_launch_command()
+        backend.enable(executable_path=exe, args=extra)
         sys.stderr.write("anyclip: autostart enabled\n")
         sys.exit(0)
     if args.uninstall_autostart:
