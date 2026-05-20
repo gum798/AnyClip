@@ -1974,9 +1974,10 @@ async def run(config: Config) -> None:
     log.info(f"AnyClip starting (node {node_id[:8]}, name={config.name!r})")
     if config.peers:
         log.info(f"manual peers: {[f'{h}:{p}' for h, p in config.peers]}")
+    tasks: list[asyncio.Task] = []
     try:
         await beacon.start()
-        tasks = [
+        coros = [
             link.serve(),
             watcher.run(),
             mdns_reconnect_loop(beacon, link),
@@ -1985,11 +1986,23 @@ async def run(config: Config) -> None:
             link_ping_loop(link),
         ]
         for host, port in config.peers:
-            tasks.append(peer_keepalive(host, port, link))
+            coros.append(peer_keepalive(host, port, link))
         if sys.platform == "darwin":
-            tasks.append(_run_permission_probe(beacon))
+            coros.append(_run_permission_probe(beacon))
+        tasks = [asyncio.create_task(c) for c in coros]
         await asyncio.gather(*tasks)
     finally:
+        # Cancel any siblings still running and *await* them so their
+        # finally blocks complete before the event loop closes. Without
+        # this, asyncio.gather() re-raises on the first failure without
+        # draining peers, leaving Windows ProactorEventLoop's internal
+        # IocpProactor.accept coroutine pending -- which surfaces as
+        # "Task was destroyed but it is pending!" at loop shutdown.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await link.close()
         await beacon.stop()
         release_pid_lock()
