@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import socket
+import stat as stat_mod
 import subprocess
 import sys
 import tempfile
@@ -814,9 +815,14 @@ class ClipboardWatcher:
     # changes that arrive within this many seconds of the previous send.
     IMAGE_COOLDOWN_S = 1.0
 
-    def __init__(self, poll_interval: float, on_change) -> None:
+    def __init__(self, poll_interval: float, on_change,
+                 on_file_skipped=None) -> None:
         self.poll_interval = poll_interval
         self.on_change = on_change  # async def (kind: str, data) -> None
+        # Optional async callback fired when a clipboard file is detected
+        # but deliberately not synced (folders, unreadable paths). Lets
+        # the UI shell surface a toast; None in headless tests.
+        self.on_file_skipped = on_file_skipped  # async def (message: str)
         self._consec_read_fails = 0
         self._read_fail_warned = False
         self._last_text: Optional[str] = self._safe_paste()
@@ -928,6 +934,18 @@ class ClipboardWatcher:
         fp = (path, stat.st_size, stat.st_mtime_ns)
         if fp == self._last_file_fp:
             return  # nothing new on the clipboard
+        # Folders are an explicit scope-out (same as multi-file). Record
+        # the fingerprint FIRST so the same copy is never re-detected --
+        # the old EISDIR path skipped that update and retried (and
+        # logged) every poll cycle, forever.
+        if stat_mod.S_ISDIR(stat.st_mode):
+            self._last_file_fp = fp
+            display = os.path.basename(path.rstrip("/\\")) or path
+            log.warning(f"folder on clipboard not synced (unsupported): {path!r}")
+            await self._notify_file_skipped(
+                f"folder not synced — folders are not supported: {display}"
+            )
+            return
         # Refuse files that would not fit in a single frame after base64.
         # Reserve ~256 KB for JSON envelope and the b64 1.34x inflation.
         budget = int((MAX_PAYLOAD - 256 * 1024) * 0.74)
@@ -945,7 +963,10 @@ class ClipboardWatcher:
         try:
             data = await asyncio.to_thread(Path(path).read_bytes)
         except OSError as exc:
-            log.debug(f"file read failed for {path!r}: {exc}")
+            # Record the fingerprint anyway: a path that cannot be read
+            # now will not become readable by polling it forever.
+            self._last_file_fp = fp
+            log.warning(f"file read failed for {path!r}: {exc}; skipping")
             return
         self._last_file_fp = fp
         self._last_file_hash = sha256_bytes(data)
@@ -953,6 +974,14 @@ class ClipboardWatcher:
             await self.on_change("file", (os.path.basename(path), data))
         except Exception as exc:
             log.exception(f"on_change(file) handler failed: {exc}")
+
+    async def _notify_file_skipped(self, message: str) -> None:
+        if self.on_file_skipped is None:
+            return
+        try:
+            await self.on_file_skipped(message)
+        except Exception as exc:
+            log.exception(f"on_file_skipped handler failed: {exc}")
 
     def update_local_text(self, text: str) -> None:
         """Set the local text clipboard without re-triggering on_change."""
@@ -1968,7 +1997,14 @@ async def run(config: Config) -> None:
                     message=f"file: {name} ({len(raw_b)//1024} KB)",
                 )
 
-    watcher = ClipboardWatcher(config.poll_interval, on_local_change)
+    async def on_file_skipped(message: str) -> None:
+        if notify_enabled:
+            await notify_async(title="AnyClip", message=message)
+
+    watcher = ClipboardWatcher(
+        config.poll_interval, on_local_change,
+        on_file_skipped=on_file_skipped,
+    )
     beacon = MdnsBeacon(config, node_id, link.try_connect)
 
     log.info(f"AnyClip starting (node {node_id[:8]}, name={config.name!r})")
