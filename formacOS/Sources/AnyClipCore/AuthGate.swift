@@ -2,7 +2,9 @@ import Foundation
 
 /// Per-IP cooldown after repeated handshake failures. After maxFails failed
 /// handshakes from the same IP, that IP is blocked for cooldown seconds.
-/// A successful handshake clears the counter. Stale entries are swept lazily.
+/// A successful handshake clears the counter. Expired entries never block
+/// (checked inline on read) and are evicted on each recordFail, so the table
+/// stays bounded by failure activity.
 /// Port of anyclip.AuthGate; the caller (PeerLink actor) provides isolation.
 public struct AuthGate: Sendable {
     public static let maxFails = 5
@@ -29,9 +31,9 @@ public struct AuthGate: Sendable {
     }
 
     public mutating func recordFail(_ ip: String) {
+        sweep() // evict expired entries so a stale count never carries over
         let count = fails[ip]?.count ?? 0
         fails[ip] = Entry(count: count + 1, last: now())
-        sweep()
     }
 
     public mutating func recordOK(_ ip: String) {
