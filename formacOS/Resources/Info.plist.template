@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>AnyClip</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.anyclip.AnyClip</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>AnyClip</string>
+    <key>CFBundleDisplayName</key>
+    <string>AnyClip</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleIconFile</key>
+    <string>anyclip.icns</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>AnyClip discovers your other device on the local network to sync the clipboard.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_anyclip._tcp</string>
+    </array>
+</dict>
+</plist>
