@@ -32,6 +32,7 @@ public func negotiate(local: VersionInfo, peer: VersionInfo) -> Compatibility {
     return .compatible
 }
 
+/// True when the negotiated compatibility allows the link to proceed (minor mismatches are advisory; major mismatches refuse).
 public func linkAllowed(_ result: Compatibility) -> Bool {
     switch result {
     case .compatible, .peerOlderMinor, .peerNewerMinor: return true

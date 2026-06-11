@@ -16,7 +16,7 @@ import Foundation
 
 @Test func sha256HexOfBytes() {
     #expect(sha256Hex(Data([0x00, 0x01, 0xff])) ==
-        sha256Hex(Data([0x00, 0x01, 0xff])))
+        "26a66b061e8f48f39927c312f25293959729eee95978e2892d49d3512a5cc092")
     #expect(sha256Hex(Data()) ==
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 }
