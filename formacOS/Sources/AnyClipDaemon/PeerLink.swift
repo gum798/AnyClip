@@ -255,7 +255,7 @@ public actor PeerLink {
         }
         activeConn = framed
         peerNodeID = peerID
-        let displayName = hello.name ?? String(peerID.prefix(8))
+        let displayName = (hello.name?.isEmpty == false) ? hello.name! : String(peerID.prefix(8))
         peerName = displayName
         linkedAt = monotonicNow()
         AnyLog.shared.info(
@@ -330,7 +330,11 @@ public actor PeerLink {
     /// socket surfaces as a send failure + EOF.
     public func sendPing() async {
         guard let conn = activeConn else { return }
-        try? await conn.sendFrame(.ping(ts: Date().timeIntervalSince1970))
+        do {
+            try await conn.sendFrame(.ping(ts: Date().timeIntervalSince1970))
+        } catch {
+            AnyLog.shared.info("send failed (link likely down): \(error)")
+        }
     }
 
     public func sendClip(_ payload: ClipPayload) async {
