@@ -190,6 +190,40 @@ jobs:
             dist/AnyClip-${{ github.ref_name }}-windows-x64.zip
             dist/windows-signature.txt
 
+  macos-swift:
+    name: macOS native (Swift) build
+    # macos-15 = arm64 + Xcode 16 (Swift 6); macos-14 images ship Swift 5.x
+    # which cannot build swift-tools-version 6.0.
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Swift tests
+        run: swift test --package-path formacOS
+
+      - name: Build AnyClip.app (Swift)
+        env:
+          ANYCLIP_BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          export ANYCLIP_BUILD_VERSION="${ANYCLIP_BUILD_VERSION#v}"
+          formacOS/Scripts/build-app.sh
+
+      - name: Zip .app (Homebrew cask asset)
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            formacOS/dist/AnyClip.app \
+            "formacOS/dist/AnyClip-${{ github.ref_name }}-macos-arm64.zip"
+          shasum -a 256 "formacOS/dist/AnyClip-${{ github.ref_name }}-macos-arm64.zip"
+
+      - name: Upload Swift macOS asset to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: formacOS/dist/AnyClip-${{ github.ref_name }}-macos-arm64.zip
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
   appcast:
     name: Publish appcast.xml to gh-pages
     needs: [macos, windows]

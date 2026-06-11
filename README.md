@@ -5,8 +5,20 @@ LAN 안의 두 컴퓨터 사이에서 **클립보드를 양방향으로 자동 �
 
 ## Quick Start
 
+### macOS — Homebrew (권장)
+
+```bash
+brew tap gum798/tap
+brew install --cask --no-quarantine anyclip
+```
+
+`--no-quarantine`은 코드 서명이 없는 빌드의 Gatekeeper 차단을 건너뜁니다. 생략했다면 첫 실행 시 우클릭 → 열기 1회가 필요합니다. 네이티브 Swift 빌드(`formacOS/`)가 설치됩니다.
+
+### 직접 다운로드
+
 1. [최신 릴리스](https://github.com/gum798/AnyClip/releases/latest)에서 OS에 맞는 파일을 다운로드합니다.
-   - macOS: `AnyClip-vX.Y.Z.dmg` (Apple Silicon 전용)
+   - macOS (native Swift): `AnyClip-vX.Y.Z-macos-arm64.zip` (Apple Silicon 전용)
+   - macOS (legacy Python): `AnyClip-vX.Y.Z.dmg` (Apple Silicon 전용)
    - Windows: `AnyClip-vX.Y.Z-windows-x64.zip` (x64)
 2. 더블클릭으로 설치/압축 해제 후 실행합니다.
 3. 첫 실행 창에서:
