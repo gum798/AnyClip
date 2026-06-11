@@ -22,6 +22,9 @@ public enum TXTCodec {
         while i < data.endIndex {
             let len = Int(data[i])
             i = data.index(after: i)
+            // A zero-length entry ends the scan (break, not continue): we only
+            // decode records we or zeroconf encoded, where 0x00 means "empty
+            // TXT record", never padding between entries.
             guard len > 0,
                   let end = data.index(i, offsetBy: len, limitedBy: data.endIndex)
             else { break }
