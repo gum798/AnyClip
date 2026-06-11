@@ -153,7 +153,15 @@ final class StatusItemController: NSObject {
         let newToken = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !newToken.isEmpty else { return }
 
-        try? ConfigStore.save(StoredConfig(token: newToken))
+        do {
+            try ConfigStore.save(StoredConfig(token: newToken))
+        } catch {
+            let failed = NSAlert()
+            failed.messageText = "Could not save token"
+            failed.informativeText = "Saving to \(ConfigStore.configPath().path) failed: \(error.localizedDescription)"
+            failed.runModal()
+            return
+        }
         let done = NSAlert()
         done.messageText = "Token saved"
         done.informativeText =
@@ -176,7 +184,15 @@ final class StatusItemController: NSObject {
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
         let newToken = ConfigStore.generateToken()
-        try? ConfigStore.save(StoredConfig(token: newToken))
+        do {
+            try ConfigStore.save(StoredConfig(token: newToken))
+        } catch {
+            let failed = NSAlert()
+            failed.messageText = "Could not save token"
+            failed.informativeText = "Saving to \(ConfigStore.configPath().path) failed: \(error.localizedDescription)"
+            failed.runModal()
+            return
+        }
         let done = NSAlert()
         done.messageText = "Token reset"
         done.informativeText =
