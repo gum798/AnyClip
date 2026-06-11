@@ -211,16 +211,10 @@ public final class Daemon: @unchecked Sendable {
         AnyLog.shared.info(
             "AnyClip starting (node \(nodeID.prefix(8)), name=\(config.name))")
 
-        // Capture watcher reference for the task group closure (Swift 5
-        // mode does not allow @MainActor on a group.addTask closure
-        // directly — use nonisolated wrapper + MainActor.run instead).
-        let capturedWatcher = watcher
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await link.serve() }
-                group.addTask {
-                    try await MainActor.run { capturedWatcher }.run()
-                }
+                group.addTask { try await watcher.run() }
                 group.addTask { try await mdnsReconnectLoop(beacon: beacon, link: link) }
                 group.addTask { try await networkWatchdog(beacon: beacon) }
                 group.addTask { try await idleLinkWatchdog(beacon: beacon, link: link) }
