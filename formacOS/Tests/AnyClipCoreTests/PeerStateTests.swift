@@ -45,7 +45,7 @@ import Testing
 
 @Test func fiveHandshakeFailsTripAuthError() {
     var s = PeerUIState.initial
-    for i in 1...4 {
+    for i in 1...(handshakeFailThreshold - 1) {
         s = reducePeerState(s, .handshakeFailed(addr: "a", reason: "auth"), now: Double(i))
         #expect(s.kind == .idle)
         #expect(s.consecutiveHandshakeFails == i)
@@ -59,5 +59,6 @@ import Testing
     var s = PeerUIState.initial
     s = reducePeerState(s, .handshakeFailed(addr: "a", reason: "auth"), now: 1)
     s = reducePeerState(s, .linkUp(peerName: "p", peerID: "x"), now: 2)
+    #expect(s.kind == .linked)
     #expect(s.consecutiveHandshakeFails == 0)
 }
