@@ -9,10 +9,14 @@ LAN 안의 두 컴퓨터 사이에서 **클립보드를 양방향으로 자동 �
 
 ```bash
 brew tap gum798/tap
-brew install --cask --no-quarantine anyclip
+brew install --cask anyclip
 ```
 
-`--no-quarantine`은 코드 서명이 없는 빌드의 Gatekeeper 차단을 건너뜁니다. 생략했다면 첫 실행 시 우클릭 → 열기 1회가 필요합니다. 네이티브 Swift 빌드(`formacOS/`)가 설치됩니다.
+네이티브 Swift 빌드(`formacOS/`)가 `/Applications`에 설치됩니다. 코드 서명이 없는 빌드라 첫 실행은 Gatekeeper가 차단합니다 — 우클릭 → 열기 1회, 또는:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AnyClip.app
+```
 
 ### 직접 다운로드
 
