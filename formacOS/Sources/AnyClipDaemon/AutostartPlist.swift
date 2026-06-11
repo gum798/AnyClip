@@ -69,6 +69,10 @@ public struct Autostart {
         do {
             try process.run()
             process.waitUntilExit()
+            if process.terminationStatus != 0, args.first == "load" {
+                AnyLog.shared.warning(
+                    "launchctl \(args) exit=\(process.terminationStatus)")
+            }
         } catch {
             AnyLog.shared.warning("launchctl \(args) failed: \(error)")
         }
