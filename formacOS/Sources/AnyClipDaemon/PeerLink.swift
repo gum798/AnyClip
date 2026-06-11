@@ -2,6 +2,9 @@ import Foundation
 import Network
 import AnyClipCore
 
+/// Sentinel thrown internally when bind fails with EADDRINUSE; triggers a retry.
+private struct PortInUseError: Error {}
+
 /// Owns the single active TCP link to a peer. Acts as both server and
 /// client; resolves the simultaneous-connect race via lexicographic
 /// node_id tie-break. Port of anyclip.PeerLink — actor isolation replaces
@@ -74,60 +77,12 @@ public actor PeerLink {
         guard self.listener == nil else {
             throw FatalStartupError("serve() called twice on the same PeerLink")
         }
-        let tcp = NWProtocolTCP.Options()
-        tcp.enableKeepalive = true
-        tcp.keepaliveIdle = 15
-        let params = NWParameters(tls: nil, tcp: tcp)
-        params.allowLocalEndpointReuse = true
-        let listener: NWListener
-        do {
-            listener = try NWListener(
-                using: params, on: NWEndpoint.Port(rawValue: config.port)!)
-        } catch {
-            throw FatalStartupError("could not open tcp/\(config.port): \(error)")
-        }
-        listener.service = advertiseService
 
-        // Capture self weakly to avoid actor-isolation issues inside the
-        // NWListener closure (which runs on an arbitrary queue, not the actor).
-        // Deviation from spec template: using 'nonisolated(unsafe)' is not
-        // available in Swift 5 mode, so we capture a sendable reference to
-        // self (PeerLink is an actor, satisfying Sendable) and dispatch a Task.
-        listener.newConnectionHandler = { [weak self] conn in
-            guard let self else { conn.cancel(); return }
-            Task { await self.handleInbound(conn) }
-        }
-        self.listener = listener
+        // Attempt to bind up to 4 times, waiting 0.5s between attempts, to
+        // survive transient EADDRINUSE after killing the previous daemon.
+        var attempt = 0
+        let listener = try await makeAndStartListener(attempt: &attempt)
 
-        // Deviation: `if case .posix(.EADDRINUSE) = error` doesn't compile for
-        // NWError in Swift 5 mode (NWError is not a Swift enum with associated
-        // values that support direct pattern matching). Use a `where` guard instead.
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            let resumed = Locked(false)
-            listener.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if !resumed.exchange(true) { cont.resume() }
-                case .failed(let error):
-                    if !resumed.exchange(true) {
-                        if case .posix(let code) = error, code == .EADDRINUSE {
-                            cont.resume(throwing: FatalStartupError(
-                                "port \(self.config.port) still in use after cleanup attempt; "
-                                + "another process may have grabbed it"))
-                        } else {
-                            cont.resume(throwing: error)
-                        }
-                    }
-                case .cancelled:
-                    if !resumed.exchange(true) {
-                        cont.resume(throwing: WireConnectionError.cancelled)
-                    }
-                default:
-                    break
-                }
-            }
-            listener.start(queue: .global(qos: .userInitiated))
-        }
         listener.stateUpdateHandler = nil
         isServing = true
         AnyLog.shared.info("listening on tcp/\(config.port)")
@@ -139,6 +94,83 @@ public actor PeerLink {
         // Park until cancelled; inbound sessions run in their own Tasks.
         while true {
             try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
+    /// Create an NWListener on `config.port`, await `.ready`, and return it.
+    /// On EADDRINUSE, cancels the failed listener and throws `PortInUseError`.
+    /// The caller owns the retry loop.
+    private func makeAndStartListener(attempt: inout Int) async throws -> NWListener {
+        while true {
+            let tcp = NWProtocolTCP.Options()
+            tcp.enableKeepalive = true
+            tcp.keepaliveIdle = 15
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            let candidate: NWListener
+            do {
+                candidate = try NWListener(
+                    using: params, on: NWEndpoint.Port(rawValue: config.port)!)
+            } catch {
+                throw FatalStartupError("could not open tcp/\(config.port): \(error)")
+            }
+            candidate.service = advertiseService
+
+            // Capture self weakly to avoid actor-isolation issues inside the
+            // NWListener closure (which runs on an arbitrary queue, not the actor).
+            // Deviation from spec template: using 'nonisolated(unsafe)' is not
+            // available in Swift 5 mode, so we capture a sendable reference to
+            // self (PeerLink is an actor, satisfying Sendable) and dispatch a Task.
+            candidate.newConnectionHandler = { [weak self] conn in
+                guard let self else { conn.cancel(); return }
+                Task { await self.handleInbound(conn) }
+            }
+            self.listener = candidate
+
+            // Deviation: `if case .posix(.EADDRINUSE) = error` doesn't compile for
+            // NWError in Swift 5 mode (NWError is not a Swift enum with associated
+            // values that support direct pattern matching). Use a `where` guard instead.
+            do {
+                try await withCheckedThrowingContinuation {
+                    (cont: CheckedContinuation<Void, Error>) in
+                    let resumed = Locked(false)
+                    candidate.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            if !resumed.exchange(true) { cont.resume() }
+                        case .failed(let error):
+                            if !resumed.exchange(true) {
+                                if case .posix(let code) = error, code == .EADDRINUSE {
+                                    cont.resume(throwing: PortInUseError())
+                                } else {
+                                    cont.resume(throwing: error)
+                                }
+                            }
+                        case .cancelled:
+                            if !resumed.exchange(true) {
+                                cont.resume(throwing: WireConnectionError.cancelled)
+                            }
+                        default:
+                            break
+                        }
+                    }
+                    candidate.start(queue: .global(qos: .userInitiated))
+                }
+                // Bind succeeded — return the ready listener.
+                return candidate
+            } catch is PortInUseError {
+                candidate.cancel()
+                self.listener = nil
+                attempt += 1
+                guard attempt <= 4 else {
+                    throw FatalStartupError(
+                        "port \(config.port) still in use after cleanup attempt; "
+                        + "another process may have grabbed it")
+                }
+                AnyLog.shared.info(
+                    "tcp/\(config.port) still in use; retrying bind (\(attempt)/4)")
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
         }
     }
 

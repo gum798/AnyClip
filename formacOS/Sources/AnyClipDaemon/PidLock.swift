@@ -21,6 +21,7 @@ public enum PidLock {
                     + "please run: kill -9 \(oldPid)")
             }
             AnyLog.shared.info("previous anyclip (pid \(oldPid)) terminated")
+            usleep(300_000) // let the OS release the dead daemon's listen socket
         }
 
         // 2) Stale state: port held without a matching PID file.
