@@ -195,6 +195,8 @@ jobs:
     # macos-15 = arm64 + Xcode 16 (Swift 6); macos-14 images ship Swift 5.x
     # which cannot build swift-tools-version 6.0.
     runs-on: macos-15
+    outputs:
+      sha256: ${{ steps.zip.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -210,11 +212,14 @@ jobs:
           formacOS/Scripts/build-app.sh
 
       - name: Zip .app (Homebrew cask asset)
+        id: zip
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             formacOS/dist/AnyClip.app \
             "formacOS/dist/AnyClip-${{ github.ref_name }}-macos-arm64.zip"
-          shasum -a 256 "formacOS/dist/AnyClip-${{ github.ref_name }}-macos-arm64.zip"
+          SHA=$(shasum -a 256 "formacOS/dist/AnyClip-${{ github.ref_name }}-macos-arm64.zip" | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha256: $SHA"
 
       - name: Upload Swift macOS asset to Release
         uses: softprops/action-gh-release@v2
@@ -223,6 +228,43 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+
+  homebrew:
+    name: Update Homebrew cask
+    needs: [macos-swift]
+    # The cask tracks stable releases only — skip pre-release tags
+    # (anything containing "-", e.g. v1.1.0-rc1).
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push version bump to gum798/homebrew-tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          SHA256: ${{ needs.macos-swift.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          test -n "$SHA256"
+
+          mkdir -p ~/.ssh
+          echo "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+
+          git clone --depth 1 git@github.com:gum798/homebrew-tap.git tap
+          cd tap
+          sed -i -E "s|^  version \".*\"$|  version \"${VERSION}\"|" Casks/anyclip.rb
+          sed -i -E "s|^  sha256 \".*\"$|  sha256 \"${SHA256}\"|" Casks/anyclip.rb
+          grep -E '^  (version|sha256) ' Casks/anyclip.rb
+
+          git config user.name "AnyClip Release Bot"
+          git config user.email "release-bot@anyclip"
+          git add Casks/anyclip.rb
+          # No-op when re-running a release whose cask is already current.
+          git diff --cached --quiet && { echo "cask already up to date"; exit 0; }
+          git commit -m "anyclip ${VERSION}"
+          git push origin main
 
   appcast:
     name: Publish appcast.xml to gh-pages
