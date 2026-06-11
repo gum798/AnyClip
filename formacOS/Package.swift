@@ -5,6 +5,11 @@ let package = Package(
     name: "AnyClip",
     platforms: [.macOS(.v14)],
     dependencies: [
+        // Explicit swift-testing dependency is REQUIRED on CLT-only machines (no
+        // Xcode): the toolchain-bundled Testing.framework builds but silently runs
+        // zero tests under `swift test` (exit 0 even on failures). The OSS package
+        // restores correct discovery + non-zero exit on failure. Verified 2026-06-11.
+        // Do not remove without re-running the failing-test experiment.
         .package(url: "https://github.com/swiftlang/swift-testing.git", from: "0.10.0"),
     ],
     targets: [
