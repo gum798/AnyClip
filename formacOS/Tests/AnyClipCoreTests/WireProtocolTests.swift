@@ -60,7 +60,10 @@ import Foundation
 @Test func oversizedPayloadThrows() {
     var big = WireMessage.ping(ts: 0)
     big.content = String(repeating: "x", count: Wire.maxPayload + 1)
-    #expect(throws: WireFrameError.self) { try big.encodeFrame() }
+    #expect { try big.encodeFrame() } throws: { error in
+        if case .payloadTooLarge(let n)? = error as? WireFrameError { return n > Wire.maxPayload }
+        return false
+    }
 }
 
 @Test func decodeBodyToleratesUnknownFields() {
@@ -103,4 +106,5 @@ import Foundation
 @Test func frameLengthParsesBigEndian() {
     #expect(WireMessage.frameLength(Data([0x00, 0x00, 0x01, 0x02])) == 258)
     #expect(WireMessage.frameLength(Data([0x01, 0x00, 0x00, 0x00])) == 16_777_216)
+    #expect(WireMessage.frameLength(Data([0x01, 0x02])) == 0)
 }

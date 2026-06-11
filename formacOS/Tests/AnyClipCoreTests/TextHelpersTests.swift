@@ -15,4 +15,5 @@ import Testing
     #expect(sanitizeFilename("") == "received.bin")
     #expect(sanitizeFilename("   ") == "received.bin")
     #expect(sanitizeFilename("한글파일.txt") == "한글파일.txt") // unicode alnum kept
+    #expect(sanitizeFilename("???") == "___")
 }

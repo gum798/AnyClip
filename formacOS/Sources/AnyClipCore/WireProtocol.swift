@@ -143,7 +143,7 @@ extension WireMessage {
             throw WireFrameError.payloadTooLarge(body.count)
         }
         var out = Data(capacity: 4 + body.count)
-        let n = UInt32(body.count)
+        let n = UInt32(body.count) // safe: guarded to maxPayload (16 MiB) above, far below UInt32.max
         out.append(UInt8((n >> 24) & 0xFF))
         out.append(UInt8((n >> 16) & 0xFF))
         out.append(UInt8((n >> 8) & 0xFF))
@@ -154,6 +154,7 @@ extension WireMessage {
 
     /// Big-endian length from the 4-byte header. Alignment-safe for slices.
     public static func frameLength(_ header: Data) -> Int {
+        guard header.count >= 4 else { return 0 } // 0 is already an invalid frame length
         var n = 0
         for byte in header.prefix(4) { n = (n << 8) | Int(byte) }
         return n
