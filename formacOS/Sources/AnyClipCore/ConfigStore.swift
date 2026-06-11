@@ -52,6 +52,9 @@ public enum ConfigStore {
         let tmp = targetDir.appendingPathComponent(".config.json.\(UUID().uuidString).tmp")
         do {
             try (data + Data("\n".utf8)).write(to: tmp)
+            let handle = try FileHandle(forWritingTo: tmp)
+            try handle.synchronize()   // fsync before rename, like config_store.py
+            try handle.close()
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600], ofItemAtPath: tmp.path)
             guard rename(tmp.path, target.path) == 0 else {

@@ -14,7 +14,17 @@ enum Onboarding {
             return stored.token
         }
         guard let token = show() else { return nil }
-        try? ConfigStore.save(StoredConfig(token: token))
+        do {
+            try ConfigStore.save(StoredConfig(token: token))
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not save token"
+            alert.informativeText =
+                "Saving to \(ConfigStore.configPath().path) failed: "
+                + "\(error.localizedDescription)\n\nAnyClip will use this token for "
+                + "this session, but you may be asked again on the next launch."
+            alert.runModal()
+        }
         return token
     }
 

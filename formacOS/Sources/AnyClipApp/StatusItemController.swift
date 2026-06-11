@@ -209,8 +209,15 @@ final class StatusItemController: NSObject {
             startAtLoginItem.state = .off
         } else {
             let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
-            try? autostart.enable(executablePath: exe)
-            startAtLoginItem.state = .on
+            do {
+                try autostart.enable(executablePath: exe)
+                startAtLoginItem.state = .on
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Could not enable Start at Login"
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
         }
     }
 

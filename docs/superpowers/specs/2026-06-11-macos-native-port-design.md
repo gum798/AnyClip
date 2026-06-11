@@ -275,3 +275,18 @@ UserNotifications: it exposes an injected `notify(title, body)` callback
   bypass flow from the README.
 - macOS 15+ shows the Local Network permission prompt on first mDNS
   use; the existing permission probe + menu shortcut handles refusal.
+
+## Post-merge amendments (2026-06-11)
+
+- Deployment target is macOS 14 (not 13) — matches Package.swift and
+  Info.plist.
+- APP_VERSION is read at runtime from CFBundleShortVersionString with an
+  ANYCLIP_BUILD_VERSION env fallback (no generated Version.swift).
+- The menu bar glyph is no longer always-static "@": it renders red while
+  not linked and "@!" (red) on error, per user request. The dropdown
+  structure is unchanged. The Token… alert gained an "Enter token…" flow.
+- swift-testing is a test-only package dependency (CLT toolchains run
+  zero tests with the bundled framework — see Package.swift comment);
+  runtime targets remain dependency-free.
+- Known follow-up: the tie-breaker race-window logic has no automated
+  test (same gap exists in the Python original).
