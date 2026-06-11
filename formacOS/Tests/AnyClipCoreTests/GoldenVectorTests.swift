@@ -63,7 +63,9 @@ private func decodeGoldenFrame(_ name: String) throws -> WireMessage {
     let man = try manifest()
     #expect(m.name == man["file_name"] as? String)
     let data = strictBase64Decode(m.content!)
+    #expect(data != nil)
     #expect(sha256Hex(data!) == man["file_hash"] as? String)
+    #expect(m.bytes == data!.count)
 }
 
 @Test func goldenPingDecodes() throws {
