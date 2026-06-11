@@ -71,6 +71,9 @@ public actor PeerLink {
     }
 
     public func serve() async throws {
+        guard self.listener == nil else {
+            throw FatalStartupError("serve() called twice on the same PeerLink")
+        }
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 15
@@ -128,6 +131,11 @@ public actor PeerLink {
         listener.stateUpdateHandler = nil
         isServing = true
         AnyLog.shared.info("listening on tcp/\(config.port)")
+        defer {
+            listener.cancel()
+            self.listener = nil
+            isServing = false
+        }
         // Park until cancelled; inbound sessions run in their own Tasks.
         while true {
             try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -278,8 +286,11 @@ public actor PeerLink {
             case "clip":
                 await handleClip(m)
             case "ping":
-                try? await framed.sendFrame(
-                    .pong(ts: Date().timeIntervalSince1970))
+                do {
+                    try await framed.sendFrame(.pong(ts: Date().timeIntervalSince1970))
+                } catch {
+                    AnyLog.shared.info("send failed (link likely down): \(error)")
+                }
             case "pong":
                 break // presence is enough
             default:

@@ -118,10 +118,10 @@ private func waitUntil(
     try await raw.sendFrame(.hello(
         tokenHash: sha256Hex("tok"), nodeID: "ffffffff-raw", name: "raw",
         appVersion: "0.0.0-test"))
-    let serverHello = try await raw.receiveMessage()
+    let serverHello = try await withTimeout(seconds: 5) { try await raw.receiveMessage() }
     #expect(serverHello?.type == "hello")
     try await raw.sendFrame(.ping(ts: 1))
-    let reply = try await raw.receiveMessage()
+    let reply = try await withTimeout(seconds: 5) { try await raw.receiveMessage() }
     #expect(reply?.type == "pong")
     await a.shutdown()
 }
