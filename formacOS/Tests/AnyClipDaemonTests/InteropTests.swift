@@ -44,7 +44,7 @@ private func scriptsDir() -> URL {
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    #expect(readyReceived)
+    try #require(readyReceived)
 
     let clips = Locked<[ClipPayload]>([])
     let events = Locked<[DaemonEvent]>([])
@@ -105,9 +105,9 @@ private func scriptsDir() -> URL {
     // The hello we sent must satisfy Python's field expectations.
     let outText = try String(contentsOf: outFile, encoding: .utf8)
     let helloLine = outText.split(separator: "\n").first { $0.contains("\"event\": \"hello\"") }
-    #expect(helloLine != nil)
-    #expect(helloLine!.contains("\"version\": 1"))
-    #expect(helloLine!.contains("\"protocol_major\": 1"))
+    let hello = try #require(helloLine)
+    #expect(hello.contains("\"version\": 1"))
+    #expect(hello.contains("\"protocol_major\": 1"))
 
     await link.shutdown()
 }
