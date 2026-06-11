@@ -2,7 +2,7 @@ import AppKit
 import AnyClipCore
 import AnyClipDaemon
 
-/// Menu bar shell. Static "@" title; all state lives in the dropdown.
+/// Menu bar shell. Icon reflects link state; all state lives in the dropdown.
 /// Port of app/menubar_mac.AnyClipMenubarApp (minus Sparkle).
 @MainActor
 final class StatusItemController: NSObject {
@@ -31,8 +31,6 @@ final class StatusItemController: NSObject {
             title: "Start at Login", action: nil, keyEquivalent: "")
         super.init()
 
-        statusItem.button?.title = "@"
-
         statusMenuItem.isEnabled = false
         lastSyncItem.isEnabled = false
         menu.autoenablesItems = false
@@ -59,9 +57,13 @@ final class StatusItemController: NSObject {
         menu.addItem(.separator())
         menu.addItem(quitItem)
         statusItem.menu = menu
+
+        // Set initial icon via the same path used by apply(_:).
+        updateIcon(.initial)
     }
 
     func apply(_ state: PeerUIState) {
+        updateIcon(state)
         switch state.kind {
         case .linked:
             statusMenuItem.title = "Linked: \(state.peerName ?? "peer")"
@@ -86,6 +88,25 @@ final class StatusItemController: NSObject {
         }
     }
 
+    // ---- icon -----------------------------------------------------------
+
+    private func updateIcon(_ state: PeerUIState) {
+        let spec = menuIconSpec(for: state)
+        guard let button = statusItem.button else { return }
+        if spec.highlighted {
+            button.attributedTitle = NSAttributedString(
+                string: spec.text,
+                attributes: [
+                    .foregroundColor: NSColor.systemRed,
+                    .font: NSFont.menuBarFont(ofSize: 0),
+                ])
+        } else {
+            button.attributedTitle = NSAttributedString(
+                string: spec.text,
+                attributes: [.font: NSFont.menuBarFont(ofSize: 0)])
+        }
+    }
+
     // ---- menu actions ---------------------------------------------------
 
     @objc private func showTokenInfo() {
@@ -100,11 +121,50 @@ final class StatusItemController: NSObject {
             + "Stored at: \(path)\n\n"
             + "Reset generates a new random token, saves it, and quits "
             + "AnyClip. The other device must re-onboard with the new "
-            + "token before sync resumes."
-        alert.addButton(withTitle: "Close")
-        alert.addButton(withTitle: "Reset…")
-        guard alert.runModal() == .alertSecondButtonReturn else { return }
+            + "token before sync resumes.\n\n"
+            + "Enter token… lets you paste the token from your other device."
+        alert.addButton(withTitle: "Close")       // first = default (Return key)
+        alert.addButton(withTitle: "Enter token…") // second
+        alert.addButton(withTitle: "Reset…")       // third
 
+        switch alert.runModal() {
+        case .alertSecondButtonReturn:
+            // "Enter token…" — prompt the user for a known token
+            enterTokenFlow()
+        case .alertThirdButtonReturn:
+            // "Reset…" — existing two-step confirm + done + quit
+            resetTokenFlow()
+        default:
+            return  // "Close"
+        }
+    }
+
+    /// Prompt the user to paste a token from another device, save it, then quit.
+    private func enterTokenFlow() {
+        let prompt = NSAlert()
+        prompt.messageText = "Enter shared token"
+        prompt.informativeText = "Paste the token shown on your other device."
+        prompt.addButton(withTitle: "OK")
+        prompt.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        prompt.accessoryView = field
+        prompt.window.initialFirstResponder = field
+        guard prompt.runModal() == .alertFirstButtonReturn else { return }
+        let newToken = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newToken.isEmpty else { return }
+
+        try? ConfigStore.save(StoredConfig(token: newToken))
+        let done = NSAlert()
+        done.messageText = "Token saved"
+        done.informativeText =
+            "AnyClip will now quit. Relaunch to apply, then make sure "
+            + "your other device uses the same token."
+        done.runModal()
+        quit()
+    }
+
+    /// Generate a fresh random token, confirm with the user, save, then quit.
+    private func resetTokenFlow() {
         let confirm = NSAlert()
         confirm.messageText = "Reset token?"
         confirm.informativeText =
