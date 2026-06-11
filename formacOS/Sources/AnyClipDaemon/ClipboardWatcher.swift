@@ -1,0 +1,244 @@
+import Foundation
+import AppKit
+import AnyClipCore
+
+/// (path, size, mtime ns, isDirectory) fingerprint so file bytes are only read
+/// when the clipboard's file reference actually changes.
+/// Port of the Python (path, st_size, st_mtime_ns) tuple.
+public struct FileFingerprint: Equatable, Sendable {
+    public let path: String
+    public let size: Int
+    public let mtimeNs: Int64
+    public let isDirectory: Bool
+
+    public init?(url: URL) {
+        var st = stat()
+        guard stat(url.path, &st) == 0 else { return nil }
+        path = url.path
+        size = Int(st.st_size)
+        mtimeNs = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000
+            + Int64(st.st_mtimespec.tv_nsec)
+        isDirectory = (st.st_mode & S_IFMT) == S_IFDIR
+    }
+}
+
+/// Polls NSPasteboard for text/image/file changes and applies inbound
+/// updates without echoing them back. Port of anyclip.ClipboardWatcher.
+/// changeCount gating means unchanged clipboards cost one property read
+/// per poll (cheaper than the Python re-read every cycle).
+@MainActor
+public final class ClipboardWatcher {
+
+    public struct Callbacks {
+        public var onChange: (ClipPayload) async -> Void
+        public var onFileSkipped: ((String) async -> Void)?
+
+        public init(
+            onChange: @escaping (ClipPayload) async -> Void,
+            onFileSkipped: ((String) async -> Void)? = nil
+        ) {
+            self.onChange = onChange
+            self.onFileSkipped = onFileSkipped
+        }
+    }
+
+    static let imageCooldown: Double = 1.0
+    /// Reserve ~256 KB for the JSON envelope and the b64 1.34× inflation.
+    /// Mirrors Python: budget = int((MAX_PAYLOAD - 256*1024) * 0.74)
+    static let fileBudget = Int(Double(Wire.maxPayload - 256 * 1024) * 0.74)
+
+    private let pasteboard: NSPasteboard
+    private let pollInterval: Double
+    private let callbacks: Callbacks
+    private let receivedDir: URL
+
+    // Baselines — seeded in init so whatever sits on the clipboard at
+    // startup never fires a spurious initial send.
+    private var lastChangeCount: Int
+    private var lastText: String?
+    private var lastImageHash: String?
+    private var lastImageSendAt: Double = 0
+    private var lastFileFingerprint: FileFingerprint?
+    private var oversizeFileWarned = false
+
+    public init(
+        pasteboard: NSPasteboard = .general,
+        pollInterval: Double,
+        receivedDir: URL,
+        callbacks: Callbacks
+    ) {
+        self.pasteboard = pasteboard
+        self.pollInterval = pollInterval
+        self.receivedDir = receivedDir
+        self.callbacks = callbacks
+
+        // Seed baselines.
+        lastChangeCount = pasteboard.changeCount
+        lastText = pasteboard.string(forType: .string)
+        if let png = Self.grabImage(pasteboard) {
+            lastImageHash = sha256Hex(png)
+        }
+        if let url = Self.grabFileURL(pasteboard) {
+            lastFileFingerprint = FileFingerprint(url: url)
+        }
+    }
+
+    // MARK: - Run loop
+
+    public func run() async throws {
+        while true {
+            await pollOnce()
+            try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+        }
+    }
+
+    /// Test seam: one poll cycle without the sleep.
+    public func pollOnceForTesting() async { await pollOnce() }
+
+    private func pollOnce() async {
+        let count = pasteboard.changeCount
+        guard count != lastChangeCount else { return }
+        lastChangeCount = count
+
+        // ---- Text --------------------------------------------------------
+        // Empty strings update the baseline but are NOT propagated —
+        // macOS Screenshot briefly clears the clipboard mid-capture.
+        let text = pasteboard.string(forType: .string)
+        if let text, text != lastText {
+            lastText = text
+            if !text.isEmpty {
+                await callbacks.onChange(.text(text))
+            } else {
+                AnyLog.shared.debug("clipboard cleared (empty text); not propagating")
+            }
+        }
+
+        // ---- Image -------------------------------------------------------
+        // Multi-representation floods right after a screenshot are
+        // collapsed by the 1-second cooldown.
+        if let png = Self.grabImage(pasteboard) {
+            let hash = sha256Hex(png)
+            if hash != lastImageHash {
+                let now = monotonicNow()
+                if now - lastImageSendAt < Self.imageCooldown {
+                    // Absorb the hash change but do NOT send.
+                    lastImageHash = hash
+                    AnyLog.shared.debug("image change within cooldown, dropping")
+                } else {
+                    lastImageHash = hash
+                    lastImageSendAt = now
+                    await callbacks.onChange(.image(png))
+                }
+            }
+        }
+
+        // ---- File --------------------------------------------------------
+        await checkFileClipboard()
+    }
+
+    // MARK: - File clipboard
+
+    private func checkFileClipboard() async {
+        guard let url = Self.grabFileURL(pasteboard) else { return }
+        guard let fingerprint = FileFingerprint(url: url) else { return }
+        guard fingerprint != lastFileFingerprint else { return }
+
+        // Folders are an explicit scope-out. Record the fingerprint FIRST
+        // so the same copy is never re-detected (no retry-loop).
+        if fingerprint.isDirectory {
+            lastFileFingerprint = fingerprint
+            let display = url.lastPathComponent
+            AnyLog.shared.warning("folder on clipboard not synced (unsupported): \(url.path)")
+            if let onSkipped = callbacks.onFileSkipped {
+                await onSkipped("folder not synced — folders are not supported: \(display)")
+            }
+            return
+        }
+
+        // Over-budget files are skipped; warn once.
+        if fingerprint.size > Self.fileBudget {
+            if !oversizeFileWarned {
+                AnyLog.shared.warning(
+                    "file \(url.path) too large to sync "
+                    + "(\(fingerprint.size) bytes > limit \(Self.fileBudget)); skipping")
+                oversizeFileWarned = true
+            }
+            lastFileFingerprint = fingerprint
+            return
+        }
+        oversizeFileWarned = false
+
+        guard let data = try? Data(contentsOf: url) else {
+            // A path that cannot be read now will not become readable by
+            // polling it forever — update fingerprint to suppress retry.
+            lastFileFingerprint = fingerprint
+            AnyLog.shared.warning("file read failed for \(url.path); skipping")
+            return
+        }
+        lastFileFingerprint = fingerprint
+        await callbacks.onChange(.file(name: url.lastPathComponent, data: data))
+    }
+
+    // MARK: - Inbound (peer → local clipboard)
+
+    public func updateLocalText(_ text: String) {
+        // Baseline before write so a racing poll cannot echo.
+        lastText = text
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        lastChangeCount = pasteboard.changeCount
+    }
+
+    public func updateLocalImage(_ png: Data) -> Bool {
+        lastImageHash = sha256Hex(png)
+        pasteboard.clearContents()
+        let ok = pasteboard.setData(png, forType: .png)
+        lastChangeCount = pasteboard.changeCount
+        if !ok { AnyLog.shared.warning("clipboard write (image) failed") }
+        return ok
+    }
+
+    public func updateLocalFile(name: String, data: Data) -> Bool {
+        let safe = sanitizeFilename(name)
+        do {
+            try FileManager.default.createDirectory(
+                at: receivedDir, withIntermediateDirectories: true)
+            let target = receivedDir.appendingPathComponent(safe)
+            try data.write(to: target)
+            // Baseline before clipboard write.
+            lastFileFingerprint = FileFingerprint(url: target)
+            pasteboard.clearContents()
+            let ok = pasteboard.writeObjects([target as NSURL])
+            lastChangeCount = pasteboard.changeCount
+            if !ok { AnyLog.shared.warning("clipboard write (file) failed") }
+            return ok
+        } catch {
+            AnyLog.shared.warning("file write to \(receivedDir.path) failed: \(error)")
+            return false
+        }
+    }
+
+    // MARK: - Pasteboard readers
+
+    static func grabFileURL(_ pb: NSPasteboard) -> URL? {
+        let options: [NSPasteboard.ReadingOptionKey: Any] =
+            [.urlReadingFileURLsOnly: true]
+        // readObjects(forClasses:options:) returns [AnyObject]? on Swift 5.
+        let raw = pb.readObjects(forClasses: [NSURL.self], options: options)
+        return (raw as? [URL])?.first
+    }
+
+    /// PNG bytes of an inline image, or nil.
+    /// File references are handled by their own branch; grabImage returns nil
+    /// when a file URL is on the clipboard (mirrors Python's behaviour).
+    static func grabImage(_ pb: NSPasteboard) -> Data? {
+        if grabFileURL(pb) != nil { return nil }
+        if let png = pb.data(forType: .png) { return png }
+        if let tiff = pb.data(forType: .tiff),
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return png
+        }
+        return nil
+    }
+}
