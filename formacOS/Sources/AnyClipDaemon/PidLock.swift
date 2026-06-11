@@ -41,7 +41,11 @@ public enum PidLock {
         }
 
         // 3) Record our pid (and chosen port for diagnostics).
-        try? "\(getpid()) \(port)\n".write(to: pidFile, atomically: true, encoding: .utf8)
+        do {
+            try "\(getpid()) \(port)\n".write(to: pidFile, atomically: true, encoding: .utf8)
+        } catch {
+            AnyLog.shared.warning("could not write PID file \(pidFile.path): \(error)")
+        }
     }
 
     /// Remove our PID file, but only if it still points at us.
