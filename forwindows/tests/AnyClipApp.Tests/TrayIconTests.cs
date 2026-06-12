@@ -17,4 +17,14 @@ public class TrayIconTests
         Assert.NotNull(attention);
         Assert.NotNull(error);
     }
+
+    [Fact]
+    public void PulseFramesBuildTenDistinctIcons()
+    {
+        using var baseIcon = SystemIcons.Application;
+        var frames = TrayIcon.BuildPulseFrames(baseIcon);
+        Assert.Equal(10, frames.Length);
+        Assert.All(frames, f => Assert.NotNull(f));
+        foreach (var f in frames) f.Dispose();
+    }
 }

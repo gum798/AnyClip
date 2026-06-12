@@ -42,7 +42,8 @@ internal static class Program
             Application.Exit();
         }
 
-        tray = new TrayIcon(logFile, Quit);
+        var notificationSettings = new NotificationSettings();
+        tray = new TrayIcon(logFile, notificationSettings, Quit);
         var notifier = new Notifier(tray.Notify);
 
         // STA invoker: a hidden UI-thread control all clipboard access AND
@@ -67,7 +68,16 @@ internal static class Program
             appVersion, stateDir,
             clipboard, mdns, new WindowsPidLock(),
             MdnsBeacon.PrimaryIPv4,
-            notify: (title, body) => notifier.Notify(title, body),
+            // Sync toasts carry an arrow ("AnyClip ← peer" / "AnyClip →
+            // peer"); the folder-skip toast ("AnyClip") does not and must
+            // not pulse the tray icon.
+            notify: (title, body) =>
+            {
+                if (title.Contains('←') || title.Contains('→'))
+                    uiContext.Post(_ => tray.AnimateSyncPulse(), null);
+                if (notificationSettings.Enabled)
+                    notifier.Notify(title, body);
+            },
             onFatal: message => uiContext.Post(_ =>
             {
                 MessageBox.Show(message, "AnyClip cannot start",

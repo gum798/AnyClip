@@ -254,3 +254,10 @@ existence and is only set on successful write.
 - Windows Defender SmartScreen on an unsigned exe: same
   "추가 정보 → 실행" flow as the existing Python zip (README already
   documents it).
+
+## Post-merge amendments (2026-06-12)
+
+- Balloon notifications are OFF by default and toggled via a "Notifications"
+  tray-menu item (HKCU\Software\AnyClip, app-local); the default sync
+  feedback is a 10-frame accent-blue arc-orbit pulse of the tray icon
+  (0.4 s, coalescing) — parity with the macOS menu-bar pulse.
