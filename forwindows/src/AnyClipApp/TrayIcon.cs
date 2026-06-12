@@ -22,7 +22,7 @@ public sealed class TrayIcon : IDisposable
     {
         _logFile = logFile;
         _onQuit = onQuit;
-        _baseIcon = new Icon(Path.Combine(AppContext.BaseDirectory, "anyclip.ico"));
+        _baseIcon = LoadBaseIcon();
         _attentionIcon = Tint(_baseIcon, bang: false);
         _errorIcon = Tint(_baseIcon, bang: true);
 
@@ -127,6 +127,21 @@ public sealed class TrayIcon : IDisposable
         }
         catch (Exception e)
         { RotatingLog.Shared.Warning($"open logs failed: {e.Message}"); }
+    }
+
+    /// Single-file publish bundles anyclip.ico into the exe, so the loose
+    /// file is absent at runtime; the PE icon (ApplicationIcon) is always
+    /// there. Loose-file fallback covers plain `dotnet build` output.
+    private static Icon LoadBaseIcon()
+    {
+        try
+        {
+            if (Environment.ProcessPath is { } exe
+                && Icon.ExtractAssociatedIcon(exe) is { } embedded)
+                return embedded;
+        }
+        catch (Exception) { /* fall through to loose file */ }
+        return new Icon(Path.Combine(AppContext.BaseDirectory, "anyclip.ico"));
     }
 
     public void Dispose()
