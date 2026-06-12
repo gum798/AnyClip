@@ -18,6 +18,15 @@ brew install --cask anyclip
 xattr -dr com.apple.quarantine /Applications/AnyClip.app
 ```
 
+### Windows — Scoop (권장)
+
+```powershell
+scoop bucket add gum798 https://github.com/gum798/scoop-bucket
+scoop install anyclip
+```
+
+네이티브 C# 빌드(`forwindows/`)가 설치됩니다. 새 릴리스는 버킷이 6시간마다 자동 반영하며 `scoop update anyclip`으로 업그레이드합니다. (winget은 [microsoft/winget-pkgs 심사](https://github.com/microsoft/winget-pkgs/pull/387026) 통과 후 `winget install gum798.AnyClip` 사용 가능.)
+
 ### 직접 다운로드
 
 1. [최신 릴리스](https://github.com/gum798/AnyClip/releases/latest)에서 OS에 맞는 파일을 다운로드합니다.
