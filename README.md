@@ -261,7 +261,7 @@ launchctl load ~/Library/LaunchAgents/com.anyclip.plist
 | 플랫폼 | 위치 | 상태 |
 |--------|------|------|
 | macOS (Swift · AppKit) | `formacOS/` | v1.0.0 출시 — `brew install --cask anyclip` |
-| Windows (native) | `forwindows/` | 개발 중 |
+| Windows (C# · .NET 8) | `forwindows/` | 릴리스 자산 `AnyClip-vX.Y.Z-windows-x64-native.zip` |
 | Python (레거시, macOS+Windows) | 저장소 루트 | 유지 — Sparkle/WinSparkle 자동 업데이트 채널 |
 
 네이티브 빌드는 Python 구현과 와이어 호환(protocol 1.0)이며 `~/.anyclip/` 설정·토큰을 그대로 공유합니다. 빌드 방법은 각 디렉토리의 README 참고.
