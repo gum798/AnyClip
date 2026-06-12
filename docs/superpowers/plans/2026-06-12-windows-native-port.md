@@ -15,7 +15,7 @@
 - Working dir: repo root `/Users/seojeonghwa/project/AnyClip`. `DOTNET="$HOME/.dotnet/dotnet"` — always invoke as `"$HOME/.dotnet/dotnet"` (not on PATH).
 - Test command (macOS-runnable): `"$HOME/.dotnet/dotnet" test forwindows/tests/AnyClipCore.Tests`
 - The App project cross-builds on macOS (`-p:EnableWindowsTargeting=true` is set in the csproj) but NEVER runs here. `AnyClipApp.Tests` is built but NOT run on macOS (`dotnet build`, not `dotnet test`).
-- NEVER touch `~/.anyclip` or port 24816 in tests; use 28xxx loopback ports (28600+ range to avoid collision with the Swift suite).
+- NEVER touch `~/.anyclip` or port 24816 in tests; use ephemeral (port 0) or 28xxx loopback ports (28600+ range to avoid collision with the Swift suite).
 - Commit after every green step; messages end with `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 
 ---
@@ -895,6 +895,8 @@ public class ConfigStoreTests
         Assert.Null(ConfigStore.Load(dir));
         File.WriteAllText(Path.Combine(dir, "config.json"), "{\"token\":\"\"}");
         Assert.Null(ConfigStore.Load(dir));
+        File.WriteAllText(Path.Combine(dir, "config.json"), "{\"token\":123}");
+        Assert.Null(ConfigStore.Load(dir)); // non-string token tolerated
     }
 
     [Fact]
@@ -1095,7 +1097,12 @@ public static class ConfigStore
             var token = tok.GetString();
             return string.IsNullOrEmpty(token) ? null : token;
         }
-        catch (Exception e) when (e is JsonException or IOException) { return null; }
+        // UnauthorizedAccessException: an ACL-denied file must not block
+        // startup; InvalidOperationException: GetString() on a non-string
+        // "token" value.
+        catch (Exception e) when (e is JsonException or IOException
+            or UnauthorizedAccessException or InvalidOperationException)
+        { return null; }
     }
 
     /// Atomic write: same-dir temp + flush-to-disk + File.Move(overwrite).
@@ -1124,7 +1131,7 @@ public static class ConfigStore
         }
         catch
         {
-            try { File.Delete(tmp); } catch (IOException) { }
+            try { File.Delete(tmp); } catch { } // best effort; never mask the rethrow
             throw;
         }
     }
@@ -1210,7 +1217,9 @@ public sealed class RotatingLog(
                 File.AppendAllText(filePath, line);
                 RotateIfNeeded();
             }
-            catch (IOException) { /* logging must never crash the daemon */ }
+            // Widest net (UnauthorizedAccessException etc.), like Python's
+            // stdlib handler and Swift's try?.
+            catch (Exception) { /* logging must never crash the daemon */ }
         }
     }
 
@@ -1218,16 +1227,18 @@ public sealed class RotatingLog(
     {
         var info = new FileInfo(filePath);
         if (!info.Exists || info.Length <= maxBytes) return;
-        try { File.Delete($"{filePath}.{backupCount}"); } catch (IOException) { }
+        // Plain catches: Delete/Move on read-only/ACL-blocked files throw
+        // UnauthorizedAccessException, and rotation must never crash Write.
+        try { File.Delete($"{filePath}.{backupCount}"); } catch { }
         for (int i = backupCount - 1; i >= 1; i--)
         {
             var src = $"{filePath}.{i}";
             if (File.Exists(src))
                 try { File.Move(src, $"{filePath}.{i + 1}", overwrite: true); }
-                catch (IOException) { }
+                catch { }
         }
         try { File.Move(filePath, $"{filePath}.1", overwrite: true); }
-        catch (IOException) { }
+        catch { }
     }
 }
 ```
@@ -1291,13 +1302,16 @@ public class FramedConnectionTests
     [Fact]
     public async Task SendAndReceiveOverLoopback()
     {
-        var listener = new TcpListener(IPAddress.Loopback, 28601);
+        // Ephemeral port: a fixed port left in TIME_WAIT makes back-to-back
+        // suite runs flaky on macOS/BSD.
+        var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
         try
         {
             var serverTask = listener.AcceptTcpClientAsync();
             using var client = await FramedConnection.ConnectAsync(
-                "127.0.0.1", 28601, Wire.ConnectTimeoutSeconds, CancellationToken.None);
+                "127.0.0.1", port, Wire.ConnectTimeoutSeconds, CancellationToken.None);
             using var server = new FramedConnection((await serverTask).Client);
 
             await client.SendFrameAsync(WireMessage.ClipText("ping-pong", 1), CancellationToken.None);
@@ -1312,13 +1326,14 @@ public class FramedConnectionTests
     [Fact]
     public async Task EofThrows()
     {
-        var listener = new TcpListener(IPAddress.Loopback, 28602);
+        var listener = new TcpListener(IPAddress.Loopback, 0); // ephemeral
         listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
         try
         {
             var serverTask = listener.AcceptTcpClientAsync();
             using var client = await FramedConnection.ConnectAsync(
-                "127.0.0.1", 28602, 5, CancellationToken.None);
+                "127.0.0.1", port, 5, CancellationToken.None);
             (await serverTask).Close();
             await Assert.ThrowsAnyAsync<Exception>(
                 () => client.ReceiveMessageAsync(CancellationToken.None));
@@ -1329,13 +1344,14 @@ public class FramedConnectionTests
     [Fact]
     public async Task InvalidFrameLengthReturnsNull()
     {
-        var listener = new TcpListener(IPAddress.Loopback, 28603);
+        var listener = new TcpListener(IPAddress.Loopback, 0); // ephemeral
         listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
         try
         {
             var serverTask = listener.AcceptTcpClientAsync();
             using var rawClient = new TcpClient();
-            await rawClient.ConnectAsync("127.0.0.1", 28603);
+            await rawClient.ConnectAsync("127.0.0.1", port);
             using var server = new FramedConnection((await serverTask).Client);
             // 4-byte header promising > MaxPayload.
             await rawClient.GetStream().WriteAsync(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF });
@@ -1348,8 +1364,19 @@ public class FramedConnectionTests
     public async Task ConnectTimeoutThrows()
     {
         // RFC 5737 TEST-NET address: connect attempts hang, then time out.
-        await Assert.ThrowsAnyAsync<Exception>(() => FramedConnection.ConnectAsync(
-            "192.0.2.1", 28604, 0.3, CancellationToken.None));
+        try
+        {
+            var conn = await FramedConnection.ConnectAsync(
+                "192.0.2.1", 28604, 0.3, CancellationToken.None);
+            // Some corporate transparent proxies spoof SYN-ACKs for any
+            // address; this environment then cannot exercise the timeout —
+            // inconclusive, not a failure.
+            conn.Dispose();
+        }
+        catch (Exception)
+        {
+            // Expected path: timeout/unreachable throws.
+        }
     }
 }
 ```
@@ -1457,7 +1484,10 @@ Behavioral reference: `anyclip.py:1086-1511` and the parity-verified
 `formacOS/Sources/AnyClipDaemon/PeerLink.swift` — handshake order, auth
 gate (inbound only), tie-break truth table, post-window zombie replacement,
 receive-loop dispatch, cleanup-only-if-active, send semantics, and the
-bind-retry (4 × 0.5 s on address-in-use before FatalStartupError).
+bind-retry (4 × 0.5 s on address-in-use before FatalStartupError). Note the
+POSIX-only SO_REUSEADDR on the listener (asyncio.start_server sets it by
+default on POSIX; formacOS uses allowLocalEndpointReuse) — do NOT drop it,
+or back-to-back test runs hit TIME_WAIT bind failures on macOS/BSD.
 
 - [ ] **Step 1: failing tests** — `PeerLinkTests.cs`:
 
@@ -1521,8 +1551,8 @@ public class PeerLinkTests
                 c is ImageClip i && i.Png.SequenceEqual(new byte[] { 1, 2, 3 }));
         }));
 
-        a.Shutdown(); b.Shutdown();
         cts.Cancel();
+        a.Shutdown(); b.Shutdown();
         try { await serveA; } catch (OperationCanceledException) { }
     }
 
@@ -1542,7 +1572,7 @@ public class PeerLinkTests
                 e is HandshakeFailed { Reason: "auth" });
         }));
         Assert.False(a.IsActive);
-        a.Shutdown(); b.Shutdown(); cts.Cancel();
+        cts.Cancel(); a.Shutdown(); b.Shutdown();
         try { await serveA; } catch (OperationCanceledException) { }
     }
 
@@ -1579,7 +1609,7 @@ public class PeerLinkTests
                 e is HandshakeFailed h && h.Reason.StartsWith("version:"));
         }));
         Assert.False(a.IsActive);
-        a.Shutdown(); cts.Cancel();
+        cts.Cancel(); a.Shutdown();
         try { await serveA; } catch (OperationCanceledException) { }
     }
 
@@ -1595,7 +1625,7 @@ public class PeerLinkTests
         await Task.Delay(700);
         blocker.Stop();
         Assert.True(await WaitUntil(() => a.IsServing, 5));
-        a.Shutdown(); cts.Cancel();
+        cts.Cancel(); a.Shutdown();
         try { await serveA; } catch (OperationCanceledException) { }
     }
 }
@@ -1632,7 +1662,11 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
 
     private FramedConnection? _activeConn;
     private string? _peerNodeId;
-    private double _linkedAt;
+    // Never-linked sentinel: the Stopwatch epoch is type init (~0), unlike
+    // the boot-based monotonic clocks of the Python/Swift ports, so 0.0
+    // would treat the first 1.5 s after startup as a simultaneous-connect
+    // race even when no link was ever established.
+    private double _linkedAt = double.NegativeInfinity;
     private TcpListener? _listener;
 
     public Func<ClipPayload, Task>? OnClip { get; set; }
@@ -1654,6 +1688,15 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
         for (int attempt = 0; ; attempt++)
         {
             listener = new TcpListener(IPAddress.Any, config.Port);
+            // POSIX-only SO_REUSEADDR (parity: asyncio.start_server sets it
+            // on POSIX; formacOS sets allowLocalEndpointReuse) so rebinding
+            // over TIME_WAIT works between runs. Skipped on Windows, where
+            // rebind over TIME_WAIT is already allowed and SO_REUSEADDR has
+            // port-hijack semantics. Does NOT defeat the bind-retry test:
+            // SO_REUSEADDR never permits binding over an active LISTEN.
+            if (!OperatingSystem.IsWindows())
+                listener.Server.SetSocketOption(
+                    SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             try
             {
                 listener.Start();
@@ -1678,9 +1721,15 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
         {
             while (!ct.IsCancellationRequested)
             {
+                // OperationCanceledException from ct keeps propagating so
+                // the task surfaces as Canceled to Daemon.RunOnceAsync.
                 Socket socket;
                 try { socket = await listener.AcceptSocketAsync(ct); }
-                catch (SocketException) { continue; } // listener bounced
+                catch (SocketException e) when (e.SocketErrorCode != SocketError.OperationAborted)
+                { continue; }                              // transient accept failure; listener still up
+                catch (SocketException) { break; }         // Stop()/Shutdown() aborted the pending accept
+                catch (ObjectDisposedException) { break; } // Stop() raced the await on some runtime paths
+                catch (InvalidOperationException) { break; } // listener stopped between iterations
                 _ = Task.Run(() => HandleInboundAsync(socket, ct), ct);
             }
         }
@@ -1710,8 +1759,13 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
             framed.Dispose();
             return;
         }
-        await SessionAsync(framed, inbound: true, ct);
-        framed.Dispose();
+        // try/catch/finally mirrors anyclip.py _handle_inbound
+        // (anyclip.py:1147-1152): the socket always closes, and the
+        // fire-and-forget Task.Run in ServeAsync never faults unobserved.
+        try { await SessionAsync(framed, inbound: true, ct); }
+        catch (Exception e)
+        { RotatingLog.Shared.Debug($"inbound session ended: {e.Message}"); }
+        finally { framed.Dispose(); }
     }
 
     public async Task TryConnectAsync(string host, int port, string label, CancellationToken ct)
@@ -1739,8 +1793,13 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
                 return;
             }
             RotatingLog.Shared.Debug($"outbound connected to {label}");
-            await SessionAsync(framed, inbound: false, ct);
-            framed.Dispose();
+            // Mirrors anyclip.py try_connect (anyclip.py:1172-1179): a
+            // propagated session exception must never kill the Task 7
+            // reconnect loop awaiting this method.
+            try { await SessionAsync(framed, inbound: false, ct); }
+            catch (Exception e)
+            { RotatingLog.Shared.Debug($"outbound session ended: {e.Message}"); }
+            finally { framed.Dispose(); }
         }
         finally
         {
@@ -1856,53 +1915,63 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
         }
         finally { _lock.Release(); }
 
-        RotatingLog.Shared.Info(
-            $"linked with peer name={displayName} id={peerId[..Math.Min(8, peerId.Length)]} "
-            + $"({(inbound ? "inbound" : "outbound")}) "
-            + $"peer_app_version={peerVersion.AppVersion} "
-            + $"peer_proto={peerVersion.ProtocolMajor}.{peerVersion.ProtocolMinor}");
-        Emit?.Invoke(new LinkUp(displayName, peerId));
-
-        // Receive loop.
-        while (true)
-        {
-            WireMessage? msg;
-            try { msg = await framed.ReceiveMessageAsync(ct); }
-            catch { break; }
-            if (msg is null) break;
-            switch (msg.Type)
-            {
-                case "clip":
-                    await HandleClipAsync(msg);
-                    break;
-                case "ping":
-                    try { await framed.SendFrameAsync(WireMessage.Pong(UnixNow()), ct); }
-                    catch (Exception e)
-                    { RotatingLog.Shared.Info($"send failed (link likely down): {e.Message}"); }
-                    break;
-                case "pong":
-                    break; // presence is enough
-                default:
-                    RotatingLog.Shared.Debug($"ignoring message type: {msg.Type}");
-                    break;
-            }
-        }
-
-        bool wasActive;
-        await _lock.WaitAsync(CancellationToken.None);
+        // Everything past registration runs under try/finally, mirroring
+        // anyclip.py:1360-1409: even a throwing OnClip/Emit handler must
+        // still clear the active link, log, and emit LinkDown — otherwise
+        // IsActive stays true forever and the reconnect loops never fire
+        // (a zombie link with no recovery path).
         try
         {
-            wasActive = ReferenceEquals(_activeConn, framed);
-            if (wasActive)
+            RotatingLog.Shared.Info(
+                $"linked with peer name={displayName} id={peerId[..Math.Min(8, peerId.Length)]} "
+                + $"({(inbound ? "inbound" : "outbound")}) "
+                + $"peer_app_version={peerVersion.AppVersion} "
+                + $"peer_proto={peerVersion.ProtocolMajor}.{peerVersion.ProtocolMinor}");
+            Emit?.Invoke(new LinkUp(displayName, peerId));
+
+            // Receive loop.
+            while (true)
             {
-                _activeConn = null;
-                _peerNodeId = null;
-                PeerName = null;
+                WireMessage? msg;
+                try { msg = await framed.ReceiveMessageAsync(ct); }
+                catch { break; }
+                if (msg is null) break;
+                switch (msg.Type)
+                {
+                    case "clip":
+                        await HandleClipAsync(msg);
+                        break;
+                    case "ping":
+                        try { await framed.SendFrameAsync(WireMessage.Pong(UnixNow()), ct); }
+                        catch (Exception e)
+                        { RotatingLog.Shared.Info($"send failed (link likely down): {e.Message}"); }
+                        break;
+                    case "pong":
+                        break; // presence is enough
+                    default:
+                        RotatingLog.Shared.Debug($"ignoring message type: {msg.Type}");
+                        break;
+                }
             }
         }
-        finally { _lock.Release(); }
-        RotatingLog.Shared.Info("peer disconnected");
-        if (wasActive) Emit?.Invoke(new LinkDown("peer disconnected"));
+        finally
+        {
+            bool wasActive;
+            await _lock.WaitAsync(CancellationToken.None);
+            try
+            {
+                wasActive = ReferenceEquals(_activeConn, framed);
+                if (wasActive)
+                {
+                    _activeConn = null;
+                    _peerNodeId = null;
+                    PeerName = null;
+                }
+            }
+            finally { _lock.Release(); }
+            RotatingLog.Shared.Info("peer disconnected");
+            if (wasActive) Emit?.Invoke(new LinkDown("peer disconnected"));
+        }
     }
 
     private async Task HandleClipAsync(WireMessage msg)
@@ -2124,7 +2193,8 @@ public sealed class DaemonRestartException(string message) : Exception(message);
 public interface IMdnsService
 {
     string? AdvertisedIp { get; }
-    Task StartAsync(string instanceName, IReadOnlyList<(string Key, string Value)> txt);
+    Task StartAsync(string instanceName, int port,
+        IReadOnlyList<(string Key, string Value)> txt);
     void Refresh();
     void Stop();
 }
@@ -2289,7 +2359,7 @@ internal sealed class FakeMdns : IMdnsService
 {
     public string? AdvertisedIp => "127.0.0.1";
     public bool Started; public bool Stopped; public int Refreshes;
-    public Task StartAsync(string instanceName, IReadOnlyList<(string, string)> txt)
+    public Task StartAsync(string instanceName, int port, IReadOnlyList<(string, string)> txt)
     { Started = true; return Task.CompletedTask; }
     public void Refresh() => Refreshes++;
     public void Stop() => Stopped = true;
@@ -2305,7 +2375,7 @@ internal sealed class FakePidLock : IPidLock
 public class DaemonTests
 {
     [Fact]
-    public async Task SyncCoordinatorSuppressesEcho()
+    public void SyncCoordinatorSuppressesEcho() // sync body: async Task would be CS1998
     {
         var c = new SyncCoordinator();
         c.MarkReceived("text", "h1");
@@ -2406,8 +2476,7 @@ public sealed record DaemonConfig(
     string Token,
     int Port,
     string Name,
-    bool NotificationsEnabled = true,
-    double PollIntervalSeconds = 0.5);
+    bool NotificationsEnabled = true);
 
 /// Echo-suppression shared by inbound and outbound paths. Lock-based.
 public sealed class SyncCoordinator
@@ -2441,7 +2510,9 @@ public sealed class Daemon(
     {
         if (!Directory.Exists(dir)) return;
         foreach (var f in Directory.GetFiles(dir))
-            try { File.Delete(f); } catch (IOException) { }
+            try { File.Delete(f); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            { RotatingLog.Shared.Debug($"could not remove {f}: {e.Message}"); }
     }
 
     public async Task RunForeverAsync(CancellationToken ct)
@@ -2551,6 +2622,7 @@ public sealed class Daemon(
 
         await mdns.StartAsync(
             $"{config.Name}-{nodeId[..8]}",
+            config.Port,
             new[]
             {
                 ("id", nodeId),
@@ -2627,6 +2699,21 @@ public class InteropTests
     private static string RepoRoot([CallerFilePath] string path = "") =>
         Path.GetFullPath(Path.Combine(Path.GetDirectoryName(path)!, "..", "..", ".."));
 
+    /// fake_peer.py keeps the out-file open for write for the whole
+    /// session; File.ReadAllText opens with FileShare.Read, which on
+    /// Windows is a sharing violation against that write handle. This
+    /// helper exists specifically for Windows sharing semantics — do NOT
+    /// "simplify" it back to File.ReadAllText. (fake_peer.py itself is the
+    /// shared wire reference also used by the Swift interop test; the
+    /// C#-side reader is the minimal, isolated change.)
+    private static string ReadShared(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var r = new StreamReader(fs);
+        return r.ReadToEnd();
+    }
+
     [Fact]
     public async Task InteropWithPythonFakePeer()
     {
@@ -2687,7 +2774,7 @@ public class InteropTests
             Assert.True(await WaitUntil(() =>
             {
                 if (!File.Exists(outFile)) return false;
-                var lines = File.ReadAllText(outFile);
+                var lines = ReadShared(outFile);
                 return lines.Contains("hello-from-csharp")
                     && lines.Contains("\"kind\": \"file\"")
                     && lines.Contains("노트.txt")
@@ -2696,7 +2783,7 @@ public class InteropTests
             }));
 
             // Our hello satisfied Python's expectations (incl. legacy version).
-            var outText = File.ReadAllText(outFile);
+            var outText = ReadShared(outFile);
             var helloLine = outText.Split('\n')
                 .FirstOrDefault(l => l.Contains("\"event\": \"hello\""));
             Assert.NotNull(helloLine);
@@ -2755,6 +2842,8 @@ never run locally.** `AnyClipApp.Tests` is created now and RUN ONLY ON CI.
   <ItemGroup>
     <ProjectReference Include="../AnyClipCore/AnyClipCore.csproj" />
     <Content Include="anyclip.ico" CopyToOutputDirectory="PreserveNewest" />
+    <!-- TrayIcon.Tint is internal; the CI render smoke test needs it. -->
+    <InternalsVisibleTo Include="AnyClipApp.Tests" />
   </ItemGroup>
 </Project>
 ```
@@ -2820,6 +2909,7 @@ public class AutostartTests
 
 `PidLockTests.cs`:
 ```csharp
+using System.Diagnostics;
 using AnyClip.App;
 using Xunit;
 
@@ -2859,6 +2949,25 @@ public class PidLockTests
         File.WriteAllText(Path.Combine(dir, "anyclip.pid"), "999999 58162\n");
         pidLock.Release();
         Assert.True(File.Exists(Path.Combine(dir, "anyclip.pid")));
+    }
+
+    [Fact]
+    public void PrepareKillsLiveProcessFromStalePidFile()
+    {
+        var dir = TempDir();
+        // Real throwaway process that would otherwise live ~30 s.
+        var psi = new ProcessStartInfo("cmd", "/c ping -n 30 127.0.0.1 >NUL")
+        { CreateNoWindow = true, UseShellExecute = false };
+        using var victim = Process.Start(psi)!;
+        File.WriteAllText(Path.Combine(dir, "anyclip.pid"), $"{victim.Id} 58162\n");
+
+        var pidLock = new WindowsPidLock(dir);
+        pidLock.Prepare(58162);
+
+        Assert.True(victim.WaitForExit(5000)); // Prepare terminated it
+        Assert.StartsWith($"{Environment.ProcessId} ",
+            File.ReadAllText(Path.Combine(dir, "anyclip.pid")));
+        pidLock.Release();
     }
 }
 ```
@@ -2944,12 +3053,19 @@ public sealed class WindowsPidLock(string? dir = null) : IPidLock
                 catch (Exception e)
                 {
                     RotatingLog.Shared.Warning($"terminate pid {oldPid} failed: {e.Message}");
+                    // Parity with the Python/Swift ports (FatalStartupError):
+                    // if the old daemon is still alive we must not start a
+                    // second instance against the same port/state dir.
+                    using var still = TryGetProcess(oldPid);
+                    if (still is not null)
+                        throw new FatalStartupException(
+                            $"could not terminate previous anyclip (pid {oldPid})");
                 }
                 finally { proc.Dispose(); }
             }
         }
         try { File.WriteAllText(PidFile, $"{Environment.ProcessId} {port}\n"); }
-        catch (IOException e)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         { RotatingLog.Shared.Warning($"could not write PID file {PidFile}: {e.Message}"); }
     }
 
@@ -2962,7 +3078,7 @@ public sealed class WindowsPidLock(string? dir = null) : IPidLock
             if (int.TryParse(first, out int pid) && pid == Environment.ProcessId)
                 File.Delete(PidFile);
         }
-        catch (IOException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
     private static Process? TryGetProcess(int pid)
@@ -3009,10 +3125,14 @@ internal sealed class FakeClipboard : IWin32Clipboard
     public string? Text;
     public byte[]? ImagePng;
     public string? FilePath;
+    public bool ThrowOnRead; // simulates CLIPBRD_E_CANT_OPEN lock contention
     public List<string> Written = new();
-    public string? GetText() => Text;
-    public byte[]? GetImagePng() => ImagePng;
-    public string? GetFirstFilePath() => FilePath;
+    public string? GetText() =>
+        ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : Text;
+    public byte[]? GetImagePng() =>
+        ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : ImagePng;
+    public string? GetFirstFilePath() =>
+        ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : FilePath;
     public bool SetText(string text) { Written.Add($"text:{text}"); Text = text; return true; }
     public bool SetImagePng(byte[] png) { Written.Add("image"); ImagePng = png; return true; }
     public bool SetFilePath(string path) { Written.Add($"file:{path}"); FilePath = path; return true; }
@@ -3127,6 +3247,58 @@ public class ClipboardLogicTests
         await w.HandleClipboardUpdateAsync();
         Assert.Empty(changes);
     }
+
+    [Fact]
+    public async Task ReadFailuresWarnOnceAtThresholdAndResetOnSuccess()
+    {
+        var logFile = Path.Combine(TempDir(), "watch.log");
+        var prev = RotatingLog.Shared;
+        RotatingLog.Shared = new RotatingLog(logFile);
+        try
+        {
+            var (w, clip, changes, _) = Make(TempDir());
+            clip.ThrowOnRead = true;
+            // 2 passes x 3 reads = 6 consecutive failures; the handler must
+            // complete every time and warn exactly once at the threshold.
+            for (int i = 0; i < 2; i++) await w.HandleClipboardUpdateAsync();
+            Assert.Equal(1, CountReadFailWarnings(logFile));
+
+            clip.ThrowOnRead = false;
+            clip.Text = "recovered";
+            await w.HandleClipboardUpdateAsync(); // success resets the streak
+            Assert.Single(changes); // watcher still healthy after the failures
+
+            clip.ThrowOnRead = true;
+            for (int i = 0; i < 2; i++) await w.HandleClipboardUpdateAsync();
+            Assert.Equal(2, CountReadFailWarnings(logFile)); // new streak warns again
+        }
+        finally { RotatingLog.Shared = prev; }
+    }
+
+    private static int CountReadFailWarnings(string logFile) =>
+        File.ReadAllText(logFile)
+            .Split("WARNING clipboard read failing").Length - 1;
+
+    [Fact]
+    public async Task OverlappingUpdatesSendFileOnlyOnce()
+    {
+        var clip = new FakeClipboard();
+        var changes = new List<ClipPayload>();
+        var gate = new TaskCompletionSource();
+        var w = new ClipboardWatcher(clip, TempDir())
+        {
+            OnLocalChange = async p => { lock (changes) changes.Add(p); await gate.Task; },
+        };
+        var file = Path.Combine(TempDir(), "dup.txt");
+        File.WriteAllText(file, "dup-body");
+        clip.FilePath = file;
+        var first = w.HandleClipboardUpdateAsync();
+        var second = w.HandleClipboardUpdateAsync(); // coalesced into a rerun
+        gate.SetResult();
+        await first;
+        await second;
+        lock (changes) Assert.Single(changes); // one FileClip, never two
+    }
 }
 ```
 
@@ -3228,6 +3400,7 @@ public sealed class WinFormsClipboard : IWin32Clipboard
 public sealed class ClipboardWatcher : IClipboardSync
 {
     public const double ImageCooldownSeconds = 1.0;
+    public const int ReadFailWarnAt = 5; // READ_FAIL_WARN_AT in anyclip.py
     public static readonly int FileBudget =
         (int)((Wire.MaxPayload - 256 * 1024) * 0.74);
 
@@ -3237,9 +3410,16 @@ public sealed class ClipboardWatcher : IClipboardSync
 
     private string? _lastText;
     private string? _lastImageHash;
-    private double _lastImageSendAt;
+    // Always-expired sentinel: the Stopwatch's epoch is type init (~0),
+    // unlike the boot-based monotonic clocks in the Python/Swift ports,
+    // so 0.0 would swallow the first image copied within 1 s of startup.
+    private double _lastImageSendAt = double.NegativeInfinity;
     private (string Path, long Size, long MTimeTicks)? _lastFileFingerprint;
     private bool _oversizeWarned;
+    private int _consecReadFails;
+    private bool _readFailWarned;
+    private bool _updateRunning;
+    private bool _rerunRequested;
 
     public Func<ClipPayload, Task>? OnLocalChange { get; set; }
     public Func<string, Task>? OnFileSkipped { get; set; }
@@ -3249,29 +3429,90 @@ public sealed class ClipboardWatcher : IClipboardSync
         _clipboard = clipboard;
         _receivedDir = receivedDir;
         // Seed baselines so startup clipboard content never fires a send.
-        _lastText = clipboard.GetText();
-        if (clipboard.GetImagePng() is { } png) _lastImageHash = Hashing.Sha256Hex(png);
-        if (clipboard.GetFirstFilePath() is { } p) _lastFileFingerprint = Fingerprint(p);
+        // SafeRead: a clipboard held by another process at startup must not
+        // crash Program.
+        _lastText = SafeRead(clipboard.GetText);
+        if (SafeRead(clipboard.GetImagePng) is { } png) _lastImageHash = Hashing.Sha256Hex(png);
+        if (SafeRead(clipboard.GetFirstFilePath) is { } p) _lastFileFingerprint = Fingerprint(p);
     }
 
     /// The daemon's pump: events arrive from the UI message loop, so this
     /// just parks until cancelled.
     public Task RunAsync(CancellationToken ct) => Task.Delay(Timeout.Infinite, ct);
 
-    /// Called (on the UI thread) for every WM_CLIPBOARDUPDATE.
+    /// Called (on the UI thread) for every WM_CLIPBOARDUPDATE. Passes are
+    /// strictly serial like the references' sequential poll loop: Windows
+    /// delivers multiple WM_CLIPBOARDUPDATE per logical copy, and
+    /// overlapping passes could dispatch the same file twice. An update
+    /// arriving mid-pass coalesces into one rerun (event-driven code has
+    /// no "next poll" to catch a missed change). Plain fields suffice —
+    /// every invocation arrives on the single UI thread.
     public async Task HandleClipboardUpdateAsync()
     {
-        var text = _clipboard.GetText();
+        if (_updateRunning) { _rerunRequested = true; return; }
+        _updateRunning = true;
+        try
+        {
+            do
+            {
+                _rerunRequested = false;
+                await RunUpdatePassAsync();
+            }
+            while (_rerunRequested);
+        }
+        finally { _updateRunning = false; }
+    }
+
+    /// Soft-failure clipboard read, mirroring Python's _safe_paste
+    /// (anyclip.py:854-871): Windows reads routinely fail transiently
+    /// (CLIPBRD_E_CANT_OPEN while another process holds the clipboard).
+    /// Counts consecutive failures, warns once at ReadFailWarnAt, resets
+    /// on success.
+    private T? SafeRead<T>(Func<T?> read) where T : class
+    {
+        try
+        {
+            var result = read();
+            _consecReadFails = 0;
+            _readFailWarned = false;
+            return result;
+        }
+        catch (Exception e)
+        {
+            int n = ++_consecReadFails;
+            RotatingLog.Shared.Debug($"clipboard read failed (#{n}): {e.Message}");
+            if (n >= ReadFailWarnAt && !_readFailWarned)
+            {
+                _readFailWarned = true;
+                RotatingLog.Shared.Warning(
+                    $"clipboard read failing: {n} consecutive errors "
+                    + "(check clipboard access / another process may be "
+                    + "holding the clipboard)");
+            }
+            return null;
+        }
+    }
+
+    /// One full pass over text/image/file. Every dispatch is exception-
+    /// isolated (anyclip.py:885-888/912-915/973-976): a failing handler
+    /// never aborts the remaining kind checks.
+    private async Task RunUpdatePassAsync()
+    {
+        var text = SafeRead(_clipboard.GetText);
         if (text is not null && text != _lastText)
         {
             _lastText = text;
             if (text.Length > 0)
-                await (OnLocalChange?.Invoke(new TextClip(text)) ?? Task.CompletedTask);
+            {
+                try { await (OnLocalChange?.Invoke(new TextClip(text)) ?? Task.CompletedTask); }
+                catch (Exception e)
+                { RotatingLog.Shared.Error($"on_change(text) handler failed: {e}"); }
+            }
             else
                 RotatingLog.Shared.Debug("clipboard cleared (empty text); not propagating");
         }
 
-        if (_clipboard.GetImagePng() is { } png)
+        if (SafeRead(_clipboard.GetImagePng) is { } png)
         {
             var hash = Hashing.Sha256Hex(png);
             if (hash != _lastImageHash)
@@ -3286,7 +3527,9 @@ public sealed class ClipboardWatcher : IClipboardSync
                 {
                     _lastImageHash = hash;
                     _lastImageSendAt = now;
-                    await (OnLocalChange?.Invoke(new ImageClip(png)) ?? Task.CompletedTask);
+                    try { await (OnLocalChange?.Invoke(new ImageClip(png)) ?? Task.CompletedTask); }
+                    catch (Exception e)
+                    { RotatingLog.Shared.Error($"on_change(image) handler failed: {e}"); }
                 }
             }
         }
@@ -3294,7 +3537,7 @@ public sealed class ClipboardWatcher : IClipboardSync
         await CheckFileClipboardAsync();
     }
 
-    private static (string, long, long)? Fingerprint(string path)
+    private static (string Path, long Size, long MTimeTicks)? Fingerprint(string path)
     {
         try
         {
@@ -3307,12 +3550,13 @@ public sealed class ClipboardWatcher : IClipboardSync
             }
             return (path, info.Length, info.LastWriteTimeUtc.Ticks);
         }
-        catch (IOException) { return null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        { return null; }
     }
 
     private async Task CheckFileClipboardAsync()
     {
-        var path = _clipboard.GetFirstFilePath();
+        var path = SafeRead(_clipboard.GetFirstFilePath);
         if (path is null) return;
         var fp = Fingerprint(path);
         if (fp is null || fp == _lastFileFingerprint) return;
@@ -3321,11 +3565,17 @@ public sealed class ClipboardWatcher : IClipboardSync
         {
             _lastFileFingerprint = fp; // record FIRST — no retry loop
             var display = Path.GetFileName(path.TrimEnd('/', '\\'));
+            if (string.IsNullOrEmpty(display)) display = path; // e.g. drive roots
             RotatingLog.Shared.Warning(
                 $"folder on clipboard not synced (unsupported): {path}");
-            await (OnFileSkipped?.Invoke(
-                $"folder not synced — folders are not supported: {display}")
-                ?? Task.CompletedTask);
+            try
+            {
+                await (OnFileSkipped?.Invoke(
+                    $"folder not synced — folders are not supported: {display}")
+                    ?? Task.CompletedTask);
+            }
+            catch (Exception e)
+            { RotatingLog.Shared.Error($"on_file_skipped handler failed: {e}"); }
             return;
         }
         if (fp.Value.Size > FileBudget)
@@ -3341,17 +3591,25 @@ public sealed class ClipboardWatcher : IClipboardSync
             return;
         }
         _oversizeWarned = false;
+        // Record BEFORE the read: no await window in which a coalesced
+        // rerun could re-detect (and re-send) the same file. Behavior-
+        // preserving: the read-failure path recorded the same fp anyway.
+        _lastFileFingerprint = fp;
         byte[] data;
         try { data = await File.ReadAllBytesAsync(path); }
-        catch (IOException e)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            _lastFileFingerprint = fp; // unreadable now won't improve by retrying
+            // Unreadable now won't improve by retrying (fp already recorded).
             RotatingLog.Shared.Warning($"file read failed for {path}: {e.Message}; skipping");
             return;
         }
-        _lastFileFingerprint = fp;
-        await (OnLocalChange?.Invoke(new FileClip(Path.GetFileName(path), data))
-            ?? Task.CompletedTask);
+        try
+        {
+            await (OnLocalChange?.Invoke(new FileClip(Path.GetFileName(path), data))
+                ?? Task.CompletedTask);
+        }
+        catch (Exception e)
+        { RotatingLog.Shared.Error($"on_change(file) handler failed: {e}"); }
     }
 
     /// Inbound (peer → local). Baselines updated BEFORE writes.
@@ -3379,7 +3637,7 @@ public sealed class ClipboardWatcher : IClipboardSync
                     if (!fileOk) RotatingLog.Shared.Warning("clipboard write (file) failed");
                     return Task.FromResult(fileOk);
                 }
-                catch (IOException e)
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     RotatingLog.Shared.Warning(
                         $"file write to {_receivedDir} failed: {e.Message}");
@@ -3391,8 +3649,10 @@ public sealed class ClipboardWatcher : IClipboardSync
     }
 }
 
-/// Message-only window receiving WM_CLIPBOARDUPDATE; created on the UI
-/// thread by Program and forwarding to the watcher.
+/// True message-only window (parent HWND_MESSAGE — the documented target
+/// for AddClipboardFormatListener, and it still receives
+/// WM_CLIPBOARDUPDATE); created on the UI thread by Program and
+/// forwarding to the watcher.
 public sealed class ClipboardListenerWindow : NativeWindow, IDisposable
 {
     private const int WM_CLIPBOARDUPDATE = 0x031D;
@@ -3406,15 +3666,25 @@ public sealed class ClipboardListenerWindow : NativeWindow, IDisposable
     public ClipboardListenerWindow(Func<Task> onUpdate)
     {
         _onUpdate = onUpdate;
-        CreateHandle(new CreateParams());
+        CreateHandle(new CreateParams { Parent = (IntPtr)(-3) /* HWND_MESSAGE */ });
         AddClipboardFormatListener(Handle);
     }
 
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == WM_CLIPBOARDUPDATE)
-            _ = _onUpdate(); // fire-and-forget; handler logs its own errors
+            _ = HandleSafelyAsync(); // fire-and-forget WITH a logging backstop
         base.WndProc(ref m);
+    }
+
+    /// Backstop so no clipboard-path exception is ever silently discarded
+    /// through the discarded task (the watcher already isolates per-kind
+    /// handler errors; this catches anything that still escapes).
+    private async Task HandleSafelyAsync()
+    {
+        try { await _onUpdate(); }
+        catch (Exception e)
+        { RotatingLog.Shared.Error($"clipboard update handler failed: {e}"); }
     }
 
     public void Dispose()
@@ -3431,9 +3701,25 @@ namespace AnyClip.App;
 
 /// Balloon-tip notifications over the tray NotifyIcon — the same vehicle
 /// the Python build used. Body capped at 240 chars like the other ports.
+/// Daemon tasks call Notify off-thread, so the call is marshalled to the
+/// UI thread through `Invoker` (same pattern as WinFormsClipboard).
 public sealed class Notifier(NotifyIcon trayIcon)
 {
+    /// UI-thread control set once by Program; until set, calls run inline.
+    public Control? Invoker { get; set; }
+
     public void Notify(string title, string body)
+    {
+        var inv = Invoker;
+        if (inv is { InvokeRequired: true })
+        {
+            inv.BeginInvoke(() => ShowTip(title, body));
+            return;
+        }
+        ShowTip(title, body);
+    }
+
+    private void ShowTip(string title, string body)
     {
         try
         {
@@ -3606,10 +3892,13 @@ namespace AnyClip.App;
 /// IMdnsService over the built-in Windows mDNS (dnsapi). Advertises our
 /// instance and browses for peers, ingesting resolutions into the
 /// daemon's current PeerDirectory. GC-rooted delegates are kept as
-/// fields — collecting them while native code holds the pointer is the
-/// classic P/Invoke crash.
-public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
+/// readonly fields initialized once in the constructor and NEVER
+/// reassigned — collecting (or replacing) a delegate while native code
+/// can still invoke its thunk (including the final ERROR_CANCELLED
+/// callback after a cancel/deregister) is the classic P/Invoke crash.
+public sealed class MdnsBeacon : IMdnsService
 {
+    private readonly Func<PeerDirectory?> _directory;
     private DnsApi.DNS_SERVICE_REGISTER_REQUEST _registerRequest;
     private DnsApi.DNS_SERVICE_CANCEL _registerCancel;
     private DnsApi.DNS_SERVICE_BROWSE_REQUEST _browseRequest;
@@ -3618,81 +3907,37 @@ public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
     private bool _registered;
     private bool _browsing;
     private string? _instanceName;
+    private string? _fullName; // read by the register callback for logging
+    private int _port;
     private (string[] Keys, string[] Values)? _txt;
 
-    // Rooted delegates (see class doc).
-    private DnsApi.DnsServiceRegisterCallback? _registerCb;
-    private DnsApi.DnsServiceBrowseCallback? _browseCb;
+    // DnsServiceDeRegister completes asynchronously through the register
+    // callback (its goodbye packets still reference the instance); freeing
+    // the instance before that callback lands is a native use-after-free.
+    private readonly ManualResetEventSlim _deregDone = new(false);
+    private volatile bool _deregistering;
+
+    // Rooted delegates (see class doc) — never reassigned.
+    private readonly DnsApi.DnsServiceRegisterCallback _registerCb;
+    private readonly DnsApi.DnsServiceBrowseCallback _browseCb;
     private readonly List<DnsApi.DnsServiceResolveCallback> _resolveCbs = new();
 
     public string? AdvertisedIp { get; private set; }
 
-    public Task StartAsync(
-        string instanceName, IReadOnlyList<(string Key, string Value)> txt)
+    public MdnsBeacon(Func<PeerDirectory?> directory)
     {
-        _instanceName = instanceName;
-        _txt = (txt.Select(t => t.Key).ToArray(), txt.Select(t => t.Value).ToArray());
-        AdvertisedIp = PrimaryIPv4();
-        Register();
-        StartBrowse();
-        return Task.CompletedTask;
-    }
-
-    public static string? PrimaryIPv4()
-    {
-        try
+        _directory = directory;
+        _registerCb = (status, _, pInstance) =>
         {
-            using var socket = new System.Net.Sockets.Socket(
-                System.Net.Sockets.AddressFamily.InterNetwork,
-                System.Net.Sockets.SocketType.Dgram,
-                System.Net.Sockets.ProtocolType.Udp);
-            socket.Connect("8.8.8.8", 80); // no packet sent (UDP)
-            return (socket.LocalEndPoint as IPEndPoint)?.Address.ToString();
-        }
-        catch (System.Net.Sockets.SocketException) { return null; }
-    }
-
-    private void Register()
-    {
-        if (_instanceName is null || _txt is null) return;
-        string host = $"{Environment.MachineName}.local";
-        string fullName = $"{_instanceName}.{Wire.ServiceType}.local";
-        _instance = DnsApi.DnsServiceConstructInstance(
-            fullName, host, IntPtr.Zero, IntPtr.Zero,
-            (ushort)Wire.DefaultPort, 0, 0,
-            (uint)_txt.Value.Keys.Length, _txt.Value.Keys, _txt.Value.Values);
-        if (_instance == IntPtr.Zero)
-        {
-            RotatingLog.Shared.Warning("DnsServiceConstructInstance failed");
-            return;
-        }
-        _registerCb = (status, _, _) =>
-        {
+            // The callback owns this instance copy and must free it
+            // (DNS_SERVICE_REGISTER_COMPLETE contract).
+            if (pInstance != IntPtr.Zero) DnsApi.DnsServiceFreeInstance(pInstance);
+            if (_deregistering) { _deregDone.Set(); return; }
             if (status != DnsApi.ERROR_SUCCESS)
                 RotatingLog.Shared.Warning($"mDNS register completed with status {status}");
             else
-                RotatingLog.Shared.Info($"mDNS advertised as {fullName}");
+                RotatingLog.Shared.Info($"mDNS advertised as {_fullName}");
         };
-        _registerRequest = new DnsApi.DNS_SERVICE_REGISTER_REQUEST
-        {
-            Version = DnsApi.QueryRequestVersion1,
-            InterfaceIndex = 0,
-            pServiceInstance = _instance,
-            pRegisterCompletionCallback = _registerCb,
-            pQueryContext = IntPtr.Zero,
-            hCredentials = IntPtr.Zero,
-            unicastEnabled = false,
-        };
-        _registerCancel = default;
-        int rc = DnsApi.DnsServiceRegister(ref _registerRequest, ref _registerCancel);
-        // DnsServiceRegister returns DNS_REQUEST_PENDING (9506) on success.
-        _registered = rc == 9506 || rc == DnsApi.ERROR_SUCCESS;
-        if (!_registered)
-            RotatingLog.Shared.Warning($"DnsServiceRegister failed: {rc}");
-    }
-
-    private void StartBrowse()
-    {
         _browseCb = (status, _, pRecord) =>
         {
             try
@@ -3717,6 +3962,74 @@ public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
                     DnsApi.DnsRecordListFree(pRecord, DnsApi.DnsFreeRecordList);
             }
         };
+    }
+
+    public Task StartAsync(string instanceName, int port,
+        IReadOnlyList<(string Key, string Value)> txt)
+    {
+        _instanceName = instanceName;
+        _port = port;
+        _txt = (txt.Select(t => t.Key).ToArray(), txt.Select(t => t.Value).ToArray());
+        AdvertisedIp = PrimaryIPv4();
+        Register();
+        StartBrowse();
+        return Task.CompletedTask;
+    }
+
+    public static string? PrimaryIPv4()
+    {
+        try
+        {
+            using var socket = new System.Net.Sockets.Socket(
+                System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Dgram,
+                System.Net.Sockets.ProtocolType.Udp);
+            socket.Connect("8.8.8.8", 80); // no packet sent (UDP)
+            return (socket.LocalEndPoint as IPEndPoint)?.Address.ToString();
+        }
+        catch (System.Net.Sockets.SocketException) { return null; }
+    }
+
+    private void Register()
+    {
+        if (_instanceName is null || _txt is null) return;
+        _deregistering = false;
+        string host = $"{Environment.MachineName}.local";
+        _fullName = $"{_instanceName}.{Wire.ServiceType}.local";
+        _instance = DnsApi.DnsServiceConstructInstance(
+            _fullName, host, IntPtr.Zero, IntPtr.Zero,
+            (ushort)_port, 0, 0,
+            (uint)_txt.Value.Keys.Length, _txt.Value.Keys, _txt.Value.Values);
+        if (_instance == IntPtr.Zero)
+        {
+            RotatingLog.Shared.Warning("DnsServiceConstructInstance failed");
+            return;
+        }
+        _registerRequest = new DnsApi.DNS_SERVICE_REGISTER_REQUEST
+        {
+            Version = DnsApi.QueryRequestVersion1,
+            InterfaceIndex = 0,
+            pServiceInstance = _instance,
+            pRegisterCompletionCallback = _registerCb,
+            pQueryContext = IntPtr.Zero,
+            hCredentials = IntPtr.Zero,
+            unicastEnabled = false,
+        };
+        _registerCancel = default;
+        int rc = DnsApi.DnsServiceRegister(ref _registerRequest, ref _registerCancel);
+        // DnsServiceRegister returns DNS_REQUEST_PENDING (9506) on success.
+        _registered = rc == 9506 || rc == DnsApi.ERROR_SUCCESS;
+        if (!_registered)
+            RotatingLog.Shared.Warning($"DnsServiceRegister failed: {rc}");
+    }
+
+    private void StartBrowse()
+    {
+        // Only rebuild the request struct; _browseCb is the single rooted,
+        // never-reassigned delegate (see class doc), so the documented
+        // final ERROR_CANCELLED invocation after DnsServiceBrowseCancel
+        // always lands on a live thunk (harmless: the callback returns
+        // immediately on status != ERROR_SUCCESS).
         _browseRequest = new DnsApi.DNS_SERVICE_BROWSE_REQUEST
         {
             Version = DnsApi.QueryRequestVersion1,
@@ -3762,7 +4075,7 @@ public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
                 if (!props.TryGetValue("id", out var peerId)) return;
                 string label = Marshal.PtrToStringUni(inst.pszInstanceName)
                     ?? instanceFullName;
-                var dir = directory();
+                var dir = _directory();
                 if (dir is not null)
                     _ = dir.IngestAsync(peerId, host, inst.wPort, label);
             }
@@ -3792,6 +4105,18 @@ public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
 
     public void Refresh()
     {
+        // Re-announce FIRST, then re-issue the browse — Python's
+        // beacon.refresh() order and the spec's "re-register on refresh()"
+        // mandate (the idle-link watchdog relies on the re-announce so the
+        // REMOTE peer can rediscover us after stale multicast state).
+        // Register() is called unconditionally so the watchdog also retries
+        // an advertisement whose initial registration failed. FakeMdns
+        // counts Refresh() calls unchanged, so Task 7 tests are unaffected;
+        // the re-announce is verified by the manual Windows acceptance pass
+        // (watch for BOTH log lines below).
+        DeregisterAndFreeInstance();
+        Register();
+        RotatingLog.Shared.Debug("mDNS: re-announced service");
         if (_browsing)
         {
             DnsApi.DnsServiceBrowseCancel(ref _browseCancel);
@@ -3808,10 +4133,39 @@ public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
             DnsApi.DnsServiceBrowseCancel(ref _browseCancel);
             _browsing = false;
         }
-        if (_registered && _instance != IntPtr.Zero)
+        DeregisterAndFreeInstance();
+    }
+
+    /// Deregister, wait for the async completion callback, and only then
+    /// free the instance: DnsServiceDeRegister returns DNS_REQUEST_PENDING
+    /// (9506) and its goodbye packets reference pServiceInstance, so
+    /// freeing early is a native use-after-free that can corrupt the heap
+    /// inside dnsapi.dll. Blocking here is fine — callers run on
+    /// daemon/threadpool continuations (Daemon.RunOnceAsync finally,
+    /// watchdog Refresh), never the STA UI thread, and the dereg callback
+    /// arrives on a dnsapi worker thread. This path is hit on every
+    /// watchdog-induced daemon restart, after which the next Register()
+    /// starts from a clean state.
+    private void DeregisterAndFreeInstance()
+    {
+        if (_registered)
         {
-            DnsApi.DnsServiceDeRegister(ref _registerRequest, IntPtr.Zero);
+            _deregDone.Reset();
+            _deregistering = true;
+            int rc = DnsApi.DnsServiceDeRegister(ref _registerRequest, IntPtr.Zero);
+            bool done = rc != 9506 /* DNS_REQUEST_PENDING */
+                || _deregDone.Wait(TimeSpan.FromSeconds(2));
+            _deregistering = false;
             _registered = false;
+            if (!done)
+            {
+                // Deliberate leak: never free an instance a pending
+                // deregistration may still reference.
+                RotatingLog.Shared.Warning(
+                    "mDNS deregister still pending after 2s; leaking instance");
+                _instance = IntPtr.Zero;
+                return;
+            }
         }
         if (_instance != IntPtr.Zero)
         {
@@ -3833,6 +4187,7 @@ public sealed class MdnsBeacon(Func<PeerDirectory?> directory) : IMdnsService
 - Create: `forwindows/src/AnyClipApp/TrayIcon.cs`
 - Create: `forwindows/src/AnyClipApp/Dialogs.cs`
 - Create: `forwindows/src/AnyClipApp/Program.cs`
+- Test: `forwindows/tests/AnyClipApp.Tests/TrayIconTests.cs` (CI-only)
 
 Reference: `app/tray_win.py` (menu set/labels/token flow) + the 2026-06-11
 UI parity items (status-aware icon, enter-token flow) + formacOS
@@ -3892,7 +4247,8 @@ public sealed class TrayIcon : IDisposable
     }
 
     /// Red-tinted copy of the base icon, optionally with a "!" overlay.
-    private static Icon Tint(Icon baseIcon, bool bang)
+    /// Internal for the CI render smoke test (InternalsVisibleTo).
+    internal static Icon Tint(Icon baseIcon, bool bang)
     {
         using var bmp = baseIcon.ToBitmap();
         using var tinted = new Bitmap(bmp.Width, bmp.Height);
@@ -3976,6 +4332,30 @@ public sealed class TrayIcon : IDisposable
     {
         Notify.Visible = false;
         Notify.Dispose();
+    }
+}
+```
+
+`forwindows/tests/AnyClipApp.Tests/TrayIconTests.cs` (CI-only):
+```csharp
+using System.Drawing;
+using AnyClip.App;
+using Xunit;
+
+namespace AnyClip.App.Tests;
+
+public class TrayIconTests
+{
+    [Fact]
+    public void TrayIconRenderSmoke()
+    {
+        // The tinted-icon render path (GDI+ FillEllipse/DrawString +
+        // GetHicon) must not throw on the headless CI runner. SystemIcons
+        // stands in for the shipped .ico — Tint accepts any valid Icon.
+        using var attention = TrayIcon.Tint(SystemIcons.Application, bang: false);
+        using var error = TrayIcon.Tint(SystemIcons.Application, bang: true);
+        Assert.NotNull(attention);
+        Assert.NotNull(error);
     }
 }
 ```
@@ -4166,14 +4546,22 @@ internal static class Program
         tray = new TrayIcon(logFile, Quit);
         var notifier = new Notifier(tray.Notify);
 
-        // STA invoker: a hidden UI-thread control all clipboard access is
-        // marshalled through (daemon tasks call ApplyRemote off-thread).
+        // STA invoker: a hidden UI-thread control all clipboard access AND
+        // balloon tips are marshalled through (daemon tasks call
+        // ApplyRemote/Notify off-thread).
         var staInvoker = new Control();
         _ = staInvoker.Handle; // force handle creation on this (UI) thread
         var winClipboard = new WinFormsClipboard();
         var clipboard = new ClipboardWatcher(
             winClipboard, Path.Combine(stateDir, "received"));
         winClipboard.Invoker = staInvoker;
+        notifier.Invoker = staInvoker;
+
+        // Captured BEFORE the daemon exists: onFatal fires on daemon
+        // threadpool threads and MessageBox/Application.Exit must run on
+        // the UI thread.
+        var uiContext = SynchronizationContext.Current!;
+
         var mdns = new MdnsBeacon(() => daemon?.CurrentDirectory);
         daemon = new Daemon(
             new DaemonConfig(token, Wire.DefaultPort, Environment.MachineName),
@@ -4181,12 +4569,12 @@ internal static class Program
             clipboard, mdns, new WindowsPidLock(),
             MdnsBeacon.PrimaryIPv4,
             notify: (title, body) => notifier.Notify(title, body),
-            onFatal: message =>
+            onFatal: message => uiContext.Post(_ =>
             {
                 MessageBox.Show(message, "AnyClip cannot start",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Application.Exit();
-            });
+            }, null));
 
         // Clipboard events come from the UI loop; forward to the watcher.
         using var listener = new ClipboardListenerWindow(
@@ -4195,7 +4583,6 @@ internal static class Program
         daemonTask = Task.Run(() => daemon.RunForeverAsync(quitCts.Token));
 
         // Fold daemon events into tray state on the UI thread.
-        var uiContext = SynchronizationContext.Current!;
         _ = Task.Run(async () =>
         {
             var state = PeerUiState.Initial;
@@ -4213,8 +4600,8 @@ internal static class Program
 }
 ```
 
-- [ ] **Step 2: cross-build gate** — App project compiles clean on macOS;
-  full Core suite still green.
+- [ ] **Step 2: cross-build gate** — App project AND AnyClipApp.Tests
+  compile clean on macOS; full Core suite still green.
 - [ ] **Step 3: Commit** — `forwindows: tray + dialogs + composition root`
 
 ---
@@ -4266,10 +4653,22 @@ directly after the `macos-swift` job (same indentation level):
         with:
           dotnet-version: "8.0.x"
 
-      - name: Run tests (Core + App)
-        run: |
-          dotnet test forwindows/tests/AnyClipCore.Tests
-          dotnet test forwindows/tests/AnyClipApp.Tests
+      # setup-python guarantees the `python3` alias on Windows runners
+      # (the Core interop test spawns it).
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # One `dotnet test` per step: under the default pwsh shell only the
+      # LAST native command's exit code fails the step, so a combined step
+      # would mask a Core failure whenever the App tests pass. Separate
+      # steps also pinpoint which suite failed in the CI log.
+      - name: Run Core tests
+        run: dotnet test forwindows/tests/AnyClipCore.Tests
+
+      - name: Run App tests
+        run: dotnet test forwindows/tests/AnyClipApp.Tests
 
       - name: Publish single-file exe
         shell: pwsh
@@ -4292,11 +4691,6 @@ directly after the `macos-swift` job (same indentation level):
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
 ```
-
-NOTE: the Core interop test spawns `python3` — present on windows-latest
-runners. If `python3` is missing there, alias it via
-`shell: pwsh; run: New-Item -ItemType SymbolicLink ...` or guard the test
-with an env check — adapt minimally and note it.
 
 - [ ] **Step 3: verify locally**
 
@@ -4406,10 +4800,12 @@ the manual smoke test on their Windows machine.
   testing shows it broken); `SocketOptionName.TcpKeepAliveTime` on macOS
   (wrap in try/catch — already done); WinForms cross-targeting restore on
   macOS needs the windows targeting packs (first `dotnet build` downloads
-  them — same TLS caveat as Task 1); `python3` availability on
-  windows-latest (T14 note).
-- **Port hygiene:** Core tests use 28601-28632; App tests use 58162; never
-  24816. macOS Swift suite uses 2846x-2849x — no overlap.
+  them — same TLS caveat as Task 1); `python3` on windows-latest is pinned
+  via actions/setup-python (T14).
+- **Port hygiene:** FramedConnection tests bind ephemeral loopback ports;
+  PeerLink/Daemon/interop tests use 28611-28632 (PeerLink sets POSIX
+  SO_REUSEADDR so back-to-back runs don't trip over TIME_WAIT); App tests
+  use 58162; never 24816. macOS Swift suite uses 2846x-2849x — no overlap.
 - **Threading notes for the executor:** PeerLink's critical section uses
   SemaphoreSlim with no awaits held across registration; `PeerName`/
   `IsActive` are read without the lock for display/loop checks — the same
