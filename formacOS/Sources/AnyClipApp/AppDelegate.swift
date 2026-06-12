@@ -25,7 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
-        notifier.setup()
+        // Permission prompt is deferred: only request if toasts are already
+        // enabled; otherwise the Notifications menu toggle triggers setup().
+        if NotificationSettings.enabled { notifier.setup() }
 
         let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"]
             as? String)
@@ -35,8 +37,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = DaemonConfig(token: token)
         let daemon = Daemon(
             config: config, appVersion: appVersion,
-            notifier: { [notifier] title, body in
-                notifier.notify(title: title, body: body)
+            notifier: { [notifier, weak self] title, body in
+                // Sync toasts carry an arrow ("AnyClip ← peer" / "AnyClip →
+                // peer"); the folder-skip toast ("AnyClip") does not and must
+                // not pulse the glyph.
+                if title.contains("←") || title.contains("→") {
+                    Task { @MainActor in self?.controller?.animateSyncPulse() }
+                }
+                if NotificationSettings.enabled {
+                    notifier.notify(title: title, body: body)
+                }
             },
             onFatal: { message in
                 Task { @MainActor in
@@ -49,9 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             })
         self.daemon = daemon
 
-        controller = StatusItemController(logFileURL: logURL) { [weak self] in
-            self?.quitGracefully()
-        }
+        controller = StatusItemController(
+            logFileURL: logURL,
+            onNotificationsEnabled: { [notifier] in notifier.setup() },
+            onQuit: { [weak self] in self?.quitGracefully() })
 
         daemonTask = Task { await daemon.runForever() }
 

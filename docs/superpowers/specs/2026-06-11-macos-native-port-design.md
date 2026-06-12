@@ -290,3 +290,8 @@ UserNotifications: it exposes an injected `notify(title, body)` callback
   runtime targets remain dependency-free.
 - Known follow-up: the tie-breaker race-window logic has no automated
   test (same gap exists in the Python original).
+- Toast notifications are OFF by default and toggled via a new
+  "Notifications" menu item (UserDefaults-backed, app-local); the default
+  sync feedback is a 10-frame circular arc-orbit pulse of the menu bar
+  glyph (accent-colored, 0.4 s, coalescing). The notification-permission
+  prompt is deferred until the user first enables toasts.

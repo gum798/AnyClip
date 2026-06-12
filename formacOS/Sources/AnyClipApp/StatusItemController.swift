@@ -21,14 +21,29 @@ final class StatusItemController: NSObject {
     private let autostart = Autostart()
     private let logFileURL: URL
     private let onQuit: () -> Void
+    private var currentState: PeerUIState = .initial
+    private var syncAnimationTimer: Timer?
+    private var syncAnimationFrame = 0
+    private static let syncFrames = ["◜", "◠", "◝", "◞", "◡", "◟", "◜", "◠", "◝", "◞"]
+    private let notificationsItem: NSMenuItem
+    /// Called when the user turns notifications ON (AppDelegate runs the
+    /// permission request lazily so default-off users never see the prompt).
+    private let onNotificationsEnabled: () -> Void
 
-    init(logFileURL: URL, onQuit: @escaping () -> Void) {
+    init(
+        logFileURL: URL,
+        onNotificationsEnabled: @escaping () -> Void,
+        onQuit: @escaping () -> Void
+    ) {
         self.logFileURL = logFileURL
+        self.onNotificationsEnabled = onNotificationsEnabled
         self.onQuit = onQuit
         statusItem = NSStatusBar.system.statusItem(
             withLength: NSStatusItem.variableLength)
         startAtLoginItem = NSMenuItem(
             title: "Start at Login", action: nil, keyEquivalent: "")
+        notificationsItem = NSMenuItem(
+            title: "Notifications", action: nil, keyEquivalent: "")
         super.init()
 
         statusMenuItem.isEnabled = false
@@ -41,6 +56,9 @@ final class StatusItemController: NSObject {
         startAtLoginItem.action = #selector(toggleAutostart)
         startAtLoginItem.target = self
         startAtLoginItem.state = autostart.isEnabled() ? .on : .off
+        notificationsItem.action = #selector(toggleNotifications)
+        notificationsItem.target = self
+        notificationsItem.state = NotificationSettings.enabled ? .on : .off
         let openLogsItem = NSMenuItem(
             title: "Open Logs", action: #selector(openLogs), keyEquivalent: "")
         openLogsItem.target = self
@@ -53,6 +71,7 @@ final class StatusItemController: NSObject {
         menu.addItem(.separator())
         menu.addItem(tokenItem)
         menu.addItem(startAtLoginItem)
+        menu.addItem(notificationsItem)
         menu.addItem(openLogsItem)
         menu.addItem(.separator())
         menu.addItem(quitItem)
@@ -63,7 +82,12 @@ final class StatusItemController: NSObject {
     }
 
     func apply(_ state: PeerUIState) {
-        updateIcon(state)
+        currentState = state
+        // While the sync pulse is running, skip the immediate icon update;
+        // the animation restores the latest state when it finishes.
+        if syncAnimationTimer == nil {
+            updateIcon(state)
+        }
         switch state.kind {
         case .linked:
             statusMenuItem.title = "Linked: \(state.peerName ?? "peer")"
@@ -107,7 +131,43 @@ final class StatusItemController: NSObject {
         }
     }
 
+    /// 10-frame circular arc-orbit pulse on the menu bar glyph (≈0.4 s).
+    /// Re-triggering mid-flight restarts the orbit instead of stacking.
+    func animateSyncPulse() {
+        syncAnimationFrame = 0
+        guard syncAnimationTimer == nil else { return }
+        syncAnimationTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.04, repeats: true
+        ) { [weak self] _ in
+            // The timer is scheduled on the main run loop, so this closure
+            // always runs on the main thread; assumeIsolated bridges the
+            // nonisolated Timer API back to the @MainActor controller.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.syncAnimationFrame >= Self.syncFrames.count {
+                    self.syncAnimationTimer?.invalidate()
+                    self.syncAnimationTimer = nil
+                    self.updateIcon(self.currentState)
+                    return
+                }
+                self.statusItem.button?.attributedTitle = NSAttributedString(
+                    string: Self.syncFrames[self.syncAnimationFrame],
+                    attributes: [
+                        .foregroundColor: NSColor.controlAccentColor,
+                        .font: NSFont.menuBarFont(ofSize: 0),
+                    ])
+                self.syncAnimationFrame += 1
+            }
+        }
+    }
+
     // ---- menu actions ---------------------------------------------------
+
+    @objc private func toggleNotifications() {
+        NotificationSettings.enabled.toggle()
+        notificationsItem.state = NotificationSettings.enabled ? .on : .off
+        if NotificationSettings.enabled { onNotificationsEnabled() }
+    }
 
     @objc private func showTokenInfo() {
         let stored = ConfigStore.load()
