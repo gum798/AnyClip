@@ -6,5 +6,5 @@ namespace AnyClip.Core.Tests;
 public class SmokeTests
 {
     [Fact]
-    public void ToolchainSmoke() => Assert.True(CoreMarker.Present);
+    public void ToolchainSmoke() => Assert.Equal(1, Wire.ProtocolMajor);
 }
