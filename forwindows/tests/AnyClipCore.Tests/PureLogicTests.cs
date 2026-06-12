@@ -114,6 +114,21 @@ public class TxtCodecTests
     }
 
     [Fact]
+    public void DecodeStopsAtMidStreamTruncation()
+    {
+        // A length byte claiming more bytes than remain makes every later
+        // offset untrustworthy — decode keeps what it has and stops
+        // (intentional; the Swift port behaves identically).
+        var data = new List<byte>();
+        data.AddRange(TxtCodec.Encode(new[] { ("a", "1") }));
+        data.Add(50); // claims 50 bytes; only a few follow
+        data.AddRange("xx"u8.ToArray());
+        data.AddRange(TxtCodec.Encode(new[] { ("b", "2") })); // unreachable
+        Assert.Equal(new Dictionary<string, string> { ["a"] = "1" },
+            TxtCodec.Decode(data.ToArray()));
+    }
+
+    [Fact]
     public void DecodeIgnoresMalformedTailAndOversized()
     {
         var data = TxtCodec.Encode(new[] { ("a", "1") }).ToList();

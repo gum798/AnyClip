@@ -55,15 +55,19 @@ public static class ConfigStore
             new JsonSerializerOptions { WriteIndented = true }) + "\n";
         try
         {
-            using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write))
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+            };
+            if (!OperatingSystem.IsWindows())
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            using (var fs = new FileStream(tmp, options))
             {
                 var bytes = System.Text.Encoding.UTF8.GetBytes(payload);
                 fs.Write(bytes);
                 fs.Flush(flushToDisk: true); // fsync, like config_store.py
             }
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(tmp,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(tmp, target, overwrite: true);
         }
         catch
