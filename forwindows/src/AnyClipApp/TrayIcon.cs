@@ -151,7 +151,12 @@ public sealed class TrayIcon : IDisposable
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                var dim = new System.Drawing.Imaging.ColorMatrix { Matrix33 = 0.55f };
+                var dim = new System.Drawing.Imaging.ColorMatrix
+                {
+                    Matrix00 = 0.55f, // R
+                    Matrix11 = 0.55f, // G
+                    Matrix22 = 0.55f, // B
+                };
                 using var attrs = new System.Drawing.Imaging.ImageAttributes();
                 attrs.SetColorMatrix(dim);
                 g.DrawImage(baseBmp, new Rectangle(0, 0, bmp.Width, bmp.Height),
@@ -166,7 +171,7 @@ public sealed class TrayIcon : IDisposable
             IntPtr hIcon = bmp.GetHicon();
             try
             {
-                using var tmp = Icon.FromHandle(hIcon);
+                var tmp = Icon.FromHandle(hIcon);
                 frames[i] = (Icon)tmp.Clone();
             }
             finally { DestroyIcon(hIcon); }

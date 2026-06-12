@@ -21,7 +21,7 @@ public class TrayIconTests
     [Fact]
     public void PulseFramesBuildTenDistinctIcons()
     {
-        using var baseIcon = SystemIcons.Application;
+        var baseIcon = SystemIcons.Application;
         var frames = TrayIcon.BuildPulseFrames(baseIcon);
         Assert.Equal(10, frames.Length);
         Assert.All(frames, f => Assert.NotNull(f));
