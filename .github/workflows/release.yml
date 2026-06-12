@@ -229,6 +229,56 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
 
+  windows-native:
+    name: Windows native (C#) build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # setup-python guarantees the `python3` alias on Windows runners
+      # (the Core interop test spawns it).
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # One `dotnet test` per step: under the default pwsh shell only the
+      # LAST native command's exit code fails the step, so a combined step
+      # would mask a Core failure whenever the App tests pass. Separate
+      # steps also pinpoint which suite failed in the CI log.
+      - name: Run Core tests
+        run: dotnet test forwindows/tests/AnyClipCore.Tests
+
+      - name: Run App tests
+        run: dotnet test forwindows/tests/AnyClipApp.Tests
+
+      - name: Publish single-file exe
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          dotnet publish forwindows/src/AnyClipApp -c Release -r win-x64 `
+            --self-contained -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:InformationalVersion=$version `
+            -o forwindows/dist/publish
+          Compress-Archive -Force `
+            -Path forwindows/dist/publish/* `
+            -DestinationPath "forwindows/dist/AnyClip-${{ github.ref_name }}-windows-x64-native.zip"
+
+      - name: Upload Windows native asset to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: forwindows/dist/AnyClip-${{ github.ref_name }}-windows-x64-native.zip
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
   homebrew:
     name: Update Homebrew cask
     needs: [macos-swift]
