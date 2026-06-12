@@ -256,6 +256,16 @@ launchctl load ~/Library/LaunchAgents/com.anyclip.plist
 - macOS arm64 + Windows x64 한정 (Intel Mac, Windows ARM64, Linux/Android/iOS는 향후 phase)
 - 평문 JSON 전송 (인증은 해시, 콘텐츠 자체는 암호화 안 됨 — 신뢰 LAN 가정)
 
+## 네이티브 구현
+
+| 플랫폼 | 위치 | 상태 |
+|--------|------|------|
+| macOS (Swift · AppKit) | `formacOS/` | v1.0.0 출시 — `brew install --cask anyclip` |
+| Windows (native) | `forwindows/` | 개발 중 |
+| Python (레거시, macOS+Windows) | 저장소 루트 | 유지 — Sparkle/WinSparkle 자동 업데이트 채널 |
+
+네이티브 빌드는 Python 구현과 와이어 호환(protocol 1.0)이며 `~/.anyclip/` 설정·토큰을 그대로 공유합니다. 빌드 방법은 각 디렉토리의 README 참고.
+
 ## 라이선스
 
 MIT
