@@ -54,6 +54,7 @@ public class PeerStateTests
         s = PeerStateReducer.Reduce(s, new HandshakeFailed("a", "auth"), 5);
         Assert.Equal(PeerStateKind.Error, s.Kind);
         Assert.Equal("auth", s.Reason);
+        Assert.Equal(5, s.ConsecutiveHandshakeFails);
     }
 
     [Fact]
@@ -63,7 +64,14 @@ public class PeerStateTests
         s = PeerStateReducer.Reduce(s, new LinkUp("p", "x"), 2);
         Assert.Equal(PeerStateKind.Linked, s.Kind);
         Assert.Equal(0, s.ConsecutiveHandshakeFails);
+        s = PeerStateReducer.Reduce(s, new HandshakeFailed("a", "auth"), 3);
+        Assert.NotEqual(PeerStateKind.Error, s.Kind);
+        Assert.Equal(1, s.ConsecutiveHandshakeFails);
     }
+
+    [Fact]
+    public void ThresholdConstantIsFive() =>
+        Assert.Equal(5, PeerStateReducer.HandshakeFailThreshold);
 
     // Tray icon spec — parity with formacOS MenuIcon (red attention when
     // not linked; "!" marker on error).
@@ -73,6 +81,8 @@ public class PeerStateTests
         var linked = PeerStateReducer.Reduce(PeerUiState.Initial, new LinkUp("p", "x"), 1);
         Assert.Equal(new TrayIconSpec(false, false), TrayIconSpec.For(linked));
         Assert.Equal(new TrayIconSpec(true, false), TrayIconSpec.For(PeerUiState.Initial));
+        var searching = PeerStateReducer.Reduce(PeerUiState.Initial, new PeerDiscovered("n", "a"), 1);
+        Assert.Equal(new TrayIconSpec(true, false), TrayIconSpec.For(searching));
         var err = PeerStateReducer.Reduce(PeerUiState.Initial, new PermissionMissing("x"), 1);
         Assert.Equal(new TrayIconSpec(true, true), TrayIconSpec.For(err));
     }
