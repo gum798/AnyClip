@@ -81,6 +81,7 @@ public class WireMessageTests
         Assert.Equal("hello", msg!.Type);
         Assert.Equal("t", msg.Token);
         Assert.Null(WireMessage.DecodeBody("{notjson"u8.ToArray()));
+        Assert.Null(WireMessage.DecodeBody("null"u8.ToArray())); // valid JSON null literal → null
     }
 
     [Fact]
@@ -104,7 +105,8 @@ public class WireMessageTests
     public void OversizedPayloadThrows()
     {
         var big = WireMessage.ClipText(new string('x', Wire.MaxPayload + 1), 0);
-        Assert.Throws<PayloadTooLargeException>(() => big.EncodeFrame());
+        var ex = Assert.Throws<PayloadTooLargeException>(() => big.EncodeFrame());
+        Assert.True(ex.Size > Wire.MaxPayload);
     }
 
     [Fact]
