@@ -5,11 +5,15 @@ LAN 안의 두 컴퓨터 사이에서 **클립보드를 양방향으로 자동 �
 
 ## Quick Start
 
+두 컴퓨터(예: Mac ↔ Windows) **각각에** 설치한 뒤, 같은 **토큰**으로 한 번만 연결하면 됩니다.
+
 ### macOS — Homebrew (권장)
 
 ```bash
+# Homebrew가 없다면 먼저: https://brew.sh 의 한 줄 설치 명령 실행
 brew tap gum798/tap
 brew install --cask anyclip
+open -a AnyClip          # 또는 Launchpad에서 AnyClip 실행
 ```
 
 네이티브 Swift 빌드(`formacOS/`)가 `/Applications`에 설치됩니다. 코드 서명이 없는 빌드라 첫 실행은 Gatekeeper가 차단합니다 — 우클릭 → 열기 1회, 또는:
@@ -21,25 +25,53 @@ xattr -dr com.apple.quarantine /Applications/AnyClip.app
 ### Windows — Scoop (권장)
 
 ```powershell
+# Scoop이 없다면 먼저 (관리자 권한 불필요, 한 번만):
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+irm get.scoop.sh | iex
+
 scoop bucket add gum798 https://github.com/gum798/scoop-bucket
 scoop install anyclip
+anyclip                  # 또는 시작 메뉴에서 AnyClip 실행
 ```
 
-네이티브 C# 빌드(`forwindows/`)가 설치됩니다. 새 릴리스는 버킷이 6시간마다 자동 반영하며 `scoop update anyclip`으로 업그레이드합니다. (winget은 [microsoft/winget-pkgs 심사](https://github.com/microsoft/winget-pkgs/pull/387026) 통과 후 `winget install gum798.AnyClip` 사용 가능.)
+네이티브 C# 빌드(`forwindows/`)가 설치됩니다. 첫 실행 시 SmartScreen이 뜨면 **추가 정보 → 실행** 1회. (winget은 [microsoft/winget-pkgs 심사](https://github.com/microsoft/winget-pkgs/pull/387026) 통과 후 `winget install gum798.AnyClip` 사용 가능.)
+
+### 첫 실행 — 두 기기 연결 (설치 방식 공통)
+
+1. **첫 번째 기기**에서 AnyClip 실행 → 온보딩 창에서 **"Generate new token"** → 생성된 토큰을 복사해 둡니다. (나중에 메뉴바/트레이 → **Token…** 에서 다시 볼 수 있습니다.)
+2. **두 번째 기기**에서 AnyClip 실행 → 온보딩 창에서 **"Enter existing token"** → 1번에서 복사한 토큰을 붙여넣습니다.
+3. 두 기기가 같은 LAN에 있으면 메뉴바(macOS)·트레이(Windows) 아이콘 상태가 `Searching for peer` → `Linked: <상대 이름>`으로 바뀝니다.
+4. 이제 한쪽에서 복사(⌘C / Ctrl+C)하면 반대쪽 클립보드에 자동 반영됩니다. **동기화될 때마다 아이콘에 원호가 한 바퀴 도는 펄스**가 잠깐 재생됩니다.
+
+> 복사할 때마다 알림 팝업이 뜨길 원하면 메뉴바/트레이 메뉴의 **Notifications** 를 켜세요. (기본은 꺼짐 — 대신 위 아이콘 펄스로 표시.)
+
+### 업데이트
+
+새 버전은 패키지 매니저로 받습니다. **실행 중인 AnyClip은 먼저 종료**해야 교체됩니다(특히 Windows).
+
+```bash
+# macOS
+brew update && brew upgrade --cask anyclip
+# 적용: 메뉴바 @ → Quit 후 다시 실행
+
+# Windows (PowerShell) — 트레이 아이콘 → Quit 먼저
+scoop update && scoop update anyclip
+anyclip
+```
+
+릴리스 직후라면 매니저 인덱스가 아직 최신이 아닐 수 있어 `brew update` / `scoop update`를 먼저 실행해야 새 버전이 보입니다.
 
 ### 직접 다운로드
 
-1. [최신 릴리스](https://github.com/gum798/AnyClip/releases/latest)에서 OS에 맞는 파일을 다운로드합니다.
-   - macOS (native Swift): `AnyClip-vX.Y.Z-macos-arm64.zip` (Apple Silicon 전용)
-   - macOS (legacy Python): `AnyClip-vX.Y.Z.dmg` (Apple Silicon 전용)
-   - Windows: `AnyClip-vX.Y.Z-windows-x64.zip` (x64)
-2. 더블클릭으로 설치/압축 해제 후 실행합니다.
-3. 첫 실행 창에서:
-   - **첫 번째 기기** — "Generate new token"을 눌러 새 토큰을 만듭니다.
-   - **두 번째 기기** — "Enter existing token"에 첫 번째 기기에서 만든 토큰을 붙여넣습니다.
-4. 메뉴바/트레이 아이콘에 `Searching for peer` → `Linked: <상대 이름>`이 떠야 정상입니다.
+패키지 매니저를 쓰지 않을 때의 방법입니다.
 
-이후 한쪽에서 복사하면 반대쪽 클립보드에 자동으로 반영됩니다.
+1. [최신 릴리스](https://github.com/gum798/AnyClip/releases/latest)에서 OS에 맞는 파일을 다운로드합니다.
+   - macOS (native Swift, 권장): `AnyClip-vX.Y.Z-macos-arm64.zip` (Apple Silicon 전용)
+   - macOS (legacy Python): `AnyClip-vX.Y.Z.dmg` (Apple Silicon 전용)
+   - Windows (native C#, 권장): `AnyClip-vX.Y.Z-windows-x64-native.zip` (x64)
+   - Windows (legacy Python): `AnyClip-vX.Y.Z-windows-x64.zip` (x64)
+2. 압축을 풀고 `AnyClip.app`(macOS)을 `/Applications`로 옮기거나 `AnyClip.exe`(Windows)를 원하는 폴더에 둔 뒤 실행합니다.
+3. 이후 연결 절차는 위 **[첫 실행 — 두 기기 연결](#첫-실행--두-기기-연결-설치-방식-공통)** 과 동일합니다.
 
 ### macOS 첫 실행 — Gatekeeper 우회
 
