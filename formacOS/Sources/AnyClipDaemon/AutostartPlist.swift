@@ -35,7 +35,11 @@ public struct Autostart {
             "Label": Self.label,
             "ProgramArguments": [executablePath],
             "RunAtLoad": true,
-            "KeepAlive": true,
+            // Conditional keep-alive: relaunch only on an *unsuccessful*
+            // exit (crash). A clean exit(0) -- which the menu-bar Quit
+            // produces -- is respected, so quitting no longer races a
+            // KeepAlive=true respawn that revives the app every ~10s.
+            "KeepAlive": ["SuccessfulExit": false],
             // launchd does not expand ~ -- absolute paths only.
             "StandardOutPath": logDir.appendingPathComponent("launchd.stdout.log").path,
             "StandardErrorPath": logDir.appendingPathComponent("launchd.stderr.log").path,

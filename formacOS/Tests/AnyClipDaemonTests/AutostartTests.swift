@@ -23,7 +23,8 @@ private func tempHome() -> URL {
     #expect(plist["ProgramArguments"] as? [String] ==
         ["/Applications/AnyClip.app/Contents/MacOS/AnyClip"])
     #expect(plist["RunAtLoad"] as? Bool == true)
-    #expect(plist["KeepAlive"] as? Bool == true)
+    let keepAlive = plist["KeepAlive"] as? [String: Bool]
+    #expect(keepAlive?["SuccessfulExit"] == false)
     let stdout = plist["StandardOutPath"] as? String
     #expect(stdout?.hasSuffix(".anyclip/launchd.stdout.log") == true)
 }

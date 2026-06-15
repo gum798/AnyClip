@@ -67,7 +67,11 @@ class MacAutostart:
             "Label": PLIST_LABEL,
             "ProgramArguments": program_args,
             "RunAtLoad": True,
-            "KeepAlive": True,
+            # Conditional keep-alive: relaunch only on an *unsuccessful*
+            # exit (crash). A clean exit(0) -- which the menu-bar Quit
+            # produces -- is respected, so quitting no longer races a
+            # KeepAlive=true respawn that revives the app every ~10s.
+            "KeepAlive": {"SuccessfulExit": False},
             # launchd does not expand ~ in these paths -- absolute only.
             "StandardOutPath": str(log_dir / "launchd.stdout.log"),
             "StandardErrorPath": str(log_dir / "launchd.stderr.log"),

@@ -83,7 +83,7 @@ def test_mac_plist_contents(tmp_path: Path) -> None:
         body = plistlib.load(fh)
     assert body["Label"] == PLIST_LABEL
     assert body["RunAtLoad"] is True
-    assert body["KeepAlive"] is True
+    assert body["KeepAlive"] == {"SuccessfulExit": False}
     assert body["ProgramArguments"] == [
         "/Applications/AnyClip.app/Contents/MacOS/AnyClip",
         "--headless",
