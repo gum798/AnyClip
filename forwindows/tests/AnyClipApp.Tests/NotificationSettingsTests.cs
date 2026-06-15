@@ -9,7 +9,12 @@ public class NotificationSettingsTests
     [Fact]
     public void DefaultsOffAndRoundTrips()
     {
-        var subKey = @"Software\AnyClipTest\" + Guid.NewGuid().ToString("N");
+        // Distinct parent from AutostartTests (which deletes Software\AnyClipTest):
+        // xUnit runs test classes in parallel, and tearing down a shared
+        // registry parent while the other class operates under it throws
+        // "key marked for deletion". A per-class parent removes the race.
+        const string parent = @"Software\AnyClipNotifTest";
+        var subKey = parent + @"\" + Guid.NewGuid().ToString("N");
         try
         {
             var settings = new NotificationSettings(subKey);
@@ -19,6 +24,6 @@ public class NotificationSettingsTests
             settings.Enabled = false;
             Assert.False(settings.Enabled);
         }
-        finally { Registry.CurrentUser.DeleteSubKeyTree(@"Software\AnyClipTest", false); }
+        finally { Registry.CurrentUser.DeleteSubKeyTree(parent, false); }
     }
 }
