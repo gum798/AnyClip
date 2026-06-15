@@ -26,16 +26,24 @@ public sealed class MdnsBeacon : IMdnsService
     private int _port;
     private (string[] Keys, string[] Values)? _txt;
 
-    // DnsServiceDeRegister completes asynchronously through the register
-    // callback (its goodbye packets still reference the instance); freeing
-    // the instance before that callback lands is a native use-after-free.
+    // DnsServiceDeRegister completes asynchronously (its goodbye packets
+    // still reference the instance); freeing the instance before that
+    // completion lands is a native use-after-free. The deregister completion
+    // is delivered to a DEDICATED callback (_deregCb) — distinct from the
+    // register-completion callback — so a late register completion arriving
+    // mid-deregister can never be mistaken for the deregister completion and
+    // free the instance early. (That confusion was the prior race: a single
+    // shared callback + a `_deregistering` flag could not tell the two
+    // completions apart, and Refresh() issues a deregister right after a
+    // register, so the register completion was routinely still in flight.)
     private readonly ManualResetEventSlim _deregDone = new(false);
-    private volatile bool _deregistering;
 
     // Rooted delegates (see class doc) — never reassigned.
     private readonly DnsApi.DnsServiceRegisterCallback _registerCb;
+    private readonly DnsApi.DnsServiceRegisterCallback _deregCb;
     private readonly DnsApi.DnsServiceBrowseCallback _browseCb;
     private readonly List<DnsApi.DnsServiceResolveCallback> _resolveCbs = new();
+    private DnsApi.DNS_SERVICE_REGISTER_REQUEST _deregisterRequest;
 
     public string? AdvertisedIp { get; private set; }
 
@@ -47,11 +55,16 @@ public sealed class MdnsBeacon : IMdnsService
             // The callback owns this instance copy and must free it
             // (DNS_SERVICE_REGISTER_COMPLETE contract).
             if (pInstance != IntPtr.Zero) DnsApi.DnsServiceFreeInstance(pInstance);
-            if (_deregistering) { _deregDone.Set(); return; }
             if (status != DnsApi.ERROR_SUCCESS)
                 RotatingLog.Shared.Warning($"mDNS register completed with status {status}");
             else
                 RotatingLog.Shared.Info($"mDNS advertised as {_fullName}");
+        };
+        _deregCb = (_, _, pInstance) =>
+        {
+            // Deregister completion: free this copy, then release the waiter.
+            if (pInstance != IntPtr.Zero) DnsApi.DnsServiceFreeInstance(pInstance);
+            _deregDone.Set();
         };
         _browseCb = (status, _, pRecord) =>
         {
@@ -108,7 +121,6 @@ public sealed class MdnsBeacon : IMdnsService
     private void Register()
     {
         if (_instanceName is null || _txt is null) return;
-        _deregistering = false;
         string host = $"{Environment.MachineName}.local";
         _fullName = $"{_instanceName}.{Wire.ServiceType}.local";
         _instance = DnsApi.DnsServiceConstructInstance(
@@ -253,26 +265,33 @@ public sealed class MdnsBeacon : IMdnsService
         DeregisterAndFreeInstance();
     }
 
-    /// Deregister, wait for the async completion callback, and only then
-    /// free the instance: DnsServiceDeRegister returns DNS_REQUEST_PENDING
-    /// (9506) and its goodbye packets reference pServiceInstance, so
-    /// freeing early is a native use-after-free that can corrupt the heap
-    /// inside dnsapi.dll. Blocking here is fine — callers run on
-    /// daemon/threadpool continuations (Daemon.RunOnceAsync finally,
-    /// watchdog Refresh), never the STA UI thread, and the dereg callback
-    /// arrives on a dnsapi worker thread. This path is hit on every
-    /// watchdog-induced daemon restart, after which the next Register()
-    /// starts from a clean state.
+    /// Deregister, wait (bounded) for the dedicated deregister-completion
+    /// callback, and only then free the instance: DnsServiceDeRegister
+    /// returns DNS_REQUEST_PENDING (9506) and its goodbye packets reference
+    /// pServiceInstance, so freeing early is a native use-after-free that can
+    /// corrupt the heap inside dnsapi.dll. The wait is bounded to 2 s and the
+    /// call path NEVER blocks unbounded, so a stuck/slow dnsapi can never
+    /// wedge a daemon restart — the worst case is one leaked instance.
+    /// Blocking up to 2 s is fine: callers run on daemon/threadpool
+    /// continuations (Daemon.RunOnceAsync finally, watchdog Refresh), never
+    /// the STA UI thread, and the dereg callback arrives on a dnsapi worker
+    /// thread. This path is hit on every watchdog-induced daemon restart,
+    /// after which the next Register() starts from a clean state.
     private void DeregisterAndFreeInstance()
     {
         if (_registered)
         {
             _deregDone.Reset();
-            _deregistering = true;
-            int rc = DnsApi.DnsServiceDeRegister(ref _registerRequest, IntPtr.Zero);
+            // Deregister with a DEDICATED completion callback. Copy the
+            // registered request (carries pServiceInstance/Version/Interface)
+            // and swap only the callback so the deregister completion lands on
+            // _deregCb, never on _registerCb — removing the register-vs-dereg
+            // confusion that previously freed the instance early.
+            _deregisterRequest = _registerRequest;
+            _deregisterRequest.pRegisterCompletionCallback = _deregCb;
+            int rc = DnsApi.DnsServiceDeRegister(ref _deregisterRequest, IntPtr.Zero);
             bool done = rc != 9506 /* DNS_REQUEST_PENDING */
                 || _deregDone.Wait(TimeSpan.FromSeconds(2));
-            _deregistering = false;
             _registered = false;
             if (!done)
             {

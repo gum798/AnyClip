@@ -261,3 +261,29 @@ existence and is only set on successful write.
   tray-menu item (HKCU\Software\AnyClip, app-local); the default sync
   feedback is a 10-frame accent-blue arc-orbit pulse of the tray icon
   (0.4 s, coalescing) — parity with the macOS menu-bar pulse.
+
+## Post-merge amendments (2026-06-15)
+
+- **MdnsBeacon deregister race fixed.** dnsapi delivers both the register
+  and deregister completions through the request's
+  `pRegisterCompletionCallback`. The original single-shared-callback +
+  `_deregistering` flag could not tell the two apart, and `Refresh()`
+  issues a deregister right after a register, so a still-in-flight register
+  completion would prematurely signal "deregister done" → the instance was
+  freed while the deregister's goodbye packets still referenced it (native
+  use-after-free in dnsapi). This is the suspected cause of a field incident
+  where the Windows tray stayed up but the daemon's listener/mDNS wedged
+  after the idle-watchdog's Refresh×3 → bounce cycle (the macOS peer saw the
+  link drop with no recovery; direct TCP to the Windows host returned RST,
+  i.e. no listener, while the host itself was reachable). Fix: a **dedicated
+  deregister-completion callback** (`_deregCb`, separately rooted) used via a
+  copied `_deregisterRequest` with only the callback swapped, so register and
+  deregister completions can never be confused. The wait stays bounded (2 s,
+  leak-on-timeout), so a slow/stuck dnsapi can never wedge a daemon restart.
+  Residual low-severity race: if a deregister stalls past the 2 s timeout and
+  a *subsequent* Refresh/Stop lands in the narrow Reset→Wait window, the
+  stale callback could satisfy the next wait early — same risk class as the
+  pre-existing accepted leak-on-timeout; closeable later with a generation
+  guard. **Runtime verification is the Windows manual gate** (provoke the
+  Refresh×3 → bounce cycle and confirm no dnsapi crash, both re-announce log
+  lines, and remote rediscovery).
