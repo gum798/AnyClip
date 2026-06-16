@@ -62,10 +62,22 @@ public final class FramedConnection: @unchecked Sendable {
 
     public func sendFrame(_ message: WireMessage) async throws {
         let data = try message.encodeFrame()
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error { cont.resume(throwing: error) } else { cont.resume() }
-            })
+        // Same non-cancellable hazard as receiveSome: a send parked on a full
+        // TCP buffer (wedged/throttled peer) would otherwise ignore task
+        // cancellation and stall a structured shutdown. Cancel the connection
+        // on cancel so the send completion fires; resumed-guard the
+        // exactly-once resume against a completion/cancel race.
+        let resumed = Locked(false)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<Void, Error>) in
+                connection.send(content: data, completion: .contentProcessed { error in
+                    if resumed.exchange(true) { return }
+                    if let error { cont.resume(throwing: error) } else { cont.resume() }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
         }
     }
 
