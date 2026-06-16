@@ -85,3 +85,37 @@ private func startLoopbackListener(
     defer { client.cancel() }
     #expect(client.remoteIP == "127.0.0.1")
 }
+
+// Regression: a parked receive (peer connected, sending nothing) must wake
+// up when its Task is cancelled. Without cancellation wired into
+// NWConnection.receive, the continuation never resumes, so a structured
+// task-group shutdown — i.e. app quit WHILE LINKED — deadlocks and the app
+// never terminates.
+@Test func receiveMessageHonorsCancellation() async throws {
+    let port: UInt16 = 28464
+    let listener = try startLoopbackListener(port: port) { conn in
+        conn.start(queue: .global()) // accept, then send nothing
+    }
+    defer { listener.cancel() }
+    let client = FramedConnection.outbound(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!))
+    try await client.start()
+    defer { client.cancel() }
+
+    let receiveTask = Task { try await client.receiveMessage() }
+    try await Task.sleep(nanoseconds: 200_000_000) // let it park in receive
+    receiveTask.cancel()
+
+    // Race the task's completion against a 2 s deadline: true = it woke up
+    // and finished (cancellation honored), false = it hung past the deadline.
+    let finished = await withTaskGroup(of: Bool.self) { group in
+        group.addTask { _ = try? await receiveTask.value; return true }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: 2_000_000_000); return false
+        }
+        let first = await group.next()!
+        group.cancelAll()
+        return first
+    }
+    #expect(finished)
+}

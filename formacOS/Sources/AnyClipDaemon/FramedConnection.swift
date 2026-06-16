@@ -94,16 +94,30 @@ public final class FramedConnection: @unchecked Sendable {
     }
 
     private func receiveSome(max: Int) async throws -> Data {
-        try await withCheckedThrowingContinuation { cont in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: max) {
-                content, _, isComplete, error in
-                if let error { cont.resume(throwing: error); return }
-                if let content, !content.isEmpty {
-                    cont.resume(returning: content)
-                    return
+        // NWConnection.receive's continuation is otherwise non-cancellable:
+        // a parked receive (linked, peer idle) never resumes on task
+        // cancellation, so a structured task-group shutdown — app quit while
+        // LINKED — deadlocks. withTaskCancellationHandler cancels the
+        // connection on cancel, which completes the pending receive (with an
+        // error) and resumes the continuation. `resumed` guards the
+        // exactly-once resume against a data/cancel race.
+        let resumed = Locked(false)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<Data, Error>) in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: max) {
+                    content, _, _, error in
+                    if resumed.exchange(true) { return }
+                    if let error { cont.resume(throwing: error); return }
+                    if let content, !content.isEmpty {
+                        cont.resume(returning: content)
+                        return
+                    }
+                    cont.resume(throwing: WireConnectionError.closed) // EOF
                 }
-                cont.resume(throwing: WireConnectionError.closed) // EOF
             }
+        } onCancel: {
+            connection.cancel()
         }
     }
 
