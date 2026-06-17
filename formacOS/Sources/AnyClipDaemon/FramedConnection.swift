@@ -23,6 +23,10 @@ public final class FramedConnection: @unchecked Sendable {
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 15
+        // Actually probe after idle: ~15s idle + 4×5s unanswered = ~35s for the
+        // OS to tear down a dead peer, as a backstop to the app-layer heartbeat.
+        tcp.keepaliveCount = 4
+        tcp.keepaliveInterval = 5
         tcp.connectionTimeout = 5
         let params = NWParameters(tls: nil, tcp: tcp)
         return FramedConnection(connection: NWConnection(to: endpoint, using: params))

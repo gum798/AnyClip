@@ -23,13 +23,28 @@ public static class Watchdogs
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
     private static double MonotonicNow() => Clock.Elapsed.TotalSeconds;
 
+    /// App-layer heartbeat while linked. Two jobs:
+    ///  1. Ping every interval, so an actively broken socket surfaces as a
+    ///     send failure + EOF.
+    ///  2. Enforce a liveness deadline. A half-open socket — the peer slept or
+    ///     vanished without RST/FIN — accepts our pings silently and never
+    ///     delivers EOF, so the parked receive idles forever and the link is a
+    ///     permanent zombie. Detection can't rely on send failures; we require
+    ///     inbound traffic (the peer pongs our pings). If nothing arrives for
+    ///     interval * deadFactor, the link is dead — drop it so the reconnect
+    ///     loop runs. (Field bug: a Mac held a dead link for ~50 min after its
+    ///     peer slept, which made the peer idle-bounce forever.)
     public static async Task LinkPingLoopAsync(
-        PeerLink link, double intervalSeconds, CancellationToken ct)
+        PeerLink link, double intervalSeconds, CancellationToken ct, double deadFactor = 3)
     {
         while (true)
         {
             await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), ct);
-            if (link.IsActive) await link.SendPingAsync();
+            if (!link.IsActive) continue;
+            await link.SendPingAsync();
+            var idle = link.SecondsSinceInbound();
+            if (idle is double s && s > intervalSeconds * deadFactor)
+                link.DropStaleLink(s);
         }
     }
 

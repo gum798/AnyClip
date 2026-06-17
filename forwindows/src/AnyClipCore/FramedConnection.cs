@@ -46,6 +46,10 @@ public sealed class FramedConnection : IDisposable
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
             socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);
             socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
+            // Bound the probe count so the OS actually tears a dead peer down
+            // (~15s idle + 4×5s ≈ 35s) as a backstop to the app-layer heartbeat,
+            // instead of probing indefinitely.
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 4);
         }
         catch (SocketException) { /* best effort, like the other ports */ }
     }

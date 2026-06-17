@@ -35,6 +35,11 @@ public actor PeerLink {
     private var peerNodeID: String?
     public private(set) var peerName: String?
     private var linkedAt: Double = 0
+    /// Monotonic timestamp of the last inbound frame on the active link. Drives
+    /// half-open detection: a peer that slept or vanished without RST/FIN keeps
+    /// the socket "writable" (our pings never error) yet sends nothing back, so
+    /// staleness can only be judged from inbound silence, not send failures.
+    private var lastInboundAt: Double = 0
     private var connecting: Set<String> = []
 
     private var listener: NWListener?
@@ -105,6 +110,10 @@ public actor PeerLink {
             let tcp = NWProtocolTCP.Options()
             tcp.enableKeepalive = true
             tcp.keepaliveIdle = 15
+            // Backstop to the app-layer heartbeat: actually probe a silent peer
+            // (~15s idle + 4×5s unanswered ≈ 35s) instead of idling forever.
+            tcp.keepaliveCount = 4
+            tcp.keepaliveInterval = 5
             let params = NWParameters(tls: nil, tcp: tcp)
             params.allowLocalEndpointReuse = true
             let candidate: NWListener
@@ -298,6 +307,7 @@ public actor PeerLink {
         let displayName = (hello.name?.isEmpty == false) ? hello.name! : String(peerID.prefix(8))
         peerName = displayName
         linkedAt = monotonicNow()
+        lastInboundAt = monotonicNow()
         AnyLog.shared.info(
             "linked with peer name=\(displayName) id=\(peerID.prefix(8)) "
             + "(\(inbound ? "inbound" : "outbound")) "
@@ -313,6 +323,9 @@ public actor PeerLink {
             } catch {
                 break
             }
+            // Any inbound frame (clip, ping, pong) proves the peer is alive;
+            // refresh the liveness clock for the heartbeat deadline.
+            if activeConn === framed { lastInboundAt = monotonicNow() }
             guard let m = msg else { break }
             switch m.type {
             case "clip":
@@ -378,6 +391,25 @@ public actor PeerLink {
         } catch {
             AnyLog.shared.info("send failed (link likely down): \(error)")
         }
+    }
+
+    /// Seconds since the last inbound frame on the active link, or nil if not
+    /// linked. The heartbeat loop compares this against its deadline.
+    public func secondsSinceInbound() -> Double? {
+        activeConn == nil ? nil : monotonicNow() - lastInboundAt
+    }
+
+    /// Drop a link that has gone silent — half-open socket: the peer slept or
+    /// vanished without RST/FIN, so our sends never error and the parked
+    /// receive never wakes. Cancelling the connection wakes that receive, the
+    /// session loop tears down (clearing activeConn/peer state) and the
+    /// reconnect loop takes over. No-op if already unlinked.
+    public func dropStaleLink(idleSeconds: Double) {
+        guard let conn = activeConn else { return }
+        AnyLog.shared.info(
+            "link to \(peerName ?? "?") idle \(Int(idleSeconds))s with no inbound "
+            + "(peer likely asleep / half-open); dropping to force reconnect")
+        conn.cancel()
     }
 
     public func sendClip(_ payload: ClipPayload) async {

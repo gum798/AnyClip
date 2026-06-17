@@ -13,12 +13,27 @@ func sleepSeconds(_ seconds: Double) async throws {
     try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
 }
 
-/// App-layer ping every `interval` seconds while linked, so a silently-dead
-/// TCP socket surfaces as a send failure instead of idling for hours.
-public func linkPingLoop(link: PeerLink, interval: Double = 30) async throws {
+/// App-layer heartbeat while linked. Two jobs:
+///  1. Ping every `interval`s, so an *actively broken* socket surfaces as a
+///     send failure + EOF.
+///  2. Enforce a liveness deadline. A half-open socket — the peer slept or
+///     vanished without RST/FIN — accepts our pings silently and never
+///     delivers EOF, so the parked receive idles forever and the link is a
+///     permanent zombie. Detection therefore can't rely on send failures; we
+///     require *inbound* traffic (the peer pongs our pings). If nothing
+///     arrives for `interval * deadFactor`, the link is dead — drop it so the
+///     reconnect loop runs. (Field bug: a Mac held a dead link for ~50 min
+///     after its peer slept, which in turn made the peer idle-bounce forever.)
+public func linkPingLoop(
+    link: PeerLink, interval: Double = 30, deadFactor: Double = 3
+) async throws {
     while true {
         try await sleepSeconds(interval)
-        if await link.isActive { await link.sendPing() }
+        guard await link.isActive else { continue }
+        await link.sendPing()
+        if let idle = await link.secondsSinceInbound(), idle > interval * deadFactor {
+            await link.dropStaleLink(idleSeconds: idle)
+        }
     }
 }
 

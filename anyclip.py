@@ -1098,6 +1098,11 @@ class PeerLink:
         self._peer_node_id: Optional[str] = None
         self._peer_name: Optional[str] = None  # peer's display name (from hello)
         self._linked_at: float = 0.0  # monotonic time when _writer was last set
+        # Monotonic time of the last inbound frame on the active link. Drives
+        # half-open detection: a peer that slept or vanished without RST/FIN
+        # keeps the socket writable (our pings never error) yet sends nothing
+        # back, so staleness can only be judged from inbound silence.
+        self._last_inbound: float = 0.0
         self._lock = asyncio.Lock()
         self._token_hash = sha256_hex(config.token)
         self._auth_gate = AuthGate()
@@ -1345,6 +1350,7 @@ class PeerLink:
             self._peer_node_id = peer_id
             self._peer_name = hello.get("name") or peer_id[:8]
             self._linked_at = time.monotonic()
+            self._last_inbound = time.monotonic()
 
         log.info(
             f"linked with peer name={hello.get('name')!r} "
@@ -1362,6 +1368,10 @@ class PeerLink:
                 msg = await self._recv(reader)
                 if msg is None:
                     break
+                # Any inbound frame proves the peer is alive; refresh the
+                # liveness clock for the heartbeat deadline.
+                if self._writer is writer:
+                    self._last_inbound = time.monotonic()
                 msg_type = msg.get("type")
                 if msg_type == "clip":
                     kind = msg.get("kind", "text")
@@ -1458,6 +1468,28 @@ class PeerLink:
         if writer is None or writer.is_closing():
             return
         await self._send(writer, {"type": "ping", "ts": time.time()})
+
+    def seconds_since_inbound(self) -> Optional[float]:
+        """Seconds since the last inbound frame on the active link, or None if
+        not linked. The heartbeat loop compares this against its deadline."""
+        if not self.active:
+            return None
+        return time.monotonic() - self._last_inbound
+
+    def drop_stale_link(self, idle_seconds: float) -> None:
+        """Drop a link gone silent -- half-open socket: the peer slept or
+        vanished without RST/FIN, so sends never error and _recv never
+        returns. Closing the writer makes the next _recv return None, the
+        session tears down (clearing the active link), and the reconnect loop
+        takes over. No-op if already unlinked."""
+        writer = self._writer
+        if writer is None:
+            return
+        log.info(
+            f"link to {self._peer_name!r} idle {int(idle_seconds)}s with no "
+            f"inbound (peer likely asleep / half-open); dropping to force reconnect"
+        )
+        self._safe_close(writer)
 
     async def send_clip(self, kind: str, content) -> None:
         """Send a clipboard payload. kind=='text' expects str, kind=='image'
@@ -1750,18 +1782,30 @@ async def idle_link_watchdog(
             )
 
 
-async def link_ping_loop(link: "PeerLink", interval: float = 30.0) -> None:
-    """Send an app-layer ping on the active link every `interval` seconds.
+async def link_ping_loop(
+    link: "PeerLink", interval: float = 30.0, dead_factor: float = 3.0
+) -> None:
+    """App-layer heartbeat on the active link. Two jobs:
 
-    Drives traffic so a silently-dead TCP socket surfaces as a send
-    failure -- without this, on Windows the OS keepalive defaults to
-    ~2h and the link can sit half-dead for hours before either side
-    notices.
+    1. Ping every `interval`s, so an actively broken socket surfaces as a
+       send failure + EOF (on Windows the OS keepalive defaults to ~2h).
+    2. Enforce a liveness deadline. A half-open socket -- the peer slept or
+       vanished without RST/FIN -- accepts our pings silently and never
+       delivers EOF, so _recv parks forever and the link is a permanent
+       zombie. Detection can't rely on send failures; we require *inbound*
+       traffic (the peer pongs our pings). If nothing arrives for
+       `interval * dead_factor`, the link is dead -- drop it so the reconnect
+       loop runs. (Field bug: a Mac held a dead link for ~50 min after its
+       peer slept, which in turn made the peer idle-bounce forever.)
     """
     while True:
         await asyncio.sleep(interval)
-        if link.active:
-            await link.send_ping()
+        if not link.active:
+            continue
+        await link.send_ping()
+        idle = link.seconds_since_inbound()
+        if idle is not None and idle > interval * dead_factor:
+            link.drop_stale_link(idle)
 
 
 async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:

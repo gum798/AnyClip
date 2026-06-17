@@ -29,6 +29,11 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
     // would treat the first 1.5 s after startup as a simultaneous-connect
     // race even when no link was ever established.
     private double _linkedAt = double.NegativeInfinity;
+    // Monotonic timestamp of the last inbound frame on the active link. Drives
+    // half-open detection: a peer that slept or vanished without RST/FIN keeps
+    // the socket "writable" (our pings never error) yet sends nothing back, so
+    // staleness can only be judged from inbound silence, not send failures.
+    private double _lastInboundAt = double.NegativeInfinity;
     private TcpListener? _listener;
 
     public Func<ClipPayload, Task>? OnClip { get; set; }
@@ -274,6 +279,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
             _peerNodeId = peerId;
             PeerName = displayName;
             _linkedAt = MonotonicNow();
+            _lastInboundAt = MonotonicNow();
         }
         finally { _lock.Release(); }
 
@@ -297,6 +303,9 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
                 WireMessage? msg;
                 try { msg = await framed.ReceiveMessageAsync(ct); }
                 catch { break; }
+                // Any inbound frame proves the peer is alive; refresh the
+                // liveness clock for the heartbeat deadline.
+                if (ReferenceEquals(_activeConn, framed)) _lastInboundAt = MonotonicNow();
                 if (msg is null) break;
                 switch (msg.Type)
                 {
@@ -381,6 +390,26 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
         try { await conn.SendFrameAsync(WireMessage.Ping(UnixNow()), CancellationToken.None); }
         catch (Exception e)
         { RotatingLog.Shared.Info($"send failed (link likely down): {e.Message}"); }
+    }
+
+    /// Seconds since the last inbound frame on the active link, or null if not
+    /// linked. The heartbeat loop compares this against its deadline.
+    public double? SecondsSinceInbound()
+        => _activeConn is null ? null : MonotonicNow() - _lastInboundAt;
+
+    /// Drop a link that has gone silent — half-open socket: the peer slept or
+    /// vanished without RST/FIN, so our sends never error and the parked
+    /// receive never wakes. Disposing the connection wakes that receive, the
+    /// session loop tears down (clearing the active link) and the reconnect
+    /// loop takes over. No-op if already unlinked.
+    public void DropStaleLink(double idleSeconds)
+    {
+        var conn = _activeConn;
+        if (conn is null) return;
+        RotatingLog.Shared.Info(
+            $"link to {PeerName ?? "?"} idle {(int)idleSeconds}s with no inbound "
+            + "(peer likely asleep / half-open); dropping to force reconnect");
+        conn.Dispose();
     }
 
     public void Shutdown()

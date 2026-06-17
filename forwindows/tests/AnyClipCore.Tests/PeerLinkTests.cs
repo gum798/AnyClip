@@ -82,6 +82,37 @@ public class PeerLinkTests
         try { await serveA; } catch (OperationCanceledException) { }
     }
 
+    // Regression: a linked peer that goes silent — half-open TCP, i.e. the peer
+    // slept or vanished without sending RST/FIN — must be detected and dropped.
+    // On a half-open socket our sends never error and the parked receive never
+    // wakes, so without an inbound-traffic deadline the link is a permanent
+    // zombie (IsActive forever) and the daemon never reconnects.
+    [Fact]
+    public async Task StaleLinkDroppedWhenPeerGoesSilent()
+    {
+        var (a, _, _) = MakeLink("tok", 28617, "a");
+        using var cts = new CancellationTokenSource();
+        var serveA = a.ServeAsync(cts.Token);
+        Assert.True(await WaitUntil(() => a.IsServing));
+
+        // Raw peer completes the handshake, then goes completely silent: it
+        // never pongs our pings and sends no further frames.
+        using var raw = await FramedConnection.ConnectAsync("127.0.0.1", 28617, 5, cts.Token);
+        await raw.SendFrameAsync(WireMessage.Hello(
+            Hashing.Sha256Hex("tok"), "ffffffff-raw", "raw", "0.0.0-test"), cts.Token);
+        _ = await raw.ReceiveMessageAsync(cts.Token); // a's hello
+        Assert.True(await WaitUntil(() => a.IsActive));
+
+        // Heartbeat with a tight deadline: 3 missed 0.3s intervals = 0.9s of
+        // silence -> drop. The silent raw peer must be dropped within 5s.
+        var heartbeat = Watchdogs.LinkPingLoopAsync(a, 0.3, cts.Token, deadFactor: 3);
+        Assert.True(await WaitUntil(() => !a.IsActive));
+
+        cts.Cancel(); a.Shutdown();
+        try { await serveA; } catch (OperationCanceledException) { }
+        try { await heartbeat; } catch (OperationCanceledException) { }
+    }
+
     [Fact]
     public async Task PingAnsweredWithPongAndMajorMismatchRefused()
     {

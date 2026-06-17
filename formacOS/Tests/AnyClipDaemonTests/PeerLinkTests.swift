@@ -126,6 +126,41 @@ private func waitUntil(
     await a.shutdown()
 }
 
+// Regression: a linked peer that goes silent — half-open TCP, i.e. the peer
+// slept or vanished without sending RST/FIN — must be detected and dropped.
+// On a half-open socket our sends never error and the parked receive never
+// wakes, so without an inbound-traffic deadline the link is a permanent zombie
+// (isActive forever) and the daemon never reconnects. (Observed in the field:
+// a Mac held a dead link for ~50 min after the Windows peer slept.)
+@Test func staleLinkIsDroppedWhenPeerGoesSilent() async throws {
+    let clips = Locked<[ClipPayload]>([]); let events = Locked<[DaemonEvent]>([])
+    let a = await makeLink(token: "tok", port: 28479, name: "a",
+                           clips: clips, events: events)
+    let serveA = Task { try await a.serve() }
+    defer { serveA.cancel() }
+    #expect(await waitUntil { await a.isServing })
+
+    // Raw peer completes the handshake, then goes completely silent: it never
+    // pongs our pings and sends no further frames.
+    let raw = FramedConnection.outbound(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 28479)!))
+    try await raw.start()
+    defer { raw.cancel() }
+    try await raw.sendFrame(.hello(
+        tokenHash: sha256Hex("tok"), nodeID: "ffffffff-raw", name: "raw",
+        appVersion: "0.0.0-test"))
+    _ = try await withTimeout(seconds: 5) { try await raw.receiveMessage() } // a's hello
+    #expect(await waitUntil { await a.isActive })
+
+    // Heartbeat with a tight deadline: 3 missed 0.3s intervals = 0.9s of
+    // silence -> drop. The silent raw peer must be dropped well within 5s.
+    let heartbeat = Task { try await linkPingLoop(link: a, interval: 0.3, deadFactor: 3) }
+    defer { heartbeat.cancel() }
+
+    #expect(await waitUntil(5) { !(await a.isActive) })
+    await a.shutdown()
+}
+
 @Test func majorVersionMismatchIsRefused() async throws {
     let clips = Locked<[ClipPayload]>([]); let events = Locked<[DaemonEvent]>([])
     let a = await makeLink(token: "tok", port: 28476, name: "a",
