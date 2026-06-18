@@ -194,13 +194,24 @@ public sealed class Daemon(
         };
         try
         {
-            // asyncio.gather semantics: first fault wins, siblings drained.
+            // asyncio.gather semantics: first task to settle wins, siblings drained.
             var first = await Task.WhenAny(tasks);
             cts.Cancel();
             try { await Task.WhenAll(tasks); } catch { /* drained below */ }
             if (first.IsFaulted)
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo
                     .Capture(first.Exception!.InnerException ?? first.Exception!).Throw();
+            // A background task that settled WITHOUT the app asking to quit means
+            // the daemon lost a leg — e.g. on a Windows sleep/resume the OS aborts
+            // the listen socket and ServeAsync's accept loop returns RanToCompletion
+            // (not faulted). Treat any such non-quit completion as a restart
+            // trigger instead of letting RunOnceAsync return normally, which would
+            // silently exit the supervisor with tcp/24816 unbound (the field wedge:
+            // tray alive, listener dead, no recovery until manual relaunch). macOS/
+            // Python can't hit this because their serve() never returns normally.
+            if (!outerCt.IsCancellationRequested)
+                throw new DaemonRestartException(
+                    $"daemon task exited unexpectedly (status={first.Status}); bouncing daemon");
             outerCt.ThrowIfCancellationRequested();
         }
         finally

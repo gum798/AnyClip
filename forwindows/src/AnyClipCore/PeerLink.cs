@@ -94,9 +94,23 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
                 try { socket = await listener.AcceptSocketAsync(ct); }
                 catch (SocketException e) when (e.SocketErrorCode != SocketError.OperationAborted)
                 { continue; }                              // transient accept failure; listener still up
-                catch (SocketException) { break; }         // Stop()/Shutdown() aborted the pending accept
-                catch (ObjectDisposedException) { break; } // Stop() raced the await on some runtime paths
-                catch (InvalidOperationException) { break; } // listener stopped between iterations
+                catch (Exception e) when (
+                    e is SocketException or ObjectDisposedException or InvalidOperationException)
+                {
+                    // The listen socket was aborted/disposed. If we were NOT asked
+                    // to shut down, the OS killed it out from under us (sleep/resume
+                    // or a NIC reset), not a clean Stop()/Shutdown(). Returning
+                    // normally here would let the supervisor's WhenAny see a
+                    // RanToCompletion serve task and silently exit with tcp/24816
+                    // unbound (the Windows wedge). Throw the restart sentinel so the
+                    // supervisor rebinds — matching macOS/Python, whose serve() can
+                    // only exit via cancellation or a thrown restart.
+                    if (!ct.IsCancellationRequested)
+                        throw new DaemonRestartException(
+                            $"listener accept aborted ({e.GetType().Name}); rebinding daemon "
+                            + "(likely sleep/resume or network change)");
+                    break;                                 // genuine shutdown
+                }
                 _ = Task.Run(() => HandleInboundAsync(socket, ct), ct);
             }
         }

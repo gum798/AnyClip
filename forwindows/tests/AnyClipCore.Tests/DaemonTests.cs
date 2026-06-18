@@ -16,6 +16,23 @@ internal sealed class FakeClipboard : IClipboardSync
     }
 }
 
+/// Clipboard whose RunAsync returns immediately (RanToCompletion) — stands in
+/// for a daemon background task that ends unexpectedly while the app was not
+/// asked to quit (the Windows sleep/resume case where the listener accept loop
+/// returned normally and the supervisor silently exited).
+internal sealed class CompletingClipboard : IClipboardSync
+{
+    public Func<ClipPayload, Task>? OnLocalChange { get; set; }
+    public Func<string, Task>? OnFileSkipped { get; set; }
+    public int RunCalls;
+    public Task RunAsync(CancellationToken ct)
+    {
+        Interlocked.Increment(ref RunCalls);
+        return Task.CompletedTask;
+    }
+    public Task<bool> ApplyRemoteAsync(ClipPayload payload) => Task.FromResult(true);
+}
+
 internal sealed class FakeMdns : IMdnsService
 {
     public string? AdvertisedIp => "127.0.0.1";
@@ -82,6 +99,39 @@ public class DaemonTests
         await run; // RunForeverAsync swallows cancellation and returns
         Assert.True(pid.Released);
         Assert.True(mdns.Stopped);
+    }
+
+    [Fact]
+    public async Task DaemonRestartsWhenABackgroundTaskExitsUnexpectedly()
+    {
+        // Regression: a background task that completes RanToCompletion (here the
+        // clipboard loop) while the app was NOT asked to quit must bounce the
+        // daemon, not silently exit the supervisor with a dead listener. Field
+        // bug: on Windows sleep/resume the listener accept loop returned
+        // normally and the IsFaulted-only supervisor treated it as a clean
+        // shutdown, wedging the daemon (tray up, tcp/24816 dead) for ~18 min
+        // until a manual relaunch.
+        var stateDir = Path.Combine(Path.GetTempPath(), "anyclip-restart-" + Guid.NewGuid());
+        var clip = new CompletingClipboard();
+        var daemon = new Daemon(
+            new DaemonConfig("test-token", 28623, "daemon-test", NotificationsEnabled: false),
+            appVersion: "0.0.0-test", stateDir: stateDir,
+            clipboard: clip, mdns: new FakeMdns(), pidLock: new FakePidLock(),
+            primaryIPv4: () => "127.0.0.1",
+            notify: (_, _) => { }, onFatal: _ => { });
+
+        using var cts = new CancellationTokenSource();
+        var run = daemon.RunForeverAsync(cts.Token);
+        // Each RunOnceAsync calls clipboard.RunAsync once; a restart calls it
+        // again. Without the fix RunCalls sticks at 1 (supervisor exits).
+        var deadline = DateTime.UtcNow.AddSeconds(8);
+        while (DateTime.UtcNow < deadline && Volatile.Read(ref clip.RunCalls) < 2)
+            await Task.Delay(50);
+        Assert.True(Volatile.Read(ref clip.RunCalls) >= 2,
+            $"daemon should restart after a task exits unexpectedly; RunAsync calls={clip.RunCalls}");
+
+        cts.Cancel();
+        try { await run; } catch (OperationCanceledException) { }
     }
 
     [Fact]
