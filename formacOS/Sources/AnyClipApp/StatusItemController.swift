@@ -29,15 +29,35 @@ final class StatusItemController: NSObject {
     /// Called when the user turns notifications ON (AppDelegate runs the
     /// permission request lazily so default-off users never see the prompt).
     private let onNotificationsEnabled: () -> Void
+    private let appVersion: String
+    private let onCheckUpdates: () async -> UpdateStatus
+    private let onInstallUpdate: () -> Void
+    private let onOpenReleases: () -> Void
+    private let versionItem: NSMenuItem
+    private let checkUpdatesItem = NSMenuItem(
+        title: "Check for Updates", action: nil, keyEquivalent: "")
+    private enum UpdateMode { case idle, available(String), failed }
+    private var updateMode: UpdateMode = .idle
+    private var updateResetTimer: Timer?
 
     init(
         logFileURL: URL,
+        appVersion: String,
         onNotificationsEnabled: @escaping () -> Void,
+        onCheckUpdates: @escaping () async -> UpdateStatus,
+        onInstallUpdate: @escaping () -> Void,
+        onOpenReleases: @escaping () -> Void,
         onQuit: @escaping () -> Void
     ) {
         self.logFileURL = logFileURL
+        self.appVersion = appVersion
         self.onNotificationsEnabled = onNotificationsEnabled
+        self.onCheckUpdates = onCheckUpdates
+        self.onInstallUpdate = onInstallUpdate
+        self.onOpenReleases = onOpenReleases
         self.onQuit = onQuit
+        versionItem = NSMenuItem(
+            title: "AnyClip v\(appVersion)", action: nil, keyEquivalent: "")
         statusItem = NSStatusBar.system.statusItem(
             withLength: NSStatusItem.variableLength)
         startAtLoginItem = NSMenuItem(
@@ -49,6 +69,9 @@ final class StatusItemController: NSObject {
         statusMenuItem.isEnabled = false
         lastSyncItem.isEnabled = false
         menu.autoenablesItems = false
+        versionItem.isEnabled = false
+        checkUpdatesItem.action = #selector(checkUpdates)
+        checkUpdatesItem.target = self
 
         let tokenItem = NSMenuItem(
             title: "Token…", action: #selector(showTokenInfo), keyEquivalent: "")
@@ -66,6 +89,8 @@ final class StatusItemController: NSObject {
             title: "Quit", action: #selector(quit), keyEquivalent: "")
         quitItem.target = self
 
+        menu.addItem(versionItem)
+        menu.addItem(.separator())
         menu.addItem(statusMenuItem)
         menu.addItem(lastSyncItem)
         menu.addItem(.separator())
@@ -73,6 +98,7 @@ final class StatusItemController: NSObject {
         menu.addItem(startAtLoginItem)
         menu.addItem(notificationsItem)
         menu.addItem(openLogsItem)
+        menu.addItem(checkUpdatesItem)
         menu.addItem(.separator())
         menu.addItem(quitItem)
         statusItem.menu = menu
@@ -307,6 +333,75 @@ final class StatusItemController: NSObject {
         guard let item = lanSettingsItem else { return }
         menu.removeItem(item)
         lanSettingsItem = nil
+    }
+
+    // ---- updates --------------------------------------------------------
+
+    @objc private func checkUpdates() {
+        switch updateMode {
+        case .available(let v):
+            let confirm = NSAlert()
+            confirm.messageText = "Update to v\(v)?"
+            confirm.informativeText = "AnyClip will close, update via Homebrew, and reopen."
+            confirm.addButton(withTitle: "Update")
+            confirm.addButton(withTitle: "Cancel")
+            guard confirm.runModal() == .alertFirstButtonReturn else { return }
+            onInstallUpdate()           // caller spawns helper + quits
+            return
+        case .failed:
+            onOpenReleases()
+            setUpdateMode(.idle)
+            checkUpdatesItem.title = "Check for Updates"
+            return
+        case .idle:
+            break
+        }
+        checkUpdatesItem.title = "Checking…"
+        checkUpdatesItem.isEnabled = false
+        Task { @MainActor in
+            let status = await onCheckUpdates()
+            applyUpdateStatus(status, silent: false)
+        }
+    }
+
+    /// Best-effort check on launch: only surface an available update; never
+    /// show "up to date"/"failed" and never pop a dialog.
+    func runSilentUpdateCheck() {
+        Task { @MainActor in
+            let status = await onCheckUpdates()
+            if case .available = status { applyUpdateStatus(status, silent: true) }
+        }
+    }
+
+    private func applyUpdateStatus(_ status: UpdateStatus, silent: Bool) {
+        checkUpdatesItem.isEnabled = true
+        switch status {
+        case .upToDate(let cur):
+            setUpdateMode(.idle)
+            checkUpdatesItem.title = "You're up to date (v\(cur))"
+            scheduleUpdateLabelReset()
+        case .available(let latest, _):
+            setUpdateMode(.available(latest))
+            checkUpdatesItem.title = "Update to v\(latest)"
+        case .failed:
+            if silent { return }
+            setUpdateMode(.failed)
+            checkUpdatesItem.title = "Check failed — open releases"
+        }
+    }
+
+    private func setUpdateMode(_ mode: UpdateMode) { updateMode = mode }
+
+    private func scheduleUpdateLabelReset() {
+        updateResetTimer?.invalidate()
+        updateResetTimer = Timer.scheduledTimer(
+            withTimeInterval: 3, repeats: false
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, case .idle = self.updateMode else { return }
+                self.checkUpdatesItem.title = "Check for Updates"
+            }
+        }
     }
 
     @objc private func quit() {

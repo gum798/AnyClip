@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var daemon: Daemon?
     private var daemonTask: Task<Void, Never>?
     private let notifier = Notifier()
+    private var updateService: UpdateService?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let stateDir = FileManager.default.homeDirectoryForCurrentUser
@@ -59,10 +60,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             })
         self.daemon = daemon
 
+        let updateService = UpdateService(appVersion: appVersion)
+        self.updateService = updateService
+
         controller = StatusItemController(
             logFileURL: logURL,
+            appVersion: appVersion,
             onNotificationsEnabled: { [notifier] in notifier.setup() },
+            onCheckUpdates: { await updateService.check() },
+            onInstallUpdate: { [weak self] in
+                self?.updateService?.installAndRelaunch()
+                self?.quitGracefully()
+            },
+            onOpenReleases: { updateService.openReleasesPage() },
             onQuit: { [weak self] in self?.quitGracefully() })
+        controller?.runSilentUpdateCheck()
 
         daemonTask = Task { await daemon.runForever() }
 
