@@ -20,9 +20,13 @@ final class UpdateService {
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.timeoutInterval = 8
         let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+        guard let http = resp as? HTTPURLResponse else {
             throw NSError(domain: "AnyClip", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "GitHub returned a non-200 status"])
+                userInfo: [NSLocalizedDescriptionKey: "GitHub returned a non-HTTP response"])
+        }
+        guard http.statusCode == 200 else {
+            throw NSError(domain: "AnyClip", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "GitHub returned HTTP \(http.statusCode)"])
         }
         return String(decoding: data, as: UTF8.self)
     }

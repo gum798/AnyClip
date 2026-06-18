@@ -26,7 +26,7 @@ public sealed class UpdateService(string appVersion)
     /// outlives us, runs `scoop update anyclip`, and relaunches the new exe.
     public void InstallAndRelaunch()
     {
-        string exe = Environment.ProcessPath ?? Application.ExecutablePath;
+        string exe = (Environment.ProcessPath ?? Application.ExecutablePath).Replace("'", "''");
         string script = UpdateCommand.WindowsHelperScript(
             Environment.ProcessId, "scoop", exe, UpdateChecker.ReleasesPageUrl);
         try

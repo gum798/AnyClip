@@ -32,6 +32,7 @@ public sealed class TrayIcon : IDisposable
     private enum UpdateMode { Idle, Available, Failed }
     private UpdateMode _updateMode = UpdateMode.Idle;
     private string? _availableVersion;
+    private bool _isCheckingUpdate;
 
     public TrayIcon(string logFile, NotificationSettings settings, string appVersion,
         Func<Task<UpdateStatus>> checkAsync, Action installUpdate, Action openReleases,
@@ -179,18 +180,30 @@ public sealed class TrayIcon : IDisposable
                 _checkUpdatesItem.Text = "Check for Updates";
                 return;
         }
+        if (_isCheckingUpdate) return;
+        _isCheckingUpdate = true;
         _checkUpdatesItem.Text = "Checking…";
         _checkUpdatesItem.Enabled = false;
-        var status = await _checkAsync();   // resumes on UI thread (WinForms sync context)
-        ApplyUpdateStatus(status, silent: false);
+        try
+        {
+            var status = await _checkAsync();   // resumes on UI thread (WinForms sync context)
+            ApplyUpdateStatus(status, silent: false);
+        }
+        finally { _isCheckingUpdate = false; }
     }
 
     /// Best-effort check on launch: only surface an available update; never
     /// show "up to date"/"failed" and never pop a dialog.
     public async Task RunSilentUpdateCheckAsync()
     {
-        var status = await _checkAsync();
-        if (status is UpdateStatus.Available) ApplyUpdateStatus(status, silent: true);
+        if (_isCheckingUpdate) return;
+        _isCheckingUpdate = true;
+        try
+        {
+            var status = await _checkAsync();
+            if (status is UpdateStatus.Available) ApplyUpdateStatus(status, silent: true);
+        }
+        finally { _isCheckingUpdate = false; }
     }
 
     private void ApplyUpdateStatus(UpdateStatus status, bool silent)

@@ -39,6 +39,7 @@ final class StatusItemController: NSObject {
     private enum UpdateMode { case idle, available(String), failed }
     private var updateMode: UpdateMode = .idle
     private var updateResetTimer: Timer?
+    private var isCheckingUpdate = false
 
     init(
         logFileURL: URL,
@@ -356,10 +357,13 @@ final class StatusItemController: NSObject {
         case .idle:
             break
         }
+        if isCheckingUpdate { return }
+        isCheckingUpdate = true
         checkUpdatesItem.title = "Checking…"
         checkUpdatesItem.isEnabled = false
         Task { @MainActor in
             let status = await onCheckUpdates()
+            isCheckingUpdate = false
             applyUpdateStatus(status, silent: false)
         }
     }
@@ -367,8 +371,11 @@ final class StatusItemController: NSObject {
     /// Best-effort check on launch: only surface an available update; never
     /// show "up to date"/"failed" and never pop a dialog.
     func runSilentUpdateCheck() {
+        if isCheckingUpdate { return }
+        isCheckingUpdate = true
         Task { @MainActor in
             let status = await onCheckUpdates()
+            isCheckingUpdate = false
             if case .available = status { applyUpdateStatus(status, silent: true) }
         }
     }
