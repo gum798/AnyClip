@@ -43,7 +43,10 @@ internal static class Program
         }
 
         var notificationSettings = new NotificationSettings();
-        tray = new TrayIcon(logFile, notificationSettings, Quit);
+        var updateService = new UpdateService(appVersion);
+        void InstallUpdate() { updateService.InstallAndRelaunch(); Quit(); }
+        tray = new TrayIcon(logFile, notificationSettings, appVersion,
+            updateService.CheckAsync, InstallUpdate, updateService.OpenReleasesPage, Quit);
         var notifier = new Notifier(tray.Notify);
 
         // STA invoker: a hidden UI-thread control all clipboard access AND
@@ -103,6 +106,12 @@ internal static class Program
                 uiContext.Post(_ => tray.Apply(snapshot), null);
             }
         });
+
+        staInvoker.BeginInvoke(new Action(async () =>
+        {
+            try { await tray.RunSilentUpdateCheckAsync(); }
+            catch (Exception e) { RotatingLog.Shared.Warning($"silent update check failed: {e.Message}"); }
+        }));
 
         Application.Run();
     }

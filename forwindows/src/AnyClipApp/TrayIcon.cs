@@ -23,12 +23,27 @@ public sealed class TrayIcon : IDisposable
     private readonly Icon[] _pulseFrames;
     private int _pulseFrame;
     private PeerUiState _currentState = PeerUiState.Initial;
+    private readonly ToolStripMenuItem _versionItem;
+    private readonly ToolStripMenuItem _checkUpdatesItem = new("Check for Updates");
+    private readonly System.Windows.Forms.Timer _updateResetTimer = new() { Interval = 3000 };
+    private readonly Func<Task<UpdateStatus>> _checkAsync;
+    private readonly Action _installUpdate;
+    private readonly Action _openReleases;
+    private enum UpdateMode { Idle, Available, Failed }
+    private UpdateMode _updateMode = UpdateMode.Idle;
+    private string? _availableVersion;
 
-    public TrayIcon(string logFile, NotificationSettings settings, Action onQuit)
+    public TrayIcon(string logFile, NotificationSettings settings, string appVersion,
+        Func<Task<UpdateStatus>> checkAsync, Action installUpdate, Action openReleases,
+        Action onQuit)
     {
         _logFile = logFile;
         _settings = settings;
+        _checkAsync = checkAsync;
+        _installUpdate = installUpdate;
+        _openReleases = openReleases;
         _onQuit = onQuit;
+        _versionItem = new ToolStripMenuItem($"AnyClip v{appVersion}") { Enabled = false };
         _baseIcon = LoadBaseIcon();
         _attentionIcon = Tint(_baseIcon, bang: false);
         _errorIcon = Tint(_baseIcon, bang: true);
@@ -43,6 +58,12 @@ public sealed class TrayIcon : IDisposable
             }
             Notify.Icon = _pulseFrames[_pulseFrame++];
         };
+        _updateResetTimer.Tick += (_, _) =>
+        {
+            _updateResetTimer.Stop();
+            if (_updateMode == UpdateMode.Idle) _checkUpdatesItem.Text = "Check for Updates";
+        };
+        _checkUpdatesItem.Click += async (_, _) => await OnCheckUpdatesClickAsync();
 
         var menu = new ContextMenuStrip();
         var tokenItem = new ToolStripMenuItem("Token…", null, (_, _) => Dialogs.TokenFlow(_onQuit));
@@ -57,6 +78,8 @@ public sealed class TrayIcon : IDisposable
         var openLogsItem = new ToolStripMenuItem("Open Logs", null, (_, _) => OpenLogs());
         var quitItem = new ToolStripMenuItem("Quit", null, (_, _) => _onQuit());
 
+        menu.Items.Add(_versionItem);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_statusItem);
         menu.Items.Add(_lastSyncItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -64,6 +87,7 @@ public sealed class TrayIcon : IDisposable
         menu.Items.Add(_startAtLoginItem);
         menu.Items.Add(_notificationsItem);
         menu.Items.Add(openLogsItem);
+        menu.Items.Add(_checkUpdatesItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(quitItem);
 
@@ -136,6 +160,63 @@ public sealed class TrayIcon : IDisposable
     {
         _pulseFrame = 0;
         if (!_pulseTimer.Enabled) _pulseTimer.Start();
+    }
+
+    private async Task OnCheckUpdatesClickAsync()
+    {
+        switch (_updateMode)
+        {
+            case UpdateMode.Available:
+                var ok = MessageBox.Show(
+                    "AnyClip will close, update via Scoop, and reopen.",
+                    $"Update to v{_availableVersion}?",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+                if (ok == DialogResult.OK) _installUpdate();   // caller spawns helper + quits
+                return;
+            case UpdateMode.Failed:
+                _openReleases();
+                _updateMode = UpdateMode.Idle;
+                _checkUpdatesItem.Text = "Check for Updates";
+                return;
+        }
+        _checkUpdatesItem.Text = "Checking…";
+        _checkUpdatesItem.Enabled = false;
+        var status = await _checkAsync();   // resumes on UI thread (WinForms sync context)
+        ApplyUpdateStatus(status, silent: false);
+    }
+
+    /// Best-effort check on launch: only surface an available update; never
+    /// show "up to date"/"failed" and never pop a dialog.
+    public async Task RunSilentUpdateCheckAsync()
+    {
+        var status = await _checkAsync();
+        if (status is UpdateStatus.Available) ApplyUpdateStatus(status, silent: true);
+    }
+
+    private void ApplyUpdateStatus(UpdateStatus status, bool silent)
+    {
+        _checkUpdatesItem.Enabled = true;
+        switch (status)
+        {
+            case UpdateStatus.UpToDate u:
+                _updateMode = UpdateMode.Idle;
+                _availableVersion = null;
+                _checkUpdatesItem.Text = $"You're up to date (v{u.Current})";
+                _updateResetTimer.Stop();
+                _updateResetTimer.Start();
+                break;
+            case UpdateStatus.Available a:
+                _updateMode = UpdateMode.Available;
+                _availableVersion = a.Latest;
+                _checkUpdatesItem.Text = $"Update to v{a.Latest}";
+                break;
+            case UpdateStatus.Failed:
+                if (silent) return;
+                _updateMode = UpdateMode.Failed;
+                _availableVersion = null;
+                _checkUpdatesItem.Text = "Check failed — open releases";
+                break;
+        }
     }
 
     /// Pre-rendered orbit frames: dimmed base icon + a Windows-accent-blue
@@ -231,6 +312,8 @@ public sealed class TrayIcon : IDisposable
     {
         _pulseTimer.Stop();
         _pulseTimer.Dispose();
+        _updateResetTimer.Stop();
+        _updateResetTimer.Dispose();
         Notify.Visible = false;
         Notify.Dispose();
     }
