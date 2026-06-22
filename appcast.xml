@@ -9,30 +9,30 @@
     <language>en</language>
 
     <item>
-      <title>Version 1.1.8</title>
-      <pubDate>Thu, 18 Jun 2026 01:41:34 +0000</pubDate>
+      <title>Version 1.1.9</title>
+      <pubDate>Mon, 22 Jun 2026 23:53:44 +0000</pubDate>
       <!-- sparkle:version must match CFBundleVersion in the installed
            app. We render the Unix-timestamp build number here so
            Sparkle's monotonic comparison reliably detects newer
            releases regardless of semver pre-release suffixes. -->
-      <sparkle:version>1781746820</sparkle:version>
-      <sparkle:shortVersionString>1.1.8</sparkle:shortVersionString>
+      <sparkle:version>1782172352</sparkle:version>
+      <sparkle:shortVersionString>1.1.9</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <description><![CDATA[
         <p>See the
-          <a href="https://github.com/gum798/AnyClip/releases/tag/v1.1.8">release notes</a>.
+          <a href="https://github.com/gum798/AnyClip/releases/tag/v1.1.9">release notes</a>.
         </p>
       ]]></description>
       <enclosure
-        url="https://github.com/gum798/AnyClip/releases/download/v1.1.8/AnyClip-v1.1.8.dmg"
+        url="https://github.com/gum798/AnyClip/releases/download/v1.1.9/AnyClip-v1.1.9.dmg"
         sparkle:os="macos"
         type="application/octet-stream"
-        sparkle:edSignature="ZhklDWUDNfFQR5xsldZ8szQhbIvRYHlw0YTEHlVnU5QHUf/omEIcFoidPOFV89Tph4S2ljcK3jHXsdjwalYoCg==" length="55403027" />
+        sparkle:edSignature="908c42Q0oaSB/1HIonnpd1D/CIw2GYVQfyaH0iqFvlKLQ4zLlUv5onaCX1wjJWPp/5f80hW4RFug40rDR+33Bw==" length="55454393" />
       <enclosure
-        url="https://github.com/gum798/AnyClip/releases/download/v1.1.8/AnyClip-v1.1.8-windows-x64.zip"
+        url="https://github.com/gum798/AnyClip/releases/download/v1.1.9/AnyClip-v1.1.9-windows-x64.zip"
         sparkle:os="windows"
         type="application/octet-stream"
-        sparkle:edSignature="MSpP7t6js9/F8MwxaT5NUZIqkm/ZuVoYZiJd1/uYoE6xn51xBKVZ7lfL/mPN2xts0rCktYXMsJ0ctUmoIMfcAQ==" length="23700713" />
+        sparkle:edSignature="ken81vDlw5XMfJy0zEDj0wjHpLuvvaOurZodHv/l4sBgHVG7lRyjYkrMpLL1tgIqGiy83NbaBt72c+1wrMzDBQ==" length="23708623" />
     </item>
   </channel>
 </rss>
