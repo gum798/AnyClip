@@ -60,6 +60,49 @@ private func startLoopbackListener(
     }
 }
 
+// Regression for the Mac outbound wedge: a send that parks on a closed TCP
+// window (peer not reading / half-open) must not block the caller forever. The
+// listener accepts but NEVER reads, so a large send fills the socket buffers
+// and parks with its completion undelivered — the exact stall that froze the
+// clipboard poll loop and the heartbeat self-heal. With a short sendTimeout,
+// sendFrame must throw TimeoutError on its own and cancel the connection.
+//
+// The send runs as an unstructured Task we never await (a parked, no-timeout
+// sendFrame would otherwise hang the test); we poll a shared box for the
+// outcome. Before the fix it stays nil → the assert fails fast (no hang);
+// after the fix it flips to "timeout" within the budget.
+@Test func sendFrameBailsWhenSendStalls() async throws {
+    let port: UInt16 = 28468
+    let listener = try startLoopbackListener(port: port) { conn in
+        conn.start(queue: .global()) // accept, then never receive()
+    }
+    defer { listener.cancel() }
+
+    let client = FramedConnection.outbound(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!))
+    try await client.start()
+    client.sendTimeout = 0.3
+    defer { client.cancel() }
+
+    // 15 MiB (just under the 16 MiB frame cap): must exceed the runner's
+    // combined loopback send+recv buffer so the send parks on the closed TCP
+    // window. On this machine the send wedges after ~1 MiB, so this is a wide
+    // margin; sized near the cap to stay robust against CI buffer autotuning.
+    let big = String(repeating: "x", count: 15 * 1024 * 1024)
+    let outcome = Locked<String?>(nil)
+    let sendTask = Task {
+        do { try await client.sendFrame(.clipText(big, ts: 0)); outcome.set("returned") }
+        catch is TimeoutError { outcome.set("timeout") }
+        catch { outcome.set("other") }
+    }
+    for _ in 0..<400 { // up to ~4 s, past the 0.3 s budget
+        if outcome.get() != nil { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    sendTask.cancel()
+    #expect(outcome.get() == "timeout") // before the fix: still nil
+}
+
 @Test func withTimeoutThrowsOnSlowOperation() async throws {
     await #expect(throws: TimeoutError.self) {
         try await withTimeout(seconds: 0.05) {

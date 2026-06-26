@@ -12,6 +12,8 @@ public enum WireConnectionError: Error {
 public final class FramedConnection: @unchecked Sendable {
     public let connection: NWConnection
     public private(set) var remoteIP: String?
+    /// Per-connection send budget; an instance hook so tests can shrink it.
+    public var sendTimeout: Double = Wire.sendTimeout
 
     public init(connection: NWConnection) {
         self.connection = connection
@@ -66,11 +68,24 @@ public final class FramedConnection: @unchecked Sendable {
 
     public func sendFrame(_ message: WireMessage) async throws {
         let data = try message.encodeFrame()
-        // Same non-cancellable hazard as receiveSome: a send parked on a full
-        // TCP buffer (wedged/throttled peer) would otherwise ignore task
-        // cancellation and stall a structured shutdown. Cancel the connection
-        // on cancel so the send completion fires; resumed-guard the
-        // exactly-once resume against a completion/cancel race.
+        // Bound the send: a write whose completion is lost (connection
+        // cancelled mid-send) or that parks on a full TCP buffer (wedged peer)
+        // would otherwise hang the caller forever. The clipboard poll loop and
+        // the heartbeat self-heal both await sends inline, so a single parked
+        // send froze outbound sync until an app restart. On timeout, withTimeout
+        // cancels the operation task, whose onCancel cancels the connection
+        // (firing the parked completion + tearing the link down to reconnect),
+        // and rethrows TimeoutError to the caller.
+        try await withTimeout(seconds: sendTimeout) { [self] in
+            try await rawSendFrame(data)
+        }
+    }
+
+    /// The bare framed send: one NWConnection.send awaited via a continuation.
+    /// Same non-cancellable hazard as receiveSome — cancel the connection on
+    /// task cancellation so the send completion fires; resumed-guard the
+    /// exactly-once resume against a completion/cancel race.
+    private func rawSendFrame(_ data: Data) async throws {
         let resumed = Locked(false)
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {

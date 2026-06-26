@@ -69,6 +69,59 @@ public class FramedConnectionTests
     }
 
     [Fact]
+    public async Task SendFrameTimesOutAndDisposesWedgedStream()
+    {
+        // Regression for the Mac outbound wedge mirrored here: a write parked on
+        // a half-open/wedged socket must not block the caller forever. The send
+        // surfaces SendTimeoutException on its own and drops the connection so
+        // the reconnect loop runs. (Before the fix SendFrameAsync never returns,
+        // so the 3 s guard fires with TimeoutException and this fails.)
+        using var stream = new HangingStream();
+        using var conn = new FramedConnection(stream)
+        {
+            SendTimeout = TimeSpan.FromMilliseconds(50),
+        };
+        await Assert.ThrowsAsync<SendTimeoutException>(
+            () => conn.SendFrameAsync(WireMessage.Ping(0), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.True(stream.Disposed, "wedged stream must be disposed to force reconnect");
+    }
+
+    /// Stream whose WriteAsync parks (full TCP buffer / half-open peer) until
+    /// the stream is disposed — then the parked write faults.
+    private sealed class HangingStream : Stream
+    {
+        public bool Disposed;
+        private readonly TaskCompletionSource _tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            using var reg = ct.Register(() => _tcs.TrySetCanceled(ct));
+            await _tcs.Task;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            _tcs.TrySetException(new ObjectDisposedException(nameof(HangingStream)));
+            base.Dispose(disposing);
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set { } }
+        public override void Flush() { }
+        public override int Read(byte[] b, int o, int c) => throw new NotSupportedException();
+        public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException();
+        public override void SetLength(long v) { }
+        public override void Write(byte[] b, int o, int c) => throw new NotSupportedException();
+    }
+
+    [Fact]
     public async Task ConnectTimeoutThrows()
     {
         // RFC 5737 TEST-NET address: connect attempts hang, then time out.

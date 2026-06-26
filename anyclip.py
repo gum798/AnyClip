@@ -75,6 +75,11 @@ MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB hard cap per frame (enough for typical 
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
+# Upper bound on a single app-initiated send. A write that parks past this
+# (full TCP buffer of a half-open/wedged peer, or a lost send completion)
+# would otherwise freeze the caller's loop -- the clipboard poll loop and the
+# heartbeat self-heal both await sends inline. On timeout we drop the link.
+SEND_TIMEOUT = 10.0
 # After a link is registered, only late-arriving handshakes within this
 # window are eligible to *replace* the existing link via the node_id
 # tie-breaker. Anything later is treated as a stale duplicate and dropped
@@ -1104,6 +1109,7 @@ class PeerLink:
         # back, so staleness can only be judged from inbound silence.
         self._last_inbound: float = 0.0
         self._lock = asyncio.Lock()
+        self._send_timeout = SEND_TIMEOUT
         self._token_hash = sha256_hex(config.token)
         self._auth_gate = AuthGate()
         # In-flight outbound attempts keyed by (host, port). Stops two
@@ -1426,7 +1432,13 @@ class PeerLink:
         try:
             writer.write(len(data).to_bytes(4, "big"))
             writer.write(data)
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=self._send_timeout)
+        except asyncio.TimeoutError:
+            # The write parked past the budget -- half-open/wedged socket. Close
+            # the writer so the next _recv returns EOF and the reconnect loop
+            # takes over; never let a stuck send freeze the caller's loop.
+            log.info("send timed out (link wedged); dropping link to force reconnect")
+            self._safe_close(writer)
         except Exception as exc:
             log.info(f"send failed (link likely down): {exc}")
 

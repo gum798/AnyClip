@@ -11,6 +11,12 @@ public enum Wire {
     public static let serviceType = "_anyclip._tcp"
     public static let handshakeTimeout: Double = 5.0
     public static let connectTimeout: Double = 5.0
+    /// Upper bound on a single app-initiated send. A send whose completion is
+    /// lost (connection cancelled mid-send) or that parks on a full TCP buffer
+    /// would otherwise freeze the caller -- the clipboard poll loop and the
+    /// heartbeat self-heal both await sends inline. On timeout the connection
+    /// is cancelled to force a reconnect.
+    public static let sendTimeout: Double = 10.0
     /// Window after link-up in which a duplicate handshake is a connect
     /// race (node_id tie-breaker); later arrivals replace a stale link.
     public static let raceWindow: Double = 1.5
