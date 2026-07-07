@@ -43,29 +43,37 @@ private func tempDir() -> URL {
                 queue.enqueue(payload)
             }))
 
-    // Drain task wedges FOREVER on the first payload — exactly like a leaked
-    // send continuation that no timeout can free.
+    // Drain task wedges FOREVER on the first payload — a send that never
+    // completes (like a leaked continuation no timeout can free). Park in a
+    // cancellation-aware loop, NOT Task.sleep(.max): a `.max` deadline
+    // overflows and can return immediately on some platforms (it did in CI),
+    // which would let the drain process the second payload and defeat the test.
     let sender = Task {
         await queue.run { _ in
             sendStarted.set(sendStarted.get() + 1)
-            try? await Task.sleep(nanoseconds: .max) // never returns
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 20_000_000) }
         }
     }
     defer { sender.cancel(); queue.finish() }
 
-    // Copy #1: detected, enqueued, sender parks on it forever.
+    // Copy #1: detected, enqueued, drain parks on it forever.
     pb.clearContents(); pb.setString("first-unique", forType: .string)
     await watcher.pollOnceForTesting()
 
-    // Let the sender actually park on payload #1.
-    try await Task.sleep(nanoseconds: 100_000_000)
+    // Deterministically wait until the drain has STARTED sending #1 (then it is
+    // wedged on it) — no reliance on a fixed sleep that could be too short.
+    for _ in 0..<200 {
+        if sendStarted.get() == 1 { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    #expect(sendStarted.get() == 1)        // drain is now wedged on #1
 
     // Copy #2: MUST still be detected — the poll loop is not frozen.
     pb.clearContents(); pb.setString("second-unique", forType: .string)
     await watcher.pollOnceForTesting()
 
-    #expect(detected.get().count == 2)     // before fix: stuck at 1
-    #expect(sendStarted.get() == 1)        // sender still wedged on the first
+    #expect(detected.get().count == 2)     // core guarantee: detection never froze
+    #expect(sendStarted.get() == 1)        // drain still wedged on #1, never reached #2
     if case .text(let s)? = detected.get().last { #expect(s == "second-unique") }
     else { Issue.record("expected the second text payload") }
 }
@@ -75,7 +83,9 @@ private func tempDir() -> URL {
 @Test func enqueueNeverBlocksWhenDrainIsWedged() async throws {
     let queue = OutboundQueue(bufferSize: 4)
     let sender = Task {
-        await queue.run { _ in try? await Task.sleep(nanoseconds: .max) }
+        await queue.run { _ in
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 20_000_000) }
+        }
     }
     defer { sender.cancel(); queue.finish() }
 
