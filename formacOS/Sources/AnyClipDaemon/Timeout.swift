@@ -16,9 +16,17 @@ public func withTimeout<T: Sendable>(
             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             throw TimeoutError()
         }
-        let result = try await group.next()!
-        group.cancelAll()
-        return result
+        // cancelAll on EVERY exit path (including the timeout throw at
+        // group.next()) and BEFORE the group drains its children on scope exit,
+        // so the losing child is always signalled to cancel as early as
+        // possible. NOTE: cancellation only frees the group if the losing child
+        // actually finishes when cancelled — a continuation that ignores
+        // cancellation would still make the implicit drain hang. The real
+        // guarantee lives in FramedConnection.rawSendFrame, which now resumes
+        // its continuation from onCancel; this defer only ensures the signal is
+        // sent promptly.
+        defer { group.cancelAll() }
+        return try await group.next()!
     }
 }
 

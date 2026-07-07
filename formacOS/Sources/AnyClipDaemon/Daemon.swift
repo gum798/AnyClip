@@ -158,7 +158,15 @@ public final class Daemon: @unchecked Sendable {
             },
             emit: emit)
 
-        let onLocalChange: @Sendable (ClipPayload) async -> Void = { [coordinator, weak link] payload in
+        // Outbound sends run on their OWN task, fed by a non-blocking queue, so
+        // the single clipboard poll loop can NEVER be frozen by a send that
+        // stalls, errors, times out, or leaks its continuation. (Root cause of
+        // the v1.1.10 outbound-silence wedge: onChange awaited the send inline,
+        // so one parked send killed all future polling.) sendOutbound is the
+        // former onLocalChange body, now driven by the drain task below.
+        let outbound = OutboundQueue()
+
+        let sendOutbound: @Sendable (ClipPayload) async -> Void = { [coordinator, weak link] payload in
             guard let link else { return }
             guard await link.isActive else { return }
             guard await coordinator.shouldSend(
@@ -187,7 +195,7 @@ public final class Daemon: @unchecked Sendable {
             ClipboardWatcher(
                 pollInterval: pollInterval, receivedDir: receivedDir,
                 callbacks: ClipboardWatcher.Callbacks(
-                    onChange: onLocalChange,
+                    onChange: { payload in outbound.enqueue(payload) },
                     onFileSkipped: { message in notify("AnyClip", message) }))
         }
         watcherBox.set(watcher)
@@ -215,6 +223,9 @@ public final class Daemon: @unchecked Sendable {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await link.serve() }
                 group.addTask { try await watcher.run() }
+                // Drain outbound clips on a dedicated task: a stuck send stalls
+                // only here, never the watcher's poll loop.
+                group.addTask { await outbound.run(send: sendOutbound) }
                 group.addTask { try await mdnsReconnectLoop(beacon: beacon, link: link) }
                 group.addTask { try await networkWatchdog(beacon: beacon) }
                 group.addTask { try await idleLinkWatchdog(beacon: beacon, link: link) }

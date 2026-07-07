@@ -82,21 +82,58 @@ public final class FramedConnection: @unchecked Sendable {
     }
 
     /// The bare framed send: one NWConnection.send awaited via a continuation.
-    /// Same non-cancellable hazard as receiveSome — cancel the connection on
-    /// task cancellation so the send completion fires; resumed-guard the
-    /// exactly-once resume against a completion/cancel race.
+    ///
+    /// The continuation MUST be resumable from EITHER the send completion OR
+    /// task cancellation. NWConnection can silently drop a send's
+    /// `.contentProcessed` completion when the connection is cancelled out from
+    /// under an in-flight send (peer restart / tie-break cancelling the old link
+    /// mid-send). The previous version's onCancel only called
+    /// `connection.cancel()` and *relied on* that completion then firing; when
+    /// it did NOT fire, this continuation leaked forever — and because
+    /// withTimeout structurally awaits its operation child, the whole clipboard
+    /// poll loop froze (the v1.1.10 outbound-silence wedge). We now resume the
+    /// continuation directly from onCancel, independent of NWConnection, so a
+    /// dropped completion can never strand the caller.
     private func rawSendFrame(_ data: Data) async throws {
-        let resumed = Locked(false)
+        enum SendState {
+            case idle                                       // no continuation yet
+            case cancelledBeforeWait                        // onCancel beat the body
+            case waiting(CheckedContinuation<Void, Error>)  // body parked
+            case finished                                   // resumed exactly once
+        }
+        let state = Locked<SendState>(.idle)
+
+        // Resume exactly once from the send completion.
+        let complete: @Sendable (Error?) -> Void = { error in
+            let prev = state.exchange(.finished)
+            if case .waiting(let cont) = prev {
+                if let error { cont.resume(throwing: error) } else { cont.resume() }
+            }
+        }
+
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
                 (cont: CheckedContinuation<Void, Error>) in
-                connection.send(content: data, completion: .contentProcessed { error in
-                    if resumed.exchange(true) { return }
-                    if let error { cont.resume(throwing: error) } else { cont.resume() }
-                })
+                let prev = state.exchange(.waiting(cont))
+                if case .cancelledBeforeWait = prev {
+                    // onCancel already fired before we parked — resume now and
+                    // skip the send entirely.
+                    _ = state.exchange(.finished)
+                    cont.resume(throwing: WireConnectionError.cancelled)
+                    return
+                }
+                connection.send(content: data,
+                                completion: .contentProcessed { error in complete(error) })
             }
         } onCancel: {
+            // Break the leak: cancel the connection AND resume the continuation
+            // ourselves, so a dropped send completion can never strand us.
             connection.cancel()
+            let prev = state.exchange(.cancelledBeforeWait)
+            if case .waiting(let cont) = prev {
+                _ = state.exchange(.finished)
+                cont.resume(throwing: WireConnectionError.cancelled)
+            }
         }
     }
 
