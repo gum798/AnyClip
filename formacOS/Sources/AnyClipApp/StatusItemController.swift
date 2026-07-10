@@ -23,8 +23,7 @@ final class StatusItemController: NSObject {
     private let onQuit: () -> Void
     private var currentState: PeerUIState = .initial
     private var syncAnimationTimer: Timer?
-    private var syncAnimationFrame = 0
-    private static let syncFrames = ["◜", "◠", "◝", "◞", "◡", "◟", "◜", "◠", "◝", "◞"]
+    private var spinner = SyncSpinner()
     private let notificationsItem: NSMenuItem
     /// Called when the user turns notifications ON (AppDelegate runs the
     /// permission request lazily so default-off users never see the prompt).
@@ -158,32 +157,33 @@ final class StatusItemController: NSObject {
         }
     }
 
-    /// 10-frame circular arc-orbit pulse on the menu bar glyph (≈0.4 s).
-    /// Re-triggering mid-flight restarts the orbit instead of stacking.
+    /// Claude-style braille spinner on the menu-bar glyph while syncs happen.
+    /// Each sync (re)arms a ~0.9 s spin window (SyncSpinner.spinWindow); a burst
+    /// of copies keeps extending it, so the glyph spins continuously while
+    /// traffic flows and then restores the resting icon.
     func animateSyncPulse() {
-        syncAnimationFrame = 0
-        guard syncAnimationTimer == nil else { return }
+        spinner.trigger(now: monotonicNow())
+        guard syncAnimationTimer == nil else { return }  // already spinning; window extended above
         syncAnimationTimer = Timer.scheduledTimer(
-            withTimeInterval: 0.04, repeats: true
+            withTimeInterval: SyncSpinner.frameInterval, repeats: true
         ) { [weak self] _ in
             // The timer is scheduled on the main run loop, so this closure
             // always runs on the main thread; assumeIsolated bridges the
             // nonisolated Timer API back to the @MainActor controller.
             MainActor.assumeIsolated {
                 guard let self else { return }
-                if self.syncAnimationFrame >= Self.syncFrames.count {
+                guard self.spinner.isSpinning(now: monotonicNow()) else {
                     self.syncAnimationTimer?.invalidate()
                     self.syncAnimationTimer = nil
-                    self.updateIcon(self.currentState)
+                    self.updateIcon(self.currentState)  // restore @ / @!
                     return
                 }
                 self.statusItem.button?.attributedTitle = NSAttributedString(
-                    string: Self.syncFrames[self.syncAnimationFrame],
+                    string: self.spinner.nextFrame(),
                     attributes: [
                         .foregroundColor: NSColor.controlAccentColor,
                         .font: NSFont.menuBarFont(ofSize: 0),
                     ])
-                self.syncAnimationFrame += 1
             }
         }
     }
