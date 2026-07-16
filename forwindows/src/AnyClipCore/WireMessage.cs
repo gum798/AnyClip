@@ -61,7 +61,12 @@ public sealed record WireMessage
 
     public static WireMessage ClipFile(string name, byte[] data, double ts) => new()
     {
-        Type = "clip", Kind = "file", Name = name,
+        // NFC on the wire: a macOS sender reads filenames in NFD (conjoining
+        // jamo U+11xx a Windows peer can't render). Normalize so every
+        // receiver gets a composed, renderable name. ToNfc tolerates ill-formed
+        // UTF-16 (NTFS allows unpaired surrogates) so a send never throws here.
+        // Keep in lockstep with Swift WireMessage.clipFile and anyclip.send_clip.
+        Type = "clip", Kind = "file", Name = TextHelpers.ToNfc(name),
         Content = Convert.ToBase64String(data),
         Hash = Hashing.Sha256Hex(data), Ts = ts, Bytes = data.Length,
     };

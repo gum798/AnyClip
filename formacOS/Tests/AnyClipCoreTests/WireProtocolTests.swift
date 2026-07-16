@@ -13,6 +13,18 @@ import Foundation
     #expect(body?["ts"] as? Double == 1.5)
 }
 
+@Test func clipFileNameIsNFCOnTheWire() {
+    // Filenames must leave as NFC (composed) bytes so a Windows peer renders
+    // Korean names instead of broken conjoining jamo. macOS reads them in NFD.
+    // Swift String == is canonical, so assert on the actual UTF-8 bytes.
+    let base = "결과보고서"
+    let nfd = base.decomposedStringWithCanonicalMapping + ".pdf"
+    let nfc = base.precomposedStringWithCanonicalMapping + ".pdf"
+    #expect(Array(nfd.utf8) != Array(nfc.utf8))
+    let m = WireMessage.clipFile(name: nfd, data: Data([1, 2, 3]), ts: 0)
+    #expect(Array((m.name ?? "").utf8) == Array(nfc.utf8))
+}
+
 @Test func helloCarriesAllProtocolFields() throws {
     let msg = WireMessage.hello(
         tokenHash: sha256Hex("tok"), nodeID: "node-1", name: "mac", appVersion: "1.2.3")

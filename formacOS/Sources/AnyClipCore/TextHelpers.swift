@@ -20,7 +20,12 @@ public func preview(_ text: String, maxLen: Int = 80) -> String {
 /// Foundation). "/" is still the only separator recognised, so
 /// "a/b/c.txt" → "c.txt" works correctly.
 public func sanitizeFilename(_ name: String) -> String {
-    let base = (name as NSString).lastPathComponent
+    // Normalize to NFC first: macOS hands filenames to peers in NFD
+    // (decomposed Hangul = conjoining jamo U+11xx that Windows can't render).
+    // NFC is the cross-platform interchange form. Keep in lockstep with
+    // anyclip.update_local_file and C# TextHelpers.SanitizeFilename.
+    let base = (name.precomposedStringWithCanonicalMapping as NSString)
+        .lastPathComponent
         .trimmingCharacters(in: .whitespaces)
     guard !base.isEmpty else { return "received.bin" }
     let allowed = CharacterSet.alphanumerics

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using AnyClip.Core;
 using Xunit;
@@ -55,6 +56,35 @@ public class WireMessageTests
         var frame = WireMessage.ClipText("안녕 👋", 2.0).EncodeFrame();
         var body = System.Text.Encoding.UTF8.GetString(frame.AsSpan(4));
         Assert.Contains("안녕", body); // UnsafeRelaxedJsonEscaping, like ensure_ascii=False
+    }
+
+    [Fact]
+    public void ClipFileDoesNotThrowOnInvalidUnicodeName()
+    {
+        // NTFS permits unpaired UTF-16 surrogates in filenames, so a name read
+        // from the clipboard file-drop can be ill-formed. NFC normalization
+        // must NOT throw (String.Normalize throws ArgumentException on invalid
+        // Unicode) — that would let SendClipAsync's catch silently drop the
+        // file. Fall back to the raw name instead of crashing.
+        var lone = "bad\uD800name.txt"; // unpaired high surrogate
+        var ex = Record.Exception(() => WireMessage.ClipFile(lone, new byte[] { 1 }, 0));
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public void ClipFileNameIsNFCOnTheWire()
+    {
+        // Filenames must leave as NFC (composed) bytes so a Windows peer
+        // renders Korean names instead of broken conjoining jamo. A macOS
+        // sender reads them in NFD; the wire builder normalizes. Keep in
+        // lockstep with Swift WireMessage.clipFile and anyclip.send_clip.
+        var baseName = "결과보고서";
+        var nfd = baseName.Normalize(NormalizationForm.FormD) + ".pdf";
+        var nfc = baseName.Normalize(NormalizationForm.FormC) + ".pdf";
+        Assert.NotEqual(nfd, nfc);
+        var frame = WireMessage.ClipFile(nfd, new byte[] { 1, 2, 3 }, 0).EncodeFrame();
+        using var doc = JsonDocument.Parse(frame.AsSpan(4).ToArray());
+        Assert.Equal(nfc, doc.RootElement.GetProperty("name").GetString());
     }
 
     [Fact]

@@ -109,7 +109,11 @@ extension WireMessage {
     public static func clipFile(name: String, data: Data, ts: Double) -> WireMessage {
         var m = WireMessage(type: "clip")
         m.kind = "file"
-        m.name = name
+        // NFC on the wire: macOS reads filenames in NFD (decomposed Hangul =
+        // conjoining jamo U+11xx a Windows peer can't render). Normalize so
+        // every receiver gets a composed, renderable name. Keep in lockstep
+        // with anyclip.send_clip and C# WireMessage.ClipFile.
+        m.name = name.precomposedStringWithCanonicalMapping
         m.content = data.base64EncodedString()
         m.hash = sha256Hex(data)
         m.ts = ts

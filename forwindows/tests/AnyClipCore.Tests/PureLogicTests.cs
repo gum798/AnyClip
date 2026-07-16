@@ -1,3 +1,4 @@
+using System.Text;
 using AnyClip.Core;
 using Xunit;
 
@@ -186,5 +187,31 @@ public class TextHelpersTests
         Assert.Equal("received.bin", TextHelpers.SanitizeFilename("   "));
         Assert.Equal("한글파일.txt", TextHelpers.SanitizeFilename("한글파일.txt"));
         Assert.Equal("___", TextHelpers.SanitizeFilename("???"));
+    }
+
+    [Fact]
+    public void SanitizeFilenameNormalizesDecomposedUnicodeToNFC()
+    {
+        // A macOS peer sends filenames in NFD (decomposed Hangul = conjoining
+        // jamo U+11xx Windows can't render). Normalize to NFC so a received
+        // file lands with the correct, renderable name. Keep in lockstep with
+        // Swift sanitizeFilename and anyclip.update_local_file.
+        var baseName = "KPI후보_2x2_매트릭스_v2_결과지";
+        var nfd = baseName.Normalize(NormalizationForm.FormD) + ".pdf";
+        var nfc = baseName.Normalize(NormalizationForm.FormC) + ".pdf";
+        Assert.NotEqual(nfd, nfc);                                    // forms genuinely differ
+        Assert.Equal(nfc, TextHelpers.SanitizeFilename(nfd));         // decomposed in → composed out
+        Assert.Equal(nfc, TextHelpers.SanitizeFilename(nfc));         // idempotent on NFC
+    }
+
+    [Fact]
+    public void SanitizeFilenameDoesNotThrowOnInvalidUnicode()
+    {
+        // NFC normalization must not throw on ill-formed UTF-16 (unpaired
+        // surrogate) — that would escape ApplyRemoteAsync's narrow catch and
+        // tear down the link. Fall back to the raw name.
+        var lone = "bad\uD800name.txt"; // unpaired high surrogate
+        var ex = Record.Exception(() => TextHelpers.SanitizeFilename(lone));
+        Assert.Null(ex);
     }
 }

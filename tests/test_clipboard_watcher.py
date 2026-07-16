@@ -100,6 +100,55 @@ async def test_regular_file_still_synced(monkeypatch, tmp_path):
     assert changes == [("file", ("note.txt", b"hello"))]
 
 
+@pytest.mark.asyncio
+async def test_decomposed_filename_sent_as_nfc(monkeypatch, tmp_path):
+    """macOS hands filenames to us in NFD (decomposed Hangul = conjoining
+    jamo U+11xx). We must send them NFC or a Windows peer renders broken
+    glyphs instead of the name. (Mac → Windows filename corruption.)"""
+    import unicodedata
+
+    changes = []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    watcher = _make_watcher(on_change)
+    nfc_name = "결과보고서.pdf"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    assert nfd_name != nfc_name  # the two forms genuinely differ
+    target = tmp_path / nfd_name
+    target.write_bytes(b"data")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(target)])
+
+    await watcher._check_file_clipboard()
+    assert len(changes) == 1
+    sent_name, sent_data = changes[0][1]
+    assert sent_name == nfc_name  # sent composed, not decomposed
+    assert sent_data == b"data"
+
+
+def test_received_filename_normalized_to_nfc(monkeypatch, tmp_path):
+    """A file received from a macOS peer (NFD name) is written and placed on
+    the clipboard with an NFC name, so it is not corrupted on Windows."""
+    import unicodedata
+
+    monkeypatch.setattr(anyclip, "LOG_DIR", tmp_path)
+    captured = {}
+
+    def fake_set(path):
+        captured["path"] = path
+        return True
+
+    monkeypatch.setattr(anyclip, "set_clipboard_file", fake_set)
+    watcher = _make_watcher()
+    nfc = "받은파일.txt"
+    nfd = unicodedata.normalize("NFD", nfc)
+    assert nfd != nfc
+    ok = watcher.update_local_file(nfd, b"data")
+    assert ok
+    assert os.path.basename(captured["path"]) == nfc  # composed on disk + clipboard
+
+
 @pytest.mark.skipif(
     sys.platform == "win32" or os.geteuid() == 0,
     reason="chmod 000 is not enforceable on Windows or as root",

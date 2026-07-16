@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
@@ -975,8 +976,13 @@ class ClipboardWatcher:
             return
         self._last_file_fp = fp
         self._last_file_hash = sha256_bytes(data)
+        # NFC on the wire: macOS reads filenames in NFD (decomposed Hangul =
+        # conjoining jamo U+11xx a Windows peer can't render). Normalize so
+        # every receiver gets a composed, renderable name. Keep in lockstep
+        # with Swift WireMessage.clipFile and C# WireMessage.ClipFile.
+        name = unicodedata.normalize("NFC", os.path.basename(path))
         try:
-            await self.on_change("file", (os.path.basename(path), data))
+            await self.on_change("file", (name, data))
         except Exception as exc:
             log.exception(f"on_change(file) handler failed: {exc}")
 
@@ -1019,8 +1025,11 @@ class ClipboardWatcher:
         is not picked up as a fresh local change on the next poll.
         """
         # Sanitize the name -- accept basename only and strip anything
-        # that would land outside the target directory.
-        safe = os.path.basename(name).strip() or "received.bin"
+        # that would land outside the target directory. Normalize to NFC
+        # first: a macOS peer sends NFD (decomposed Hangul = conjoining jamo
+        # U+11xx Windows can't render). Keep in lockstep with Swift
+        # sanitizeFilename and C# TextHelpers.SanitizeFilename.
+        safe = os.path.basename(unicodedata.normalize("NFC", name)).strip() or "received.bin"
         # Drop characters that are awkward on either OS.
         safe = "".join(
             c if c.isalnum() or c in "._- " else "_" for c in safe
