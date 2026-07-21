@@ -73,6 +73,12 @@ PROTOCOL_MINOR = 1
 # it as equivalent to protocol_major so old<->new handshakes still link.
 PROTOCOL_VERSION = PROTOCOL_MAJOR
 MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB hard cap per frame (enough for typical PNGs)
+# Greedy multi-file send budget, applied to the SUM of raw file sizes in one
+# "files" clip (reserves ~256 KB for the JSON envelope + base64 1.34x). Same
+# value the single-file path used inline. Keep in lockstep with Swift/C#.
+FILE_BUDGET = int((MAX_PAYLOAD - 256 * 1024) * 0.74)  # ~12,221,153
+# Sender-side cap on files per clip; the receiver stays lenient.
+MAX_FILES_PER_CLIP = 100
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
@@ -945,19 +951,21 @@ class ClipboardWatcher:
         initial_image = grab_clipboard_image()
         if initial_image is not None:
             self._last_image_hash = sha256_bytes(initial_image)
-        # File path on the clipboard: cache (path, size, mtime) so we do
-        # not re-read megabytes of bytes off disk every poll cycle.
-        self._last_file_fp: Optional[tuple] = None
+        # Files on the clipboard: cache an ORDERED list of (path, size,
+        # mtime_ns) fingerprints for the whole selection so we neither
+        # re-read bytes every poll nor re-detect an unchanged selection.
+        self._last_file_fp: Optional[list] = None
         self._last_file_hash: Optional[str] = None
-        self._oversize_file_warned = False
-        # Seed file baseline as well.
+        # Seed the baseline from whatever is already on the clipboard so we
+        # do not fire a spurious initial send at startup.
+        seed = []
         for _path in grab_clipboard_files() or []:
             try:
                 stat = os.stat(_path)
             except OSError:
                 continue
-            self._last_file_fp = (_path, stat.st_size, stat.st_mtime_ns)
-            break
+            seed.append((_path, stat.st_size, stat.st_mtime_ns))
+        self._last_file_fp = seed or None
 
     def _safe_paste(self) -> Optional[str]:
         try:
@@ -1030,63 +1038,86 @@ class ClipboardWatcher:
             await asyncio.sleep(self.poll_interval)
 
     async def _check_file_clipboard(self) -> None:
-        files = await asyncio.to_thread(grab_clipboard_files)
-        if not files:
+        paths = await asyncio.to_thread(grab_clipboard_files)
+        if not paths:
             return
-        # Only the first file is synced -- multi-file is intentional scope-out.
-        path = files[0]
-        try:
-            stat = await asyncio.to_thread(os.stat, path)
-        except OSError:
+        # Build the ORDERED fingerprint for the WHOLE selection. A path that
+        # vanished between grab and stat drops out of both fingerprint and
+        # candidate list.
+        fp = []
+        statted = []  # (path, os.stat_result) in selection order
+        for path in paths:
+            try:
+                stat = await asyncio.to_thread(os.stat, path)
+            except OSError:
+                continue
+            fp.append((path, stat.st_size, stat.st_mtime_ns))
+            statted.append((path, stat))
+        if not fp:
             return
-        fp = (path, stat.st_size, stat.st_mtime_ns)
         if fp == self._last_file_fp:
-            return  # nothing new on the clipboard
-        # Folders are an explicit scope-out (same as multi-file). Record
-        # the fingerprint FIRST so the same copy is never re-detected --
-        # the old EISDIR path skipped that update and retried (and
-        # logged) every poll cycle, forever.
-        if stat_mod.S_ISDIR(stat.st_mode):
-            self._last_file_fp = fp
-            display = os.path.basename(path.rstrip("/\\")) or path
-            log.warning(f"folder on clipboard not synced (unsupported): {path!r}")
-            await self._notify_file_skipped(
-                f"folder not synced — folders are not supported: {display}"
-            )
-            return
-        # Refuse files that would not fit in a single frame after base64.
-        # Reserve ~256 KB for JSON envelope and the b64 1.34x inflation.
-        budget = int((MAX_PAYLOAD - 256 * 1024) * 0.74)
-        if stat.st_size > budget:
-            if not self._oversize_file_warned:
-                log.warning(
-                    f"file {path!r} too large to sync "
-                    f"({stat.st_size} bytes > limit {budget}); skipping"
-                )
-                self._oversize_file_warned = True
-            # Still update the fingerprint so we do not keep re-warning.
-            self._last_file_fp = fp
-            return
-        self._oversize_file_warned = False
-        try:
-            data = await asyncio.to_thread(Path(path).read_bytes)
-        except OSError as exc:
-            # Record the fingerprint anyway: a path that cannot be read
-            # now will not become readable by polling it forever.
-            self._last_file_fp = fp
-            log.warning(f"file read failed for {path!r}: {exc}; skipping")
-            return
+            return  # unchanged selection
+        # Record the fingerprint FIRST so a selection we cannot fully sync is
+        # never re-detected and retried every poll cycle (folder-skip design).
         self._last_file_fp = fp
-        self._last_file_hash = sha256_bytes(data)
-        # NFC on the wire: macOS reads filenames in NFD (decomposed Hangul =
-        # conjoining jamo U+11xx a Windows peer can't render). Normalize so
-        # every receiver gets a composed, renderable name. Keep in lockstep
-        # with Swift WireMessage.clipFile and C# WireMessage.ClipFile.
-        name = unicodedata.normalize("NFC", os.path.basename(path))
-        try:
-            await self.on_change("file", (name, data))
-        except Exception as exc:
-            log.exception(f"on_change(file) handler failed: {exc}")
+
+        # Filter folders (each named once), then greedily accept files in
+        # selection order while sum(raw) <= FILE_BUDGET and count <= cap.
+        skipped_folders = []
+        accepted = []  # (name, raw_bytes)
+        skipped_count = 0
+        total = 0
+        for path, stat in statted:
+            if stat_mod.S_ISDIR(stat.st_mode):
+                skipped_folders.append(os.path.basename(path.rstrip("/\\")) or path)
+                continue
+            if len(accepted) >= MAX_FILES_PER_CLIP:
+                skipped_count += 1
+                continue
+            if total + stat.st_size > FILE_BUDGET:
+                skipped_count += 1
+                continue
+            try:
+                data = await asyncio.to_thread(Path(path).read_bytes)
+            except OSError as exc:
+                log.warning(f"file read failed for {path!r}: {exc}; skipping")
+                skipped_count += 1
+                continue
+            total += stat.st_size
+            # NFC on the wire (macOS reads filenames in NFD). Keep in lockstep
+            # with Swift WireMessage and C# WireMessage.
+            name = unicodedata.normalize("NFC", os.path.basename(path))
+            accepted.append((name, data))
+
+        if skipped_folders:
+            if len(skipped_folders) == 1:
+                await self._notify_file_skipped(
+                    "folder not synced — folders are not supported: "
+                    f"{skipped_folders[0]}"
+                )
+            else:
+                await self._notify_file_skipped(
+                    f"{len(skipped_folders)} folders not synced — "
+                    "folders are not supported"
+                )
+        if skipped_count:
+            await self._notify_file_skipped(
+                f"{skipped_count} file(s) skipped (too large to sync)"
+            )
+
+        if not accepted:
+            return
+        if len(accepted) == 1:
+            self._last_file_hash = sha256_bytes(accepted[0][1])
+            try:
+                await self.on_change("file", accepted[0])
+            except Exception as exc:
+                log.exception(f"on_change(file) handler failed: {exc}")
+        else:
+            try:
+                await self.on_change("files", accepted)
+            except Exception as exc:
+                log.exception(f"on_change(files) handler failed: {exc}")
 
     async def _notify_file_skipped(self, message: str) -> None:
         if self.on_file_skipped is None:
@@ -1142,7 +1173,7 @@ class ClipboardWatcher:
         # Update fingerprint so the next poll does not echo this back.
         try:
             stat = target.stat()
-            self._last_file_fp = (str(target), stat.st_size, stat.st_mtime_ns)
+            self._last_file_fp = [(str(target), stat.st_size, stat.st_mtime_ns)]
         except OSError:
             self._last_file_fp = None
         ok = set_clipboard_file(str(target))

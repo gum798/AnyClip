@@ -178,3 +178,91 @@ async def test_unreadable_file_does_not_loop(monkeypatch, tmp_path):
         assert watcher._last_file_fp == first_fp
     finally:
         target.chmod(0o600)
+
+
+@pytest.mark.asyncio
+async def test_multiple_files_emitted_as_files_kind(monkeypatch, tmp_path):
+    changes = []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    watcher = _make_watcher(on_change)
+    f1 = tmp_path / "a.txt"; f1.write_bytes(b"one")
+    f2 = tmp_path / "b.txt"; f2.write_bytes(b"two")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files",
+                        lambda: [str(f1), str(f2)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("files", [("a.txt", b"one"), ("b.txt", b"two")])]
+
+    # Same selection again -> fingerprint list matches -> no second emission.
+    await watcher._check_file_clipboard()
+    assert len(changes) == 1
+
+
+@pytest.mark.asyncio
+async def test_folder_mixed_with_files(monkeypatch, tmp_path):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    folder = tmp_path / "docs"; folder.mkdir()
+    f1 = tmp_path / "a.txt"; f1.write_bytes(b"one")
+    f2 = tmp_path / "b.txt"; f2.write_bytes(b"two")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files",
+                        lambda: [str(folder), str(f1), str(f2)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("files", [("a.txt", b"one"), ("b.txt", b"two")])]
+    assert any("docs" in m for m in skipped)
+
+
+@pytest.mark.asyncio
+async def test_budget_greedy_partial_send(monkeypatch, tmp_path):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    monkeypatch.setattr(anyclip, "FILE_BUDGET", 10)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    f1 = tmp_path / "a.txt"; f1.write_bytes(b"123456")   # 6, accepted (total 6)
+    f2 = tmp_path / "b.txt"; f2.write_bytes(b"789012")   # 6, 6+6=12>10 skip
+    f3 = tmp_path / "c.txt"; f3.write_bytes(b"XY")       # 2, 6+2=8<=10 accepted
+    monkeypatch.setattr(anyclip, "grab_clipboard_files",
+                        lambda: [str(f1), str(f2), str(f3)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("files", [("a.txt", b"123456"), ("c.txt", b"XY")])]
+    assert any("skipped" in m for m in skipped)
+
+
+@pytest.mark.asyncio
+async def test_single_survivor_falls_back_to_file_kind(monkeypatch, tmp_path):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    monkeypatch.setattr(anyclip, "FILE_BUDGET", 10)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    f1 = tmp_path / "a.txt"; f1.write_bytes(b"12345678")  # 8, accepted
+    f2 = tmp_path / "b.txt"; f2.write_bytes(b"ABCDEFGH")  # 8, 8+8=16>10 skip
+    monkeypatch.setattr(anyclip, "grab_clipboard_files",
+                        lambda: [str(f1), str(f2)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("file", ("a.txt", b"12345678"))]
+    assert any("skipped" in m for m in skipped)
