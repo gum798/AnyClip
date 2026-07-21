@@ -20,3 +20,15 @@ import Foundation
     #expect(sha256Hex(Data()) ==
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 }
+
+@Test func aggregateFilesHashMatchesFormulaAndIsOrderIndependent() {
+    // Aggregate = sha256 of the per-file hex hashes sorted lexicographically
+    // and concatenated with no separator. Hex is ASCII, so "a…" sorts before
+    // "b…" — assert against the formula itself (no magic constant).
+    let h1 = String(repeating: "a", count: 64)
+    let h2 = String(repeating: "b", count: 64)
+    let expected = sha256Hex(h1 + h2)
+    #expect(aggregateFilesHash([h1, h2]) == expected)
+    #expect(aggregateFilesHash([h2, h1]) == expected) // input order must not matter
+    #expect(aggregateFilesHash(["ff", "00"]) == sha256Hex("00" + "ff"))
+}
