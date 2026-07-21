@@ -102,6 +102,20 @@ private func scriptsDir() -> URL {
             && lines.contains("\"type\": \"ping\"")
     })
 
+    // Swift -> Python: a two-file kind:"files" clip. The fake peer records it
+    // verbatim; assert both names and the aggregate hash land in the outfile.
+    let mf1 = (name: "노트.txt", data: Data("files body one".utf8))
+    let mf2 = (name: "(E&S) plan.txt", data: Data("files body two".utf8))
+    await link.sendClip(.files([mf1, mf2]))
+    let expectedAgg = aggregateFilesHash([sha256Hex(mf1.data), sha256Hex(mf2.data)])
+    #expect(await waitUntil(5) {
+        guard let lines = try? String(contentsOf: outFile, encoding: .utf8) else { return false }
+        return lines.contains("\"kind\": \"files\"")
+            && lines.contains("노트.txt")
+            && lines.contains("(E&S) plan.txt")
+            && lines.contains(expectedAgg)
+    })
+
     // The hello we sent must satisfy Python's field expectations.
     let outText = try String(contentsOf: outFile, encoding: .utf8)
     let helloLine = outText.split(separator: "\n").first { $0.contains("\"event\": \"hello\"") }
