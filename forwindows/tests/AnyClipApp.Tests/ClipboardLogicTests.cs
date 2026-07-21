@@ -8,18 +8,19 @@ internal sealed class FakeClipboard : IWin32Clipboard
 {
     public string? Text;
     public byte[]? ImagePng;
-    public string? FilePath;
+    public List<string>? FilePaths;
     public bool ThrowOnRead; // simulates CLIPBRD_E_CANT_OPEN lock contention
     public List<string> Written = new();
     public string? GetText() =>
         ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : Text;
     public byte[]? GetImagePng() =>
         ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : ImagePng;
-    public string? GetFirstFilePath() =>
-        ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : FilePath;
+    public IReadOnlyList<string>? GetFilePaths() =>
+        ThrowOnRead ? throw new InvalidOperationException("clipboard locked") : FilePaths;
     public bool SetText(string text) { Written.Add($"text:{text}"); Text = text; return true; }
     public bool SetImagePng(byte[] png) { Written.Add("image"); ImagePng = png; return true; }
-    public bool SetFilePath(string path) { Written.Add($"file:{path}"); FilePath = path; return true; }
+    public bool SetFilePaths(IReadOnlyList<string> paths)
+    { Written.Add($"files:{string.Join(";", paths)}"); FilePaths = paths.ToList(); return true; }
 }
 
 public class ClipboardLogicTests
@@ -89,7 +90,7 @@ public class ClipboardLogicTests
         var dir = TempDir();
         var (w, clip, changes, skipped) = Make(dir);
         var folder = TempDir();
-        clip.FilePath = folder;
+        clip.FilePaths = new List<string> { folder };
         await w.HandleClipboardUpdateAsync();
         Assert.Empty(changes);
         Assert.Single(skipped);
@@ -99,7 +100,7 @@ public class ClipboardLogicTests
 
         var file = Path.Combine(TempDir(), "note.txt");
         File.WriteAllText(file, "file-body");
-        clip.FilePath = file;
+        clip.FilePaths = new List<string> { file };
         await w.HandleClipboardUpdateAsync();
         Assert.Contains(changes, c => c is FileClip f && f.Name == "note.txt");
     }
@@ -111,7 +112,7 @@ public class ClipboardLogicTests
         var (w, clip, changes, _) = Make(dir);
         var file = Path.Combine(TempDir(), "big.bin");
         using (var fs = File.Create(file)) fs.SetLength(12L * 1024 * 1024);
-        clip.FilePath = file;
+        clip.FilePaths = new List<string> { file };
         await w.HandleClipboardUpdateAsync();
         Assert.Empty(changes);
     }
@@ -175,12 +176,90 @@ public class ClipboardLogicTests
         };
         var file = Path.Combine(TempDir(), "dup.txt");
         File.WriteAllText(file, "dup-body");
-        clip.FilePath = file;
+        clip.FilePaths = new List<string> { file };
         var first = w.HandleClipboardUpdateAsync();
         var second = w.HandleClipboardUpdateAsync(); // coalesced into a rerun
         gate.SetResult();
         await first;
         await second;
         lock (changes) Assert.Single(changes); // one FileClip, never two
+    }
+
+    [Fact]
+    public async Task MultipleFilesEmitFilesClipWithAllEntries()
+    {
+        var (w, clip, changes, _) = Make(TempDir());
+        var d = TempDir();
+        var f1 = Path.Combine(d, "a.txt"); File.WriteAllText(f1, "aaa");
+        var f2 = Path.Combine(d, "b.txt"); File.WriteAllText(f2, "bbbb");
+        clip.FilePaths = new List<string> { f1, f2 };
+        await w.HandleClipboardUpdateAsync();
+        var fc = Assert.IsType<FilesClip>(Assert.Single(changes));
+        Assert.Equal(new[] { "a.txt", "b.txt" }, fc.Files.Select(f => f.Name).ToArray());
+        Assert.Equal("aaa", System.Text.Encoding.UTF8.GetString(fc.Files[0].Data));
+    }
+
+    [Fact]
+    public async Task SingleSendableFileStillEmitsLegacyFileClip()
+    {
+        var (w, clip, changes, _) = Make(TempDir());
+        var f1 = Path.Combine(TempDir(), "solo.txt"); File.WriteAllText(f1, "x");
+        clip.FilePaths = new List<string> { f1 };
+        await w.HandleClipboardUpdateAsync();
+        Assert.IsType<FileClip>(Assert.Single(changes));
+    }
+
+    [Fact]
+    public async Task GreedyBudgetDropsOversizeKeepsFittingFilesInOrder()
+    {
+        var (w, clip, changes, skipped) = Make(TempDir());
+        var d = TempDir();
+        var s1 = Path.Combine(d, "s1.txt"); File.WriteAllText(s1, "a");
+        var s2 = Path.Combine(d, "s2.txt"); File.WriteAllText(s2, "b");
+        var big = Path.Combine(d, "big.bin");
+        using (var fs = File.Create(big)) fs.SetLength((long)ClipboardWatcher.FileBudget + 1);
+        clip.FilePaths = new List<string> { s1, big, s2 }; // big in the middle
+        await w.HandleClipboardUpdateAsync();
+        var fc = Assert.IsType<FilesClip>(Assert.Single(changes));
+        Assert.Equal(new[] { "s1.txt", "s2.txt" }, fc.Files.Select(f => f.Name).ToArray());
+        Assert.Contains(skipped, s => s.Contains("1 file"));
+    }
+
+    [Fact]
+    public async Task FolderMixedWithFilesSkipsFolderSyncsFiles()
+    {
+        var (w, clip, changes, skipped) = Make(TempDir());
+        var d = TempDir();
+        var folder = TempDir();
+        var f1 = Path.Combine(d, "keep.txt"); File.WriteAllText(f1, "k");
+        var f2 = Path.Combine(d, "keep2.txt"); File.WriteAllText(f2, "k2");
+        clip.FilePaths = new List<string> { folder, f1, f2 };
+        await w.HandleClipboardUpdateAsync();
+        var fc = Assert.IsType<FilesClip>(Assert.Single(changes));
+        Assert.Equal(2, fc.Files.Count);
+        Assert.Contains(skipped, s => s.Contains("folders are not supported"));
+    }
+
+    [Fact]
+    public async Task ApplyRemoteFilesClipWritesAllUniquifiesPlacesAllNoEcho()
+    {
+        var dir = TempDir();
+        var (w, clip, changes, _) = Make(dir);
+        var payload = new FilesClip(new List<(string, byte[])>
+        {
+            ("note.txt", "one"u8.ToArray()),
+            ("note.txt", "two"u8.ToArray()),       // same sanitized name -> uniquified
+            ("(E&S) plan.txt", "three"u8.ToArray()),
+        });
+        Assert.True(await w.ApplyRemoteAsync(payload));
+        Assert.True(File.Exists(Path.Combine(dir, "note.txt")));
+        Assert.True(File.Exists(Path.Combine(dir, "note (2).txt")));
+        Assert.True(File.Exists(Path.Combine(dir, "(E&S) plan.txt")));
+        Assert.Equal("three", File.ReadAllText(Path.Combine(dir, "(E&S) plan.txt")));
+        Assert.Contains(clip.Written, x => x.StartsWith("files:")
+            && x.Contains("note.txt") && x.Contains("note (2).txt") && x.Contains("(E&S) plan.txt"));
+        // Baseline set to placed paths -> re-detect does not echo.
+        await w.HandleClipboardUpdateAsync();
+        Assert.Empty(changes);
     }
 }
