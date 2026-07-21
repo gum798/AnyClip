@@ -165,4 +165,84 @@ public class PeerLinkTests
         cts.Cancel(); a.Shutdown();
         try { await serveA; } catch (OperationCanceledException) { }
     }
+
+    [Fact]
+    public async Task TwoLinksExchangeFilesClipAndRetainPeerMinor()
+    {
+        var (a, aClips, _) = MakeLink("tok", 28641, "node-a");
+        var (b, bClips, _) = MakeLink("tok", 28642, "node-b");
+        using var cts = new CancellationTokenSource();
+        var serveA = a.ServeAsync(cts.Token);
+        Assert.True(await WaitUntil(() => a.IsServing));
+        _ = b.TryConnectAsync("127.0.0.1", 28641, "127.0.0.1:28641", cts.Token);
+        Assert.True(await WaitUntil(() => a.IsActive && b.IsActive));
+
+        // Both peers are this build (minor 1); retained from the hello.
+        Assert.Equal(1, a.PeerProtocolMinor);
+        Assert.Equal(1, b.PeerProtocolMinor);
+
+        await b.SendClipAsync(new FilesClip(new List<(string, byte[])>
+        {
+            ("노트.txt", "one"u8.ToArray()),
+            ("réport.bin", new byte[] { 2, 3 }),
+        }));
+        Assert.True(await WaitUntil(() => { lock (aClips) return aClips.Any(c => c is FilesClip); }));
+        FilesClip got;
+        lock (aClips) got = aClips.OfType<FilesClip>().First();
+        Assert.Equal(2, got.Files.Count);
+        Assert.Equal("노트.txt", got.Files[0].Name);
+        Assert.Equal("one"u8.ToArray(), got.Files[0].Data);
+        Assert.Equal("réport.bin", got.Files[1].Name);
+        Assert.Equal(new byte[] { 2, 3 }, got.Files[1].Data);
+
+        cts.Cancel(); a.Shutdown(); b.Shutdown();
+        try { await serveA; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
+    public async Task FilesClipInvalidOrEmptyFrameIgnoredAndLinkStaysUp()
+    {
+        var (a, aClips, _) = MakeLink("tok", 28643, "a");
+        using var cts = new CancellationTokenSource();
+        var serveA = a.ServeAsync(cts.Token);
+        Assert.True(await WaitUntil(() => a.IsServing));
+
+        using var raw = await FramedConnection.ConnectAsync("127.0.0.1", 28643, 5, cts.Token);
+        await raw.SendFrameAsync(WireMessage.Hello(
+            Hashing.Sha256Hex("tok"), "ffffffff-raw", "raw", "0.0.0-test"), cts.Token);
+        _ = await raw.ReceiveMessageAsync(cts.Token); // a's hello
+        Assert.True(await WaitUntil(() => a.IsActive));
+
+        // (1) empty files array -> ignored.
+        await raw.SendFrameAsync(new WireMessage
+        {
+            Type = "clip", Kind = "files", Files = new List<WireFileEntry>(), Hash = "x", Ts = 1,
+        }, cts.Token);
+        // (2) one entry has non-strict base64 -> whole frame ignored.
+        await raw.SendFrameAsync(new WireMessage
+        {
+            Type = "clip", Kind = "files",
+            Files = new List<WireFileEntry>
+            {
+                new() { Name = "ok.txt", Content = Convert.ToBase64String("ok"u8.ToArray()),
+                        Hash = "x", Bytes = 2 },
+                new() { Name = "bad.txt", Content = "!!!not-base64!!!", Hash = "x", Bytes = 0 },
+            },
+            Hash = "x", Ts = 1,
+        }, cts.Token);
+        // (3) a valid 2-entry frame proves the link survived both bad frames.
+        await raw.SendFrameAsync(WireMessage.ClipFiles(
+            new List<(string, byte[])> { ("a.txt", "aa"u8.ToArray()), ("b.txt", "bb"u8.ToArray()) },
+            1), cts.Token);
+
+        Assert.True(await WaitUntil(() =>
+        {
+            lock (aClips) return aClips.OfType<FilesClip>().Any(f => f.Files.Count == 2);
+        }));
+        lock (aClips) Assert.DoesNotContain(aClips, c => c is FilesClip f && f.Files.Count != 2);
+        Assert.True(a.IsActive);
+
+        cts.Cancel(); a.Shutdown();
+        try { await serveA; } catch (OperationCanceledException) { }
+    }
 }

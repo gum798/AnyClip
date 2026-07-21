@@ -40,6 +40,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
     public Action<DaemonEvent>? Emit { get; set; }
     public volatile bool IsServing;
     public string? PeerName { get; private set; }
+    public int PeerProtocolMinor { get; private set; }
     public bool IsActive => _activeConn is not null;
 
     private static double MonotonicNow() => Clock.Elapsed.TotalSeconds;
@@ -292,6 +293,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
             _activeConn = framed;
             _peerNodeId = peerId;
             PeerName = displayName;
+            PeerProtocolMinor = peerVersion.ProtocolMinor;
             _linkedAt = MonotonicNow();
             _lastInboundAt = MonotonicNow();
         }
@@ -351,6 +353,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
                     _activeConn = null;
                     _peerNodeId = null;
                     PeerName = null;
+                    PeerProtocolMinor = 0;
                 }
             }
             finally { _lock.Release(); }
@@ -379,6 +382,29 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
                     await (OnClip?.Invoke(new FileClip(name, data)) ?? Task.CompletedTask);
                 }
                 else RotatingLog.Shared.Warning("bad file payload from peer");
+                break;
+            case "files":
+                if (msg.Files is null || msg.Files.Count == 0)
+                {
+                    RotatingLog.Shared.Warning("ignoring files clip with no entries");
+                    break;
+                }
+                var decoded = new List<(string Name, byte[] Data)>(msg.Files.Count);
+                bool bad = false;
+                foreach (var entry in msg.Files)
+                {
+                    if (entry.Content is null ||
+                        WireMessage.StrictBase64Decode(entry.Content) is not { } fbytes)
+                    {
+                        RotatingLog.Shared.Warning("bad file payload in files clip; ignoring frame");
+                        bad = true;
+                        break;
+                    }
+                    var fname = string.IsNullOrEmpty(entry.Name) ? "received.bin" : entry.Name!;
+                    decoded.Add((fname, fbytes)); // hash NOT trusted from wire; recomputed downstream
+                }
+                if (!bad)
+                    await (OnClip?.Invoke(new FilesClip(decoded)) ?? Task.CompletedTask);
                 break;
             default:
                 RotatingLog.Shared.Debug($"ignoring clip with kind={kind}");
@@ -432,6 +458,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
         _activeConn = null;
         _peerNodeId = null;
         PeerName = null;
+        PeerProtocolMinor = 0;
         _listener?.Stop();
         IsServing = false;
     }
