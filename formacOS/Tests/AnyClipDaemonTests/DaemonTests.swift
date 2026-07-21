@@ -54,3 +54,25 @@ private func tempDir() -> URL {
     // PID file released on graceful shutdown.
     #expect(!FileManager.default.fileExists(atPath: pidFile.path))
 }
+
+@Test func downgradeForPeerKeepsFilesForModernPeer() {
+    let payload = ClipPayload.files([(name: "a", data: Data([1])), (name: "b", data: Data([2]))])
+    let (out, dropped) = downgradeForPeer(payload, peerMinor: 1)
+    #expect(dropped == 0)
+    if case .files(let fs)? = out { #expect(fs.count == 2) } else { Issue.record("expected .files") }
+}
+
+@Test func downgradeForPeerDropsToFirstFileForOldPeer() {
+    let payload = ClipPayload.files([(name: "a", data: Data([1])), (name: "b", data: Data([2]))])
+    let (out, dropped) = downgradeForPeer(payload, peerMinor: 0)
+    #expect(dropped == 1)                                     // one file left behind
+    if case .file(let name, let data)? = out {
+        #expect(name == "a"); #expect(data == Data([1]))     // first file, legacy kind:"file"
+    } else { Issue.record("expected .file") }
+}
+
+@Test func downgradePassesNonFilesPayloadsThrough() {
+    let (out, dropped) = downgradeForPeer(.text("hi"), peerMinor: 0)
+    #expect(dropped == 0)
+    if case .text(let s)? = out { #expect(s == "hi") } else { Issue.record("expected .text") }
+}

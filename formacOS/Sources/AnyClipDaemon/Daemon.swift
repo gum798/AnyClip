@@ -48,6 +48,19 @@ public func clearDirectoryFiles(_ dir: URL) {
     }
 }
 
+/// Decide what to actually send given the peer's protocol minor. Minor >= 1
+/// understands kind:"files" (pass through, dropped == 0). Minor 0 predates
+/// multi-file sync: degrade a .files batch to its first file as legacy
+/// kind:"file"; `dropped` counts the files left behind for the notification.
+/// Returns a nil payload only for an empty .files batch (nothing to send).
+public func downgradeForPeer(
+    _ payload: ClipPayload, peerMinor: Int
+) -> (payload: ClipPayload?, dropped: Int) {
+    guard case .files(let fs) = payload, peerMinor < 1 else { return (payload, 0) }
+    guard let first = fs.first else { return (nil, 0) }
+    return (.file(name: first.name, data: first.data), fs.count - 1)
+}
+
 /// Assembles and supervises one daemon runtime: PeerLink + MdnsBeacon +
 /// ClipboardWatcher + watchdogs, restarting with 1s -> 60s backoff on
 /// errors (improvement over the Python GUI build, where watchdog-raised
@@ -154,14 +167,22 @@ public final class Daemon: @unchecked Sendable {
                         "<- received file \(name) \(data.count) bytes from \(peer) "
                         + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
                     notify("AnyClip ← \(peer)", "file: \(name) (\(data.count / 1024) KB)")
-                case .files(let items):
-                    // Multi-file apply is wired by Task 7 (daemon). No producer
-                    // constructs .files at runtime yet, so this arm exists only
-                    // to keep the switch exhaustive.
-                    let total = items.reduce(0) { $0 + $1.data.count }
+                case .files(let fs):
+                    let placed = await MainActor.run {
+                        watcherBox.get()?.updateLocalFiles(fs) ?? []
+                    }
+                    // markReceived("files", aggregate) already ran at the top of
+                    // this handler. If exactly one file landed, the watcher will
+                    // re-detect it as a single-file copy (kind "file"), so also
+                    // suppress that hash.
+                    if placed.count == 1 {
+                        await coordinator.markReceived(
+                            kind: "file", hash: sha256Hex(placed[0].data))
+                    }
                     AnyLog.shared.info(
-                        "<- received \(items.count) files \(total) bytes from \(peer) "
-                        + "(multi-file apply pending daemon support)")
+                        "<- received \(fs.count) files from \(peer) "
+                        + "(\(placed.count) written to clipboard)")
+                    notify("AnyClip ← \(peer)", "\(placed.count) files")
                 }
             },
             emit: emit)
@@ -174,9 +195,20 @@ public final class Daemon: @unchecked Sendable {
         // former onLocalChange body, now driven by the drain task below.
         let outbound = OutboundQueue()
 
-        let sendOutbound: @Sendable (ClipPayload) async -> Void = { [coordinator, weak link] payload in
+        let sendOutbound: @Sendable (ClipPayload) async -> Void = { [coordinator, weak link] rawPayload in
             guard let link else { return }
             guard await link.isActive else { return }
+
+            // Old-peer fallback: a peer that predates protocol 1.1 cannot decode
+            // kind:"files". Degrade a batch to its first file and notify.
+            let (maybePayload, dropped) = downgradeForPeer(
+                rawPayload, peerMinor: await link.peerProtocolMinor)
+            guard let payload = maybePayload else { return }
+            if dropped > 0 {
+                notify("AnyClip",
+                    "\(dropped) file(s) not synced — update the peer to receive multiple files")
+            }
+
             guard await coordinator.shouldSend(
                 kind: payload.kind, hash: payload.payloadHash)
             else {
@@ -195,10 +227,10 @@ public final class Daemon: @unchecked Sendable {
             case .file(let name, let data):
                 AnyLog.shared.info("-> sent file \(name) \(data.count) bytes to \(peer)")
                 notify("AnyClip → \(peer)", "file: \(name) (\(data.count / 1024) KB)")
-            case .files(let items):
-                // Multi-file send is wired by Task 7 (daemon); exhaustiveness stub.
-                let total = items.reduce(0) { $0 + $1.data.count }
-                AnyLog.shared.info("-> sent \(items.count) files \(total) bytes to \(peer)")
+            case .files(let fs):
+                let total = fs.reduce(0) { $0 + $1.data.count }
+                AnyLog.shared.info("-> sent \(fs.count) files \(total) bytes to \(peer)")
+                notify("AnyClip → \(peer)", "\(fs.count) files")
             }
         }
 
