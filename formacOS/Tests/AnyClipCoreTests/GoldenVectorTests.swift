@@ -68,6 +68,27 @@ private func decodeGoldenFrame(_ name: String) throws -> WireMessage {
     #expect(m.bytes == data!.count)
 }
 
+@Test func goldenClipFilesDecodes() throws {
+    let m = try decodeGoldenFrame("clip_files.bin")
+    let man = try manifest()
+    #expect(m.kind == "files")
+    let entries = try #require(m.files)
+    let names = man["files_names"] as! [String]
+    let hashes = man["files_hashes"] as! [String]
+    #expect(entries.count == names.count)
+    for (i, e) in entries.enumerated() {
+        #expect(e.name == names[i])
+        let data = try #require(strictBase64Decode(e.content))
+        #expect(sha256Hex(data) == hashes[i])          // per-file hash recomputed from bytes
+        #expect(e.hash == hashes[i])                    // wire hash matches manifest
+        #expect(e.bytes == data.count)
+    }
+    // Aggregate + total match the Python-canonical manifest values.
+    #expect(m.hash == man["files_aggregate"] as? String)
+    #expect(aggregateFilesHash(hashes) == man["files_aggregate"] as? String)
+    #expect(m.bytes == man["files_total_bytes"] as? Int)
+}
+
 @Test func goldenPingDecodes() throws {
     let m = try decodeGoldenFrame("ping.bin")
     #expect(m.type == "ping")
