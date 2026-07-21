@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import pathlib
+import unicodedata
 
 OUT = pathlib.Path(__file__).resolve().parent.parent / "Tests" / "AnyClipCoreTests" / "Fixtures"
 
@@ -19,6 +20,15 @@ IMAGE_BYTES = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 FILE_NAME = "réport final.txt"
 FILE_BYTES = b"golden file body \x00\x01\x02"
 TS = 1718000000.5
+# One Korean and one accented-Latin name, binary bodies. Names NFC on wire.
+FILES = [
+    ("노트.txt", b"golden multi one \x00\x01"),
+    ("réport (v2).bin", b"golden multi two \x02\x03"),
+]
+
+
+def _agg(hexes: list) -> str:
+    return hashlib.sha256("".join(sorted(hexes)).encode("ascii")).hexdigest()
 
 
 def frame(obj: dict) -> bytes:
@@ -50,6 +60,21 @@ def main() -> None:
             "hash": hashlib.sha256(FILE_BYTES).hexdigest(), "ts": TS,
             "bytes": len(FILE_BYTES),
         },
+        "clip_files.bin": {
+            "type": "clip", "kind": "files",
+            "files": [
+                {
+                    "name": unicodedata.normalize("NFC", n),
+                    "content": base64.b64encode(b).decode("ascii"),
+                    "hash": hashlib.sha256(b).hexdigest(),
+                    "bytes": len(b),
+                }
+                for n, b in FILES
+            ],
+            "hash": _agg([hashlib.sha256(b).hexdigest() for _n, b in FILES]),
+            "ts": TS,
+            "bytes": sum(len(b) for _n, b in FILES),
+        },
         "ping.bin": {"type": "ping", "ts": TS},
     }
     for fname, obj in vectors.items():
@@ -63,6 +88,11 @@ def main() -> None:
         "file_name": FILE_NAME,
         "file_b64": base64.b64encode(FILE_BYTES).decode("ascii"),
         "file_hash": hashlib.sha256(FILE_BYTES).hexdigest(),
+        "files_names": [unicodedata.normalize("NFC", n) for n, _ in FILES],
+        "files_hashes": [hashlib.sha256(b).hexdigest() for _n, b in FILES],
+        "files_aggregate": _agg(
+            [hashlib.sha256(b).hexdigest() for _n, b in FILES]),
+        "files_total_bytes": sum(len(b) for _n, b in FILES),
         "ts": TS,
     }
     (OUT / "manifest.json").write_text(

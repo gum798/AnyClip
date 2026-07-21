@@ -56,6 +56,8 @@ def main() -> None:
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--token", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--send-files", action="store_true",
+                    help="after handshake, send one kind:'files' clip (2 entries)")
     args = ap.parse_args()
 
     token_hash = hashlib.sha256(args.token.encode("utf-8")).hexdigest()
@@ -91,6 +93,31 @@ def main() -> None:
         "hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "ts": time.time(),
     })
+
+    if args.send_files:
+        import base64 as _b64
+        import unicodedata as _ud
+        entries = [
+            (_ud.normalize("NFC", "노트.txt"), b"multi body one"),
+            (_ud.normalize("NFC", "(E&S) plan.txt"), b"multi body two"),
+        ]
+        files_field = [
+            {
+                "name": n,
+                "content": _b64.b64encode(b).decode("ascii"),
+                "hash": hashlib.sha256(b).hexdigest(),
+                "bytes": len(b),
+            }
+            for n, b in entries
+        ]
+        agg = hashlib.sha256(
+            "".join(sorted(f["hash"] for f in files_field)).encode("ascii")
+        ).hexdigest()
+        send_frame(conn, {
+            "type": "clip", "kind": "files", "files": files_field,
+            "hash": agg, "ts": time.time(),
+            "bytes": sum(f["bytes"] for f in files_field),
+        })
 
     while True:
         msg = recv_frame(conn)

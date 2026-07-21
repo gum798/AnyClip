@@ -9,5 +9,15 @@
   "file_name": "réport final.txt",
   "file_b64": "Z29sZGVuIGZpbGUgYm9keSAAAQI=",
   "file_hash": "518fe58282a8c20a730452120f6c18305e985494a0578b9eaeae470efc4cc7e8",
+  "files_names": [
+    "노트.txt",
+    "réport (v2).bin"
+  ],
+  "files_hashes": [
+    "19ec298dbf31b7d37f08d0536d1657c4ed056115a83317d711be4f0a80fced65",
+    "ce020e6c9b4aac66ff8b8901b7569372cb1672068f7921f822d65c2975facc7a"
+  ],
+  "files_aggregate": "7d04c7a5d04332ff7e657a1046d2e3c22e808f5fccba7dbf321d9738dcb2979c",
+  "files_total_bytes": 38,
   "ts": 1718000000.5
 }
