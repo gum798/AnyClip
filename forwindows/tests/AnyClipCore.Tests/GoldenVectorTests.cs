@@ -75,6 +75,33 @@ public class GoldenVectorTests
     }
 
     [Fact]
+    public void GoldenClipFilesDecodes()
+    {
+        var m = DecodeGolden("clip_files.bin");
+        var man = Manifest();
+        Assert.Equal("files", m.Kind);
+        Assert.NotNull(m.Files);
+        var names = man.GetProperty("files_names").EnumerateArray()
+            .Select(e => e.GetString()).ToArray();
+        var hashes = man.GetProperty("files_hashes").EnumerateArray()
+            .Select(e => e.GetString()!).ToArray();
+        Assert.Equal(names.Length, m.Files!.Count);
+        for (int i = 0; i < m.Files.Count; i++)
+        {
+            var entry = m.Files[i];
+            Assert.Equal(names[i], entry.Name);
+            var data = WireMessage.StrictBase64Decode(entry.Content!)!;
+            Assert.Equal(hashes[i], Hashing.Sha256Hex(data)); // recomputed == manifest
+            Assert.Equal(hashes[i], entry.Hash);               // wire hash == manifest
+            Assert.Equal(entry.Bytes, data.Length);
+        }
+        Assert.Equal(man.GetProperty("files_aggregate").GetString(),
+            Hashing.AggregateFilesHash(hashes));
+        Assert.Equal(man.GetProperty("files_aggregate").GetString(), m.Hash);
+        Assert.Equal(man.GetProperty("files_total_bytes").GetInt32(), m.Bytes);
+    }
+
+    [Fact]
     public void GoldenPingDecodes()
     {
         var m = DecodeGolden("ping.bin");
