@@ -194,4 +194,71 @@ public class InteropTests
             if (!proc.HasExited) proc.Kill();
         }
     }
+
+    [Fact]
+    public async Task InteropReceivesFilesClipFromPythonPeer()
+    {
+        int port = 28635;
+        string outFile = Path.Combine(Path.GetTempPath(),
+            $"fake-peer-{Guid.NewGuid()}.jsonl");
+        var psi = new ProcessStartInfo
+        {
+            FileName = "python3",
+            ArgumentList =
+            {
+                Path.Combine(RepoRoot(), "formacOS", "Scripts", "fake_peer.py"),
+                "--port", port.ToString(),
+                "--token", "interop-token",
+                "--out", outFile,
+                "--send-files",
+            },
+            RedirectStandardOutput = true,
+        };
+        using var proc = Process.Start(psi)!;
+        try
+        {
+            var ready = await proc.StandardOutput.ReadLineAsync()
+                .WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal("READY", ready);
+
+            var clips = new List<ClipPayload>();
+            var link = new PeerLink(
+                new PeerLink.LinkConfig("interop-token", 28636, "csharp-interop", "0.0.0-test"),
+                Guid.NewGuid().ToString().ToLowerInvariant());
+            link.OnClip = p => { lock (clips) clips.Add(p); return Task.CompletedTask; };
+            link.Emit = _ => { };
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            _ = link.TryConnectAsync("127.0.0.1", port, $"127.0.0.1:{port}", cts.Token);
+
+            async Task<bool> WaitUntil(Func<bool> cond, double seconds = 5)
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(seconds);
+                while (DateTime.UtcNow < deadline)
+                { if (cond()) return true; await Task.Delay(50); }
+                return cond();
+            }
+
+            Assert.True(await WaitUntil(() => link.IsActive));
+            Assert.True(await WaitUntil(() =>
+            {
+                lock (clips) return clips.OfType<FilesClip>().Any(f => f.Files.Count == 2);
+            }));
+
+            FilesClip got;
+            lock (clips) got = clips.OfType<FilesClip>().First(f => f.Files.Count == 2);
+            Assert.Equal("노트.txt", got.Files[0].Name);
+            Assert.Equal("multi body one",
+                System.Text.Encoding.UTF8.GetString(got.Files[0].Data));
+            Assert.Equal("(E&S) plan.txt", got.Files[1].Name);
+            Assert.Equal("multi body two",
+                System.Text.Encoding.UTF8.GetString(got.Files[1].Data));
+
+            link.Shutdown();
+        }
+        finally
+        {
+            if (!proc.HasExited) proc.Kill();
+        }
+    }
 }
