@@ -228,3 +228,58 @@ private func waitUntil(
     #expect(serving)
     await link.shutdown()
 }
+
+@Test func twoLinksExchangeMultipleFiles() async throws {
+    let aClips = Locked<[ClipPayload]>([]); let aEvents = Locked<[DaemonEvent]>([])
+    let bClips = Locked<[ClipPayload]>([]); let bEvents = Locked<[DaemonEvent]>([])
+    let a = await makeLink(token: "tok", port: 28485, name: "node-a", clips: aClips, events: aEvents)
+    let b = await makeLink(token: "tok", port: 28486, name: "node-b", clips: bClips, events: bEvents)
+    let serveA = Task { try await a.serve() }
+    defer { serveA.cancel() }
+    #expect(await waitUntil { await a.isServing })
+    let connectB = Task {
+        await b.tryConnect(
+            to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 28485)!),
+            label: "127.0.0.1:28485")
+    }
+    defer { connectB.cancel() }
+    #expect(await waitUntil { let x = await a.isActive; let y = await b.isActive; return x && y })
+
+    let files: [(name: String, data: Data)] = [
+        (name: "노트.txt", data: Data("body one".utf8)),
+        (name: "réport (v2).bin", data: Data([0, 1, 2, 3])),
+    ]
+    await b.sendClip(.files(files))
+    #expect(await waitUntil {
+        aClips.get().contains {
+            if case .files(let fs) = $0 {
+                return fs.count == 2
+                    && fs.contains { $0.name == "노트.txt" && $0.data == Data("body one".utf8) }
+                    && fs.contains { $0.name == "réport (v2).bin" && $0.data == Data([0, 1, 2, 3]) }
+            }
+            return false
+        }
+    })
+    await a.shutdown(); await b.shutdown()
+}
+
+@Test func peerProtocolMinorRetainedFromHello() async throws {
+    let clips = Locked<[ClipPayload]>([]); let events = Locked<[DaemonEvent]>([])
+    let a = await makeLink(token: "tok", port: 28487, name: "a", clips: clips, events: events)
+    let serveA = Task { try await a.serve() }
+    defer { serveA.cancel() }
+    #expect(await waitUntil { await a.isServing })
+
+    let raw = FramedConnection.outbound(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 28487)!))
+    try await raw.start()
+    defer { raw.cancel() }
+    var hello = WireMessage.hello(
+        tokenHash: sha256Hex("tok"), nodeID: "ffffffff-oldpeer", name: "old", appVersion: "1.0.0")
+    hello.protocol_minor = 0                                  // pre-1.1 peer
+    try await raw.sendFrame(hello)
+    _ = try await raw.receiveMessage()                        // a's hello
+    #expect(await waitUntil { await a.isActive })
+    #expect(await a.peerProtocolMinor == 0)
+    await a.shutdown()
+}

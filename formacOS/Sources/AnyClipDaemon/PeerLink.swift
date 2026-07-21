@@ -34,6 +34,9 @@ public actor PeerLink {
     private var activeConn: FramedConnection?
     private var peerNodeID: String?
     public private(set) var peerName: String?
+    /// Peer's advertised protocol minor from the hello; gates the outbound
+    /// files/kind:"file" downgrade. 0 when unlinked.
+    public private(set) var peerProtocolMinor: Int = 0
     private var linkedAt: Double = 0
     /// Monotonic timestamp of the last inbound frame on the active link. Drives
     /// half-open detection: a peer that slept or vanished without RST/FIN keeps
@@ -304,6 +307,7 @@ public actor PeerLink {
         }
         activeConn = framed
         peerNodeID = peerID
+        peerProtocolMinor = peerVersion.protocolMinor
         let displayName = (hello.name?.isEmpty == false) ? hello.name! : String(peerID.prefix(8))
         peerName = displayName
         linkedAt = monotonicNow()
@@ -348,6 +352,7 @@ public actor PeerLink {
             activeConn = nil
             peerNodeID = nil
             peerName = nil
+            peerProtocolMinor = 0
         }
         AnyLog.shared.info("peer disconnected")
         if wasActive {
@@ -377,6 +382,13 @@ public actor PeerLink {
             }
             let name = (m.name?.isEmpty == false) ? m.name! : "received.bin"
             await onClip?(.file(name: name, data: data))
+        case "files":
+            guard let entries = decodeFileEntries(m.files) else {
+                AnyLog.shared.warning(
+                    "bad files payload from peer (empty or invalid base64); dropping frame")
+                return
+            }
+            await onClip?(.files(entries))
         default:
             AnyLog.shared.debug("ignoring clip with kind=\(kind)")
         }
@@ -430,6 +442,7 @@ public actor PeerLink {
         activeConn = nil
         peerNodeID = nil
         peerName = nil
+        peerProtocolMinor = 0
         listener?.cancel()
         listener = nil
         isServing = false
