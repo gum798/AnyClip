@@ -30,6 +30,9 @@ import Testing
     #expect(sanitizeFilename("../x") == "x")                   // traversal -> last component
     #expect(sanitizeFilename("..") == "received.bin")          // dotdot -> received.bin
     #expect(sanitizeFilename(".") == "received.bin")
+    // Trailing separator -> empty final component (Python rsplit[-1] == "").
+    #expect(sanitizeFilename("a/") == "received.bin")
+    #expect(sanitizeFilename("dir\\") == "received.bin")
 }
 
 @Test func sanitizeTrimsTrailingDotsAndSpaces() {

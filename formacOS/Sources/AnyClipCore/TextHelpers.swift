@@ -24,7 +24,12 @@ public func preview(_ text: String, maxLen: Int = 80) -> String {
 ///      case-insensitive, matched on the stem before the FIRST dot) -> "_"-prefixed.
 public func sanitizeFilename(_ name: String) -> String {
     let nfc = name.precomposedStringWithCanonicalMapping
-    let base = nfc.split(whereSeparator: { $0 == "/" || $0 == "\\" })
+    // omittingEmptySubsequences: false + .last reproduces Python's
+    // rsplit("/", 1)[-1] EXACTLY: a trailing separator yields "" (-> the
+    // received.bin fallback below), not the component before it. Keep in
+    // lockstep with anyclip.sanitize_filename and C# TextHelpers.SanitizeFilename.
+    let base = nfc.split(omittingEmptySubsequences: false,
+                         whereSeparator: { $0 == "/" || $0 == "\\" })
         .last.map(String.init) ?? ""
     let deny: Set<Character> = ["\\", "/", "<", ">", ":", "\"", "|", "?", "*"]
     var out = ""
