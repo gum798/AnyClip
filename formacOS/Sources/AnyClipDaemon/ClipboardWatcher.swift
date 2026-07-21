@@ -149,14 +149,15 @@ public final class ClipboardWatcher {
         var sendable: [(name: String, data: Data)] = []
         var running = 0
         var skippedForSize = 0
+        // Folders are collected during the loop and named in ONE notification
+        // afterwards (spec: one skip notification per detection pass). Mirrors
+        // the Python `skipped_folders` accumulation.
+        var skippedFolders: [String] = []
         for url in urls {
             guard let fp = FileFingerprint(url: url) else { continue }
             if fp.isDirectory {
                 AnyLog.shared.warning("folder on clipboard not synced (unsupported): \(url.path)")
-                if let onSkipped = callbacks.onFileSkipped {
-                    await onSkipped(
-                        "folder not synced — folders are not supported: \(url.lastPathComponent)")
-                }
+                skippedFolders.append(url.lastPathComponent)
                 continue
             }
             if sendable.count >= Self.maxFilesPerClip || running + fp.size > Self.fileBudget {
@@ -169,6 +170,15 @@ public final class ClipboardWatcher {
             }
             running += fp.size
             sendable.append((name: url.lastPathComponent, data: data))
+        }
+        if !skippedFolders.isEmpty, let onSkipped = callbacks.onFileSkipped {
+            if skippedFolders.count == 1 {
+                await onSkipped(
+                    "folder not synced — folders are not supported: \(skippedFolders[0])")
+            } else {
+                await onSkipped(
+                    "\(skippedFolders.count) folders not synced — folders are not supported")
+            }
         }
         if skippedForSize > 0, let onSkipped = callbacks.onFileSkipped {
             await onSkipped("\(skippedForSize) file(s) skipped (too large to sync)")

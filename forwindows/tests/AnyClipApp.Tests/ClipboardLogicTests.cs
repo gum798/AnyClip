@@ -237,7 +237,25 @@ public class ClipboardLogicTests
         await w.HandleClipboardUpdateAsync();
         var fc = Assert.IsType<FilesClip>(Assert.Single(changes));
         Assert.Equal(2, fc.Files.Count);
-        Assert.Contains(skipped, s => s.Contains("folders are not supported"));
+        // Single folder -> exactly one skip callback, singular wording with the name.
+        Assert.Equal($"folder not synced — folders are not supported: {Path.GetFileName(folder)}",
+            Assert.Single(skipped));
+    }
+
+    [Fact]
+    public async Task MultipleFoldersEmitOneAggregatedSkip()
+    {
+        var (w, clip, changes, skipped) = Make(TempDir());
+        var d = TempDir();
+        var folder1 = TempDir();
+        var folder2 = TempDir();
+        var f1 = Path.Combine(d, "keep.txt"); File.WriteAllText(f1, "k");
+        clip.FilePaths = new List<string> { folder1, folder2, f1 };
+        await w.HandleClipboardUpdateAsync();
+        // The single accepted file still syncs (legacy FileClip kind).
+        Assert.IsType<FileClip>(Assert.Single(changes));
+        // Exactly ONE aggregated skip notification, plural wording, no folder names.
+        Assert.Equal("2 folders not synced — folders are not supported", Assert.Single(skipped));
     }
 
     [Fact]

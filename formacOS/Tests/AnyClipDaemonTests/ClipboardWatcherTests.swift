@@ -112,8 +112,10 @@ private func makeWatcher(
     pb.writeObjects([folder as NSURL])
     await watcher.pollOnceForTesting()
     #expect(changes.get().isEmpty)
+    // Exactly one skip callback, singular wording naming the folder.
     #expect(skipped.get().count == 1)
-    #expect(skipped.get()[0].contains("folders are not supported"))
+    #expect(skipped.get()[0]
+        == "folder not synced — folders are not supported: \(folder.lastPathComponent)")
     // Same copy is never re-detected.
     await watcher.pollOnceForTesting()
     #expect(skipped.get().count == 1)
@@ -217,7 +219,32 @@ private func makeWatcher(
     let got = changes.get()
     #expect(got.count == 1)
     if case .files(let fs) = got[0] { #expect(fs.count == 2) } else { Issue.record("expected .files") }
-    #expect(skipped.get().contains { $0.contains("folders are not supported") })
+    // Single folder -> exactly one skip callback, singular wording with the name.
+    #expect(skipped.get().count == 1)
+    #expect(skipped.get()[0] == "folder not synced — folders are not supported: sub")
+}
+
+@Test @MainActor func multipleFoldersEmitOneAggregatedSkip() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let d1 = dir.appendingPathComponent("one", isDirectory: true)
+    let d2 = dir.appendingPathComponent("two", isDirectory: true)
+    try FileManager.default.createDirectory(at: d1, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: d2, withIntermediateDirectories: true)
+    let f1 = dir.appendingPathComponent("keep.txt"); try Data("k".utf8).write(to: f1)
+    pb.clearContents()
+    pb.writeObjects([d1 as NSURL, d2 as NSURL, f1 as NSURL])
+    await watcher.pollOnceForTesting()
+    // The single accepted file still syncs (legacy .file kind).
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .file(let name, _) = got[0] { #expect(name == "keep.txt") }
+    else { Issue.record("expected single-file payload") }
+    // Exactly ONE aggregated skip notification, plural wording, no folder names.
+    #expect(skipped.get().count == 1)
+    #expect(skipped.get()[0] == "2 folders not synced — folders are not supported")
 }
 
 @Test @MainActor func budgetGreedySkipOverflowFallsBackToSingleFile() async throws {

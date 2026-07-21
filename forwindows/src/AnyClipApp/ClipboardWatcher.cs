@@ -270,8 +270,11 @@ public sealed class ClipboardWatcher : IClipboardSync
         // skipped) so nothing retry-loops.
         _lastFileFingerprints = fps;
 
-        // Split folders (skip + notify) from files.
+        // Split folders from files. Skipped folders are collected here and named
+        // in ONE notification afterwards (spec: one skip notification per
+        // detection pass). Mirrors the Python `skipped_folders` accumulation.
         var files = new List<string>();
+        var skippedFolders = new List<string>();
         foreach (var p in paths)
         {
             if (Directory.Exists(p))
@@ -279,10 +282,16 @@ public sealed class ClipboardWatcher : IClipboardSync
                 var display = Path.GetFileName(p.TrimEnd('/', '\\'));
                 if (string.IsNullOrEmpty(display)) display = p; // drive roots
                 RotatingLog.Shared.Warning($"folder on clipboard not synced (unsupported): {p}");
-                await SafeSkipAsync($"folder not synced — folders are not supported: {display}");
+                skippedFolders.Add(display);
             }
             else files.Add(p);
         }
+        if (skippedFolders.Count == 1)
+            await SafeSkipAsync(
+                $"folder not synced — folders are not supported: {skippedFolders[0]}");
+        else if (skippedFolders.Count >= 2)
+            await SafeSkipAsync(
+                $"{skippedFolders.Count} folders not synced — folders are not supported");
 
         // Greedy: keep files in selection order while sum(raw) <= budget and
         // count <= cap. Skipped (too large, over-cap, or unreadable) -> one toast.
