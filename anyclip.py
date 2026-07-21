@@ -507,6 +507,34 @@ def set_clipboard_file(path: str) -> bool:
     return False
 
 
+def set_clipboard_files(paths: list) -> bool:
+    """Place multiple file references on the clipboard in one operation.
+
+    Windows-> PowerShell ``Set-Clipboard -Path`` with N paths.
+    macOS  -> not reliably supported for multiple furls (the shipped Mac app
+              is the Swift port); the caller places only the first file via
+              set_clipboard_file, so this returns False here.
+    Other  -> no-op (False).
+    """
+    if not paths:
+        return False
+    if sys.platform == "win32":
+        try:
+            abs_paths = [str(Path(p).resolve()) for p in paths]
+            quoted = ",".join("'" + p.replace("'", "''") + "'" for p in abs_paths)
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Set-Clipboard -Path {quoted}"],
+                capture_output=True, timeout=5,
+                creationflags=0x08000000,
+            )
+            return result.returncode == 0
+        except Exception as exc:
+            log.warning(f"set_clipboard_files (Windows) failed: {exc}")
+            return False
+    return False
+
+
 def set_clipboard_image(png_bytes: bytes) -> bool:
     """Best-effort: place a PNG image on the system clipboard.
 
@@ -1181,6 +1209,50 @@ class ClipboardWatcher:
             log.warning("clipboard write (file) failed or unsupported on this OS")
         return ok
 
+    def update_local_files(self, files: list) -> int:
+        """Write received files under ~/.anyclip/received/ and place them on
+        the clipboard in one operation. ``files`` is [(name, raw_bytes), ...].
+
+        Names are sanitized then de-duplicated within the batch before
+        writing. macOS places only the FIRST file (AppleScript furl limit);
+        Windows places all. Baselines the fingerprint to the paths actually
+        PLACED on the clipboard so the just-written files are not re-detected.
+        Returns the number of files placed on the clipboard (0 on failure)."""
+        names = uniquify_names([sanitize_filename(n) for n, _ in files])
+        target_dir = LOG_DIR / "received"
+        written = []  # absolute path strings, in batch order
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for safe, (_orig, data) in zip(names, files):
+                target = target_dir / safe
+                target.write_bytes(bytes(data))
+                written.append(str(target))
+        except OSError as exc:
+            log.warning(f"file write to {target_dir} failed: {exc}")
+            return 0
+        if not written:
+            return 0
+        if sys.platform == "darwin":
+            placed = written[:1]
+            ok = set_clipboard_file(placed[0])
+        elif sys.platform == "win32":
+            placed = list(written)
+            ok = set_clipboard_files(placed)
+        else:
+            placed, ok = [], False
+        if not ok:
+            log.warning("clipboard write (files) failed or unsupported on this OS")
+            placed = []
+        fp = []
+        for p in placed:
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            fp.append((p, st.st_size, st.st_mtime_ns))
+        self._last_file_fp = fp or None
+        return len(placed)
+
 
 class AuthGate:
     """Per-IP cooldown after repeated handshake failures.
@@ -1238,6 +1310,7 @@ class PeerLink:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._peer_node_id: Optional[str] = None
         self._peer_name: Optional[str] = None  # peer's display name (from hello)
+        self._peer_protocol_minor: Optional[int] = None  # from hello; gates kind:"files"
         self._linked_at: float = 0.0  # monotonic time when _writer was last set
         # Monotonic time of the last inbound frame on the active link. Drives
         # half-open detection: a peer that slept or vanished without RST/FIN
@@ -1260,6 +1333,10 @@ class PeerLink:
     @property
     def peer_name(self) -> Optional[str]:
         return self._peer_name
+
+    @property
+    def peer_protocol_minor(self) -> Optional[int]:
+        return self._peer_protocol_minor
 
     async def serve(self) -> None:
         try:
@@ -1490,6 +1567,7 @@ class PeerLink:
                 self._safe_close(self._writer)  # type: ignore[arg-type]
             self._writer = writer
             self._peer_node_id = peer_id
+            self._peer_protocol_minor = peer_proto_minor_raw
             self._peer_name = hello.get("name") or peer_id[:8]
             self._linked_at = time.monotonic()
             self._last_inbound = time.monotonic()
@@ -1560,6 +1638,7 @@ class PeerLink:
                 if was_active:
                     self._writer = None
                     self._peer_node_id = None
+                    self._peer_protocol_minor = None
                     self._peer_name = None
             log.info("peer disconnected")
             if was_active:
@@ -2118,6 +2197,27 @@ async def _run_permission_probe(beacon: "MdnsBeacon") -> None:
         log.debug("permission probe: ok")
 
 
+async def emit_files_clip(link, suppressor, data) -> tuple:
+    """Decide how to send a local multi-file selection to the peer and do it.
+    ``data`` is [(name, raw_bytes), ...] with len >= 2. Returns:
+      ("suppressed", 0) -- echo of a just-received set; nothing sent.
+      ("files", n)      -- sent all n files as one kind:"files" clip.
+      ("file", dropped) -- peer protocol_minor 0; sent the first file as a
+                           legacy kind:"file" clip; ``dropped`` others not sent.
+    """
+    hashes = [sha256_bytes(bytes(raw)) for _name, raw in data]
+    aggregate = aggregate_files_hash(hashes)
+    if not suppressor.should_send("files", aggregate):
+        return ("suppressed", 0)
+    minor = link.peer_protocol_minor or 0
+    if minor >= 1:
+        await link.send_clip("files", data)
+        return ("files", len(data))
+    first_name, first_raw = data[0]
+    await link.send_clip("file", (first_name, bytes(first_raw)))
+    return ("file", len(data) - 1)
+
+
 async def run(config: Config) -> None:
     setup_logging(config.verbose)
     if _token_loaded_from_config.get():
@@ -2176,6 +2276,27 @@ async def run(config: Config) -> None:
                     title=f"AnyClip ← {peer}",
                     message=f"file: {name} ({len(raw_b)//1024} KB)",
                 )
+        elif kind == "files":
+            assert isinstance(data, list)
+            # data: [(name, raw_bytes), ...] already decoded from the wire.
+            hashes = [sha256_bytes(bytes(raw)) for _name, raw in data]
+            aggregate = aggregate_files_hash(hashes)
+            suppressor.mark_received("files", aggregate)
+            placed = await asyncio.to_thread(watcher.update_local_files, data)
+            # Python-macOS places only the FIRST file; a re-detection of a
+            # lone placed file surfaces as kind:"file", so also seed the
+            # single-file suppressor slot with that file's hash.
+            if placed == 1:
+                suppressor.mark_received("file", hashes[0])
+            log.info(
+                f"<- received {len(data)} files from {peer!r} "
+                f"({placed} placed on clipboard)"
+            )
+            if notify_enabled:
+                await notify_async(
+                    title=f"AnyClip ← {peer}",
+                    message=f"{len(data)} files",
+                )
 
     link = PeerLink(config, node_id, on_remote_clip)
 
@@ -2223,6 +2344,32 @@ async def run(config: Config) -> None:
                 await notify_async(
                     title=f"AnyClip → {peer}",
                     message=f"file: {name} ({len(raw_b)//1024} KB)",
+                )
+        elif kind == "files":
+            assert isinstance(data, list)
+            decision, count = await emit_files_clip(link, suppressor, data)
+            peer = link.peer_name or "peer"
+            if decision == "suppressed":
+                log.debug("skip echo of just-received files")
+                return
+            if decision == "files":
+                log.info(f"-> sent {count} files to {peer!r}")
+                if notify_enabled:
+                    await notify_async(
+                        title=f"AnyClip → {peer}", message=f"{count} files",
+                    )
+            else:  # "file" old-peer fallback
+                log.info(
+                    f"-> sent 1 file to {peer!r} "
+                    f"(peer proto minor 0, {count} dropped)"
+                )
+                if notify_enabled:
+                    await notify_async(
+                        title=f"AnyClip → {peer}", message="file (1 of many)",
+                    )
+                await on_file_skipped(
+                    f"{count} file(s) not sent — peer needs an update for "
+                    "multi-file sync"
                 )
 
     async def on_file_skipped(message: str) -> None:
