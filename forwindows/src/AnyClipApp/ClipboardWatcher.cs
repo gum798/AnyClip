@@ -12,10 +12,10 @@ public interface IWin32Clipboard
 {
     string? GetText();
     byte[]? GetImagePng();
-    string? GetFirstFilePath();
+    IReadOnlyList<string>? GetFilePaths();
     bool SetText(string text);
     bool SetImagePng(byte[] png);
-    bool SetFilePath(string path);
+    bool SetFilePaths(IReadOnlyList<string> paths);
 }
 
 /// Real implementation over WinForms Clipboard. The WinForms Clipboard
@@ -52,11 +52,14 @@ public sealed class WinFormsClipboard : IWin32Clipboard
         return ms.ToArray();
     });
 
-    public string? GetFirstFilePath() => OnSta<string?>(() =>
+    public IReadOnlyList<string>? GetFilePaths() => OnSta<IReadOnlyList<string>?>(() =>
     {
         if (!Clipboard.ContainsFileDropList()) return null;
         var list = Clipboard.GetFileDropList();
-        return list.Count > 0 ? list[0] : null;
+        if (list.Count == 0) return null;
+        var result = new List<string>(list.Count);
+        foreach (var p in list) if (p is not null) result.Add(p);
+        return result.Count > 0 ? result : null;
     });
 
     public bool SetText(string text) => OnSta(() =>
@@ -74,11 +77,12 @@ public sealed class WinFormsClipboard : IWin32Clipboard
         catch (Exception) { return false; }
     });
 
-    public bool SetFilePath(string path) => OnSta(() =>
+    public bool SetFilePaths(IReadOnlyList<string> paths) => OnSta(() =>
     {
         try
         {
-            var sc = new System.Collections.Specialized.StringCollection { path };
+            var sc = new System.Collections.Specialized.StringCollection();
+            foreach (var p in paths) sc.Add(p);
             Clipboard.SetFileDropList(sc);
             return true;
         }
@@ -95,6 +99,7 @@ public sealed class ClipboardWatcher : IClipboardSync
     public const int ReadFailWarnAt = 5; // READ_FAIL_WARN_AT in anyclip.py
     public static readonly int FileBudget =
         (int)((Wire.MaxPayload - 256 * 1024) * 0.74);
+    public const int MaxFilesPerClip = 100; // sender-side cap; receiver stays lenient
 
     private readonly IWin32Clipboard _clipboard;
     private readonly string _receivedDir;
@@ -106,8 +111,7 @@ public sealed class ClipboardWatcher : IClipboardSync
     // unlike the boot-based monotonic clocks in the Python/Swift ports,
     // so 0.0 would swallow the first image copied within 1 s of startup.
     private double _lastImageSendAt = double.NegativeInfinity;
-    private (string Path, long Size, long MTimeTicks)? _lastFileFingerprint;
-    private bool _oversizeWarned;
+    private List<(string Path, long Size, long MTimeTicks)> _lastFileFingerprints = new();
     private int _consecReadFails;
     private bool _readFailWarned;
     private bool _updateRunning;
@@ -125,7 +129,8 @@ public sealed class ClipboardWatcher : IClipboardSync
         // crash Program.
         _lastText = SafeRead(clipboard.GetText);
         if (SafeRead(clipboard.GetImagePng) is { } png) _lastImageHash = Hashing.Sha256Hex(png);
-        if (SafeRead(clipboard.GetFirstFilePath) is { } p) _lastFileFingerprint = Fingerprint(p);
+        if (SafeRead(clipboard.GetFilePaths) is { } paths)
+            _lastFileFingerprints = FingerprintList(paths);
     }
 
     /// The daemon's pump: events arrive from the UI message loop, so this
@@ -246,62 +251,82 @@ public sealed class ClipboardWatcher : IClipboardSync
         { return null; }
     }
 
+    private static List<(string Path, long Size, long MTimeTicks)> FingerprintList(
+        IReadOnlyList<string> paths)
+    {
+        var list = new List<(string Path, long Size, long MTimeTicks)>(paths.Count);
+        foreach (var p in paths)
+            if (Fingerprint(p) is { } fp) list.Add(fp);
+        return list;
+    }
+
     private async Task CheckFileClipboardAsync()
     {
-        var path = SafeRead(_clipboard.GetFirstFilePath);
-        if (path is null) return;
-        var fp = Fingerprint(path);
-        if (fp is null || fp == _lastFileFingerprint) return;
+        var paths = SafeRead(_clipboard.GetFilePaths);
+        if (paths is null || paths.Count == 0) return;
+        var fps = FingerprintList(paths);
+        if (fps.Count == 0 || fps.SequenceEqual(_lastFileFingerprints)) return;
+        // Record FIRST — the fingerprint is always taken (even if everything is
+        // skipped) so nothing retry-loops.
+        _lastFileFingerprints = fps;
 
-        if (Directory.Exists(path))
+        // Split folders (skip + notify) from files.
+        var files = new List<string>();
+        foreach (var p in paths)
         {
-            _lastFileFingerprint = fp; // record FIRST — no retry loop
-            var display = Path.GetFileName(path.TrimEnd('/', '\\'));
-            if (string.IsNullOrEmpty(display)) display = path; // e.g. drive roots
-            RotatingLog.Shared.Warning(
-                $"folder on clipboard not synced (unsupported): {path}");
-            try
+            if (Directory.Exists(p))
             {
-                await (OnFileSkipped?.Invoke(
-                    $"folder not synced — folders are not supported: {display}")
-                    ?? Task.CompletedTask);
+                var display = Path.GetFileName(p.TrimEnd('/', '\\'));
+                if (string.IsNullOrEmpty(display)) display = p; // drive roots
+                RotatingLog.Shared.Warning($"folder on clipboard not synced (unsupported): {p}");
+                await SafeSkipAsync($"folder not synced — folders are not supported: {display}");
             }
-            catch (Exception e)
-            { RotatingLog.Shared.Error($"on_file_skipped handler failed: {e}"); }
-            return;
+            else files.Add(p);
         }
-        if (fp.Value.Size > FileBudget)
+
+        // Greedy: keep files in selection order while sum(raw) <= budget and
+        // count <= cap. Skipped (too large, over-cap, or unreadable) -> one toast.
+        var sendable = new List<(string Name, byte[] Data)>();
+        long cumulative = 0;
+        int skipped = 0;
+        foreach (var path in files)
         {
-            if (!_oversizeWarned)
+            if (sendable.Count >= MaxFilesPerClip) { skipped++; continue; }
+            long size;
+            try { size = new FileInfo(path).Length; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                RotatingLog.Shared.Warning(
-                    $"file {path} too large to sync ({fp.Value.Size} bytes > "
-                    + $"limit {FileBudget}); skipping");
-                _oversizeWarned = true;
+                RotatingLog.Shared.Warning($"file stat failed for {path}: {e.Message}; skipping");
+                skipped++; continue;
             }
-            _lastFileFingerprint = fp;
-            return;
+            if (cumulative + size > FileBudget) { skipped++; continue; }
+            byte[] data;
+            try { data = await File.ReadAllBytesAsync(path); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                RotatingLog.Shared.Warning($"file read failed for {path}: {e.Message}; skipping");
+                skipped++; continue;
+            }
+            cumulative += size;
+            sendable.Add((Path.GetFileName(path), data));
         }
-        _oversizeWarned = false;
-        // Record BEFORE the read: no await window in which a coalesced
-        // rerun could re-detect (and re-send) the same file. Behavior-
-        // preserving: the read-failure path recorded the same fp anyway.
-        _lastFileFingerprint = fp;
-        byte[] data;
-        try { data = await File.ReadAllBytesAsync(path); }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            // Unreadable now won't improve by retrying (fp already recorded).
-            RotatingLog.Shared.Warning($"file read failed for {path}: {e.Message}; skipping");
-            return;
-        }
-        try
-        {
-            await (OnLocalChange?.Invoke(new FileClip(Path.GetFileName(path), data))
-                ?? Task.CompletedTask);
-        }
+        if (skipped > 0)
+            await SafeSkipAsync($"{skipped} file(s) skipped (too large to sync)");
+
+        if (sendable.Count == 0) return;
+        ClipPayload payload = sendable.Count == 1
+            ? new FileClip(sendable[0].Name, sendable[0].Data)
+            : new FilesClip(sendable);
+        try { await (OnLocalChange?.Invoke(payload) ?? Task.CompletedTask); }
         catch (Exception e)
-        { RotatingLog.Shared.Error($"on_change(file) handler failed: {e}"); }
+        { RotatingLog.Shared.Error($"on_change(files) handler failed: {e}"); }
+    }
+
+    private async Task SafeSkipAsync(string message)
+    {
+        try { await (OnFileSkipped?.Invoke(message) ?? Task.CompletedTask); }
+        catch (Exception e)
+        { RotatingLog.Shared.Error($"on_file_skipped handler failed: {e}"); }
     }
 
     /// Inbound (peer → local). Baselines updated BEFORE writes.
@@ -321,18 +346,40 @@ public sealed class ClipboardWatcher : IClipboardSync
                 try
                 {
                     Directory.CreateDirectory(_receivedDir);
-                    string target = Path.Combine(
-                        _receivedDir, TextHelpers.SanitizeFilename(f.Name));
+                    string target = Path.Combine(_receivedDir, TextHelpers.SanitizeFilename(f.Name));
                     File.WriteAllBytes(target, f.Data);
-                    _lastFileFingerprint = Fingerprint(target);
-                    bool fileOk = _clipboard.SetFilePath(target);
+                    _lastFileFingerprints = FingerprintList(new[] { target });
+                    bool fileOk = _clipboard.SetFilePaths(new[] { target });
                     if (!fileOk) RotatingLog.Shared.Warning("clipboard write (file) failed");
                     return Task.FromResult(fileOk);
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
-                    RotatingLog.Shared.Warning(
-                        $"file write to {_receivedDir} failed: {e.Message}");
+                    RotatingLog.Shared.Warning($"file write to {_receivedDir} failed: {e.Message}");
+                    return Task.FromResult(false);
+                }
+            case FilesClip fs:
+                try
+                {
+                    Directory.CreateDirectory(_receivedDir);
+                    var sanitized = TextHelpers.UniquifyNames(
+                        fs.Files.Select(x => TextHelpers.SanitizeFilename(x.Name)).ToList());
+                    var placed = new List<string>(fs.Files.Count);
+                    for (int i = 0; i < fs.Files.Count; i++)
+                    {
+                        string target = Path.Combine(_receivedDir, sanitized[i]);
+                        File.WriteAllBytes(target, fs.Files[i].Data);
+                        placed.Add(target);
+                    }
+                    // Baseline to the paths actually PLACED on the clipboard.
+                    _lastFileFingerprints = FingerprintList(placed);
+                    bool filesOk = _clipboard.SetFilePaths(placed);
+                    if (!filesOk) RotatingLog.Shared.Warning("clipboard write (files) failed");
+                    return Task.FromResult(filesOk);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    RotatingLog.Shared.Warning($"files write to {_receivedDir} failed: {e.Message}");
                     return Task.FromResult(false);
                 }
             default:
