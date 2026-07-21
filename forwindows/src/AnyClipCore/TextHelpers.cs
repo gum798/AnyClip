@@ -25,20 +25,63 @@ public static class TextHelpers
         catch (ArgumentException) { return s; }
     }
 
+    private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    };
+
+    /// Cross-platform denylist sanitizer (receive side). Keep in lockstep with
+    /// Swift sanitizeFilename and anyclip.update_local_file:
+    /// NFC; basename; replace \ / < > : " | ? *, controls (< U+0020), U+007F;
+    /// trim trailing dots/spaces; empty/./.. -> received.bin; Windows reserved
+    /// device names (stem before first dot, case-insensitive) -> "_" prefix.
     public static string SanitizeFilename(string name)
     {
-        // Normalize to NFC first: a macOS peer sends filenames in NFD
-        // (decomposed Hangul = conjoining jamo U+11xx Windows can't render).
-        // NFC is the cross-platform interchange form. Keep in lockstep with
-        // Swift sanitizeFilename and anyclip.update_local_file.
         name = ToNfc(name);
         int cut = Math.Max(name.LastIndexOf('/'), name.LastIndexOf('\\'));
-        var basename = (cut >= 0 ? name[(cut + 1)..] : name).Trim();
-        if (basename.Length == 0) return "received.bin";
+        var basename = cut >= 0 ? name[(cut + 1)..] : name;
         var sb = new StringBuilder(basename.Length);
         foreach (var ch in basename)
-            sb.Append(char.IsLetterOrDigit(ch) || ch is '.' or '_' or '-' or ' '
-                ? ch : '_');
-        return sb.ToString();
+            sb.Append(
+                ch is '\\' or '/' or '<' or '>' or ':' or '"' or '|' or '?' or '*'
+                    || ch < ' ' || ch == ''
+                ? '_' : ch);
+        var cleaned = sb.ToString().TrimEnd('.', ' ');
+        if (cleaned.Length == 0 || cleaned == "." || cleaned == "..") return "received.bin";
+        int dot = cleaned.IndexOf('.');
+        var stem = dot >= 0 ? cleaned[..dot] : cleaned;
+        if (ReservedDeviceNames.Contains(stem)) cleaned = "_" + cleaned;
+        return cleaned;
+    }
+
+    /// De-duplicate already-sanitized names within one received batch:
+    /// first wins, later dupes get " (2)", " (3)" before the LAST extension
+    /// (no extension -> appended). Keep in lockstep with Swift/Python.
+    public static IReadOnlyList<string> UniquifyNames(IReadOnlyList<string> names)
+    {
+        // First occurrence keeps its name; later duplicates get " (2)", " (3)"
+        // before the LAST extension (a leading dot is not an extension:
+        // ".env" -> ".env (2)"). Candidates colliding with an already-emitted
+        // name are bumped further. Lockstep with Swift/Python.
+        var used = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<string>(names.Count);
+        foreach (var name in names)
+        {
+            if (used.Add(name)) { result.Add(name); continue; }
+            int dot = name.LastIndexOf('.');
+            string stem = dot <= 0 ? name : name[..dot];
+            string ext = dot <= 0 ? "" : name[dot..];
+            int n = 2;
+            string candidate = $"{stem} ({n}){ext}";
+            while (!used.Add(candidate))
+            {
+                n++;
+                candidate = $"{stem} ({n}){ext}";
+            }
+            result.Add(candidate);
+        }
+        return result;
     }
 }

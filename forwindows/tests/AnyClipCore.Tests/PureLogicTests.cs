@@ -182,7 +182,7 @@ public class TextHelpersTests
         Assert.Equal("report v2.txt", TextHelpers.SanitizeFilename("report v2.txt"));
         Assert.Equal("c.txt", TextHelpers.SanitizeFilename("a/b/c.txt"));
         Assert.Equal("lid.txt", TextHelpers.SanitizeFilename("in:va/lid.txt"));
-        Assert.Equal("we_rd_na_me", TextHelpers.SanitizeFilename("we!rd:na?me"));
+        Assert.Equal("we!rd_na_me", TextHelpers.SanitizeFilename("we!rd:na?me"));
         Assert.Equal("received.bin", TextHelpers.SanitizeFilename(""));
         Assert.Equal("received.bin", TextHelpers.SanitizeFilename("   "));
         Assert.Equal("한글파일.txt", TextHelpers.SanitizeFilename("한글파일.txt"));
@@ -213,5 +213,63 @@ public class TextHelpersTests
         var lone = "bad\uD800name.txt"; // unpaired high surrogate
         var ex = Record.Exception(() => TextHelpers.SanitizeFilename(lone));
         Assert.Null(ex);
+    }
+
+    [Fact]
+    public void SanitizeFilenamePreservesParensAmpersandAndKorean()
+    {
+        // The old alnum-whitelist mangled ( & ) to underscores; the denylist keeps them.
+        Assert.Equal("(E&S)_SCM 마스터플랜_20250915_공유6.pptx",
+            TextHelpers.SanitizeFilename("(E&S)_SCM 마스터플랜_20250915_공유6.pptx"));
+    }
+
+    [Fact]
+    public void SanitizeFilenameStripsTraversalAndDenylistChars()
+    {
+        Assert.Equal("passwd", TextHelpers.SanitizeFilename("../../etc/passwd"));
+        Assert.Equal("received.bin", TextHelpers.SanitizeFilename(".."));
+        Assert.Equal("received.bin", TextHelpers.SanitizeFilename("."));
+        Assert.Equal("received.bin", TextHelpers.SanitizeFilename("a/"));    // trailing sep -> empty basename
+        Assert.Equal("received.bin", TextHelpers.SanitizeFilename("dir\\")); // rsplit("/",1)[-1] yields ""
+        Assert.Equal("x_y_z", TextHelpers.SanitizeFilename("x<y>z"));
+        Assert.Equal("a_b_c_d_e_f", TextHelpers.SanitizeFilename("a\"b|c?d*e:f"));
+        Assert.Equal("tab_here.txt", TextHelpers.SanitizeFilename("tab\there.txt")); // \t < U+0020
+        Assert.Equal("del_.txt", TextHelpers.SanitizeFilename("del.txt"));      // U+007F
+    }
+
+    [Fact]
+    public void SanitizeFilenameTrimsTrailingDotsAndSpaces()
+    {
+        Assert.Equal("report", TextHelpers.SanitizeFilename("report... "));
+        Assert.Equal("a.txt", TextHelpers.SanitizeFilename("a.txt.  "));
+        Assert.Equal(".gitignore", TextHelpers.SanitizeFilename(".gitignore")); // leading dot kept
+    }
+
+    [Fact]
+    public void SanitizeFilenamePrefixesWindowsReservedNames()
+    {
+        Assert.Equal("_CON", TextHelpers.SanitizeFilename("CON"));
+        Assert.Equal("_con.txt", TextHelpers.SanitizeFilename("con.txt"));   // case-insensitive
+        Assert.Equal("_COM1.log", TextHelpers.SanitizeFilename("COM1.log"));
+        Assert.Equal("_lpt9", TextHelpers.SanitizeFilename("lpt9"));
+        Assert.Equal("com10.txt", TextHelpers.SanitizeFilename("com10.txt")); // NOT reserved
+        Assert.Equal("console.txt", TextHelpers.SanitizeFilename("console.txt"));
+    }
+
+    [Fact]
+    public void UniquifyNamesSuffixesCollisionsBeforeLastExtension()
+    {
+        Assert.Equal(new[] { "a.txt", "a (2).txt", "a (3).txt" },
+            TextHelpers.UniquifyNames(new[] { "a.txt", "a.txt", "a.txt" }).ToArray());
+        Assert.Equal(new[] { "note", "note (2)" },
+            TextHelpers.UniquifyNames(new[] { "note", "note" }).ToArray());
+        Assert.Equal(new[] { "a.txt", "b.txt" },
+            TextHelpers.UniquifyNames(new[] { "a.txt", "b.txt" }).ToArray());
+        Assert.Equal(new[] { "archive.tar.gz", "archive.tar (2).gz" },
+            TextHelpers.UniquifyNames(new[] { "archive.tar.gz", "archive.tar.gz" }).ToArray());
+        Assert.Equal(new[] { ".env", ".env (2)" },
+            TextHelpers.UniquifyNames(new[] { ".env", ".env" }).ToArray());
+        Assert.Equal(new[] { "a (2).txt", "a.txt", "a (3).txt" },
+            TextHelpers.UniquifyNames(new[] { "a (2).txt", "a.txt", "a.txt" }).ToArray());
     }
 }
