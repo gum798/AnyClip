@@ -10,12 +10,50 @@ import Testing
 
 @Test func sanitizeKeepsSafeChars() {
     #expect(sanitizeFilename("report v2.txt") == "report v2.txt")
-    #expect(sanitizeFilename("a/b/c.txt") == "c.txt")        // basename only
-    #expect(sanitizeFilename("we!rd:na?me") == "we_rd_na_me")
+    #expect(sanitizeFilename("a/b/c.txt") == "c.txt")          // basename only
+    // Denylist (not whitelist): "!" and "&" are kept; ":" and "?" become "_".
+    #expect(sanitizeFilename("we!rd:na?me") == "we!rd_na_me")
     #expect(sanitizeFilename("") == "received.bin")
     #expect(sanitizeFilename("   ") == "received.bin")
-    #expect(sanitizeFilename("한글파일.txt") == "한글파일.txt") // unicode alnum kept
+    #expect(sanitizeFilename("한글파일.txt") == "한글파일.txt")
     #expect(sanitizeFilename("???") == "___")
+}
+
+@Test func sanitizeKeepsParensAmpersandSpacesForRealFilename() {
+    // The reported regression: the alnum whitelist mangled "(", "&", ")" to "_".
+    let name = "(E&S)_SCM 마스터플랜_20250915_공유6.pptx"
+    #expect(sanitizeFilename(name) == name)                    // survives UNCHANGED
+}
+
+@Test func sanitizeSplitsOnBothSlashKinds() {
+    #expect(sanitizeFilename("a\\b\\c.txt") == "c.txt")        // Windows backslash path
+    #expect(sanitizeFilename("../x") == "x")                   // traversal -> last component
+    #expect(sanitizeFilename("..") == "received.bin")          // dotdot -> received.bin
+    #expect(sanitizeFilename(".") == "received.bin")
+}
+
+@Test func sanitizeTrimsTrailingDotsAndSpaces() {
+    #expect(sanitizeFilename("name.  ") == "name")
+    #expect(sanitizeFilename("name...") == "name")
+    #expect(sanitizeFilename("keep.mid.dots.txt") == "keep.mid.dots.txt")
+}
+
+@Test func sanitizePrefixesWindowsReservedDeviceNames() {
+    #expect(sanitizeFilename("CON") == "_CON")
+    #expect(sanitizeFilename("con.txt") == "_con.txt")         // case-insensitive, stem-before-first-dot
+    #expect(sanitizeFilename("COM1") == "_COM1")
+    #expect(sanitizeFilename("LPT9.log") == "_LPT9.log")
+    #expect(sanitizeFilename("COM10") == "COM10")              // not a reserved device
+    #expect(sanitizeFilename("console.txt") == "console.txt")  // only exact stem matches
+}
+
+@Test func uniquifyInsertsSuffixBeforeLastExtension() {
+    #expect(uniquifyNames(["a.txt", "a.txt", "a.txt"]) == ["a.txt", "a (2).txt", "a (3).txt"])
+    #expect(uniquifyNames(["x", "x"]) == ["x", "x (2)"])       // no extension
+    #expect(uniquifyNames(["a.tar.gz", "a.tar.gz"]) == ["a.tar.gz", "a.tar (2).gz"]) // last ext only
+    #expect(uniquifyNames(["a.txt", "b.txt"]) == ["a.txt", "b.txt"]) // no collision -> untouched
+    #expect(uniquifyNames([".env", ".env"]) == [".env", ".env (2)"]) // leading dot != extension
+    #expect(uniquifyNames(["a (2).txt", "a.txt", "a.txt"]) == ["a (2).txt", "a.txt", "a (3).txt"]) // guard vs existing
 }
 
 @Test func sanitizeNormalizesDecomposedUnicodeToNFC() {
