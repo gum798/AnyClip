@@ -68,7 +68,7 @@ SERVICE_TYPE = "_anyclip._tcp.local."
 # local source runs default to a dev marker so handshake logs stay readable.
 APP_VERSION = os.environ.get("ANYCLIP_BUILD_VERSION", "0.0.0-dev")
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 0
+PROTOCOL_MINOR = 1
 # Legacy alias: pre-1.0 peers send a single `version` int. New code treats
 # it as equivalent to protocol_major so old<->new handshakes still link.
 PROTOCOL_VERSION = PROTOCOL_MAJOR
@@ -353,6 +353,48 @@ def sha256_hex(data: str) -> str:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def aggregate_files_hash(hashes: list) -> str:
+    """Echo-suppression key for a multi-file clip. Order-independent: sort
+    the per-file sha256 lowercase-hex strings lexicographically, concatenate
+    with NO separator, and sha256 the ASCII bytes of that concatenation.
+    Identical formula in Swift (WireProtocol) and C# (WireMessage)."""
+    joined = "".join(sorted(hashes))
+    return hashlib.sha256(joined.encode("ascii")).hexdigest()
+
+
+def decode_files_payload(msg: dict) -> Optional[list]:
+    """Decode a kind:"files" clip into [(name, raw_bytes), ...].
+
+    Strict: any entry with a missing/non-str/non-strict-base64 ``content``,
+    a non-object entry, or an empty/missing ``files`` array returns None so
+    the caller drops the WHOLE frame (no partial apply). Names come straight
+    off the wire (already NFC per the sender); sanitization happens on write.
+    Wire hashes are never trusted -- recomputed downstream from decoded bytes."""
+    entries = msg.get("files")
+    if not isinstance(entries, list) or not entries:
+        log.warning("ignoring files clip: empty or non-list 'files' array")
+        return None
+    decoded: list = []
+    for ent in entries:
+        if not isinstance(ent, dict):
+            log.warning("ignoring files clip: non-object entry")
+            return None
+        content = ent.get("content")
+        if not isinstance(content, str):
+            log.warning("ignoring files clip: entry missing string 'content'")
+            return None
+        try:
+            raw = base64.b64decode(content, validate=True)
+        except Exception as exc:
+            log.warning(f"ignoring files clip: bad base64 entry ({exc})")
+            return None
+        name = ent.get("name")
+        if not isinstance(name, str) or not name:
+            name = "received.bin"
+        decoded.append((name, raw))
+    return decoded
 
 
 def grab_clipboard_image() -> Optional[bytes]:
@@ -1410,6 +1452,11 @@ class PeerLink:
                         if not isinstance(name, str):
                             name = "received.bin"
                         await self.on_clip("file", (name, raw))
+                    elif kind == "files":
+                        decoded = decode_files_payload(msg)
+                        if decoded is None:
+                            continue  # whole-frame drop already logged
+                        await self.on_clip("files", decoded)
                     else:
                         log.debug(f"ignoring clip with kind={kind!r}")
                 elif msg_type == "ping":
@@ -1557,6 +1604,37 @@ class PeerLink:
                 "hash": sha256_bytes(raw_b),
                 "ts": time.time(),
                 "bytes": len(raw_b),
+            }
+        elif kind == "files":
+            # content is expected to be a list of (name, raw_bytes) tuples.
+            if not isinstance(content, list) or not content:
+                return
+            files_arr = []
+            hashes = []
+            total = 0
+            for ent in content:
+                if not isinstance(ent, tuple) or len(ent) != 2:
+                    return
+                name, raw = ent
+                if not isinstance(name, str) or not isinstance(raw, (bytes, bytearray)):
+                    return
+                raw_b = bytes(raw)
+                h = sha256_bytes(raw_b)
+                files_arr.append({
+                    "name": name,
+                    "content": base64.b64encode(raw_b).decode("ascii"),
+                    "hash": h,
+                    "bytes": len(raw_b),
+                })
+                hashes.append(h)
+                total += len(raw_b)
+            payload = {
+                "type": "clip",
+                "kind": "files",
+                "files": files_arr,
+                "hash": aggregate_files_hash(hashes),
+                "ts": time.time(),
+                "bytes": total,
             }
         else:
             log.debug(f"send_clip: unknown kind {kind!r}, dropping")
