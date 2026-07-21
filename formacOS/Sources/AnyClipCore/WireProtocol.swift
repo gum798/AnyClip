@@ -4,7 +4,7 @@ import Foundation
 public enum Wire {
     public static let maxPayload = 16 * 1024 * 1024
     public static let protocolMajor = 1
-    public static let protocolMinor = 0
+    public static let protocolMinor = 1
     /// Legacy single-int field old peers read; equals protocolMajor.
     public static let legacyVersion = 1
     public static let defaultPort: UInt16 = 24816
@@ -32,12 +32,14 @@ public enum ClipPayload: Sendable {
     case text(String)
     case image(Data)
     case file(name: String, data: Data)
+    case files([(name: String, data: Data)])
 
     public var kind: String {
         switch self {
         case .text: return "text"
         case .image: return "image"
         case .file: return "file"
+        case .files: return "files"
         }
     }
 
@@ -46,7 +48,25 @@ public enum ClipPayload: Sendable {
         case .text(let s): return sha256Hex(s)
         case .image(let d): return sha256Hex(d)
         case .file(_, let d): return sha256Hex(d)
+        case .files(let fs): return aggregateFilesHash(fs.map { sha256Hex($0.data) })
         }
+    }
+}
+
+/// One entry inside a kind:"files" clip. Fields name,content,hash,bytes are the
+/// canonical wire keys (the order Python/C# emit). Swift's Foundation
+/// JSONEncoder does not guarantee key order, but that is fine: JSON objects are
+/// unordered and every peer parses by key, so interop never depends on it.
+public struct WireFileEntry: Codable, Sendable, Equatable {
+    public var name: String
+    public var content: String
+    public var hash: String
+    public var bytes: Int
+    public init(name: String, content: String, hash: String, bytes: Int) {
+        self.name = name
+        self.content = content
+        self.hash = hash
+        self.bytes = bytes
     }
 }
 
@@ -65,6 +85,7 @@ public struct WireMessage: Codable, Sendable, Equatable {
     public var protocol_minor: Int?
     public var kind: String?
     public var content: String?
+    public var files: [WireFileEntry]?
     public var hash: String?
     public var ts: Double?
     public var bytes: Int?
@@ -121,11 +142,33 @@ extension WireMessage {
         return m
     }
 
+    public static func clipFiles(files: [(name: String, data: Data)], ts: Double) -> WireMessage {
+        var m = WireMessage(type: "clip")
+        m.kind = "files"
+        var entries: [WireFileEntry] = []
+        var hashes: [String] = []
+        var total = 0
+        for f in files {
+            let h = sha256Hex(f.data)
+            entries.append(WireFileEntry(
+                name: f.name.precomposedStringWithCanonicalMapping,  // NFC on the wire
+                content: f.data.base64EncodedString(), hash: h, bytes: f.data.count))
+            hashes.append(h)
+            total += f.data.count
+        }
+        m.files = entries
+        m.hash = aggregateFilesHash(hashes)  // top-level hash = aggregate
+        m.ts = ts
+        m.bytes = total                       // sum of raw byte counts
+        return m
+    }
+
     public static func clip(_ payload: ClipPayload, ts: Double) -> WireMessage {
         switch payload {
         case .text(let s): return clipText(s, ts: ts)
         case .image(let d): return clipImage(d, ts: ts)
         case .file(let n, let d): return clipFile(name: n, data: d, ts: ts)
+        case .files(let fs): return clipFiles(files: fs, ts: ts)
         }
     }
 
@@ -190,4 +233,18 @@ extension WireMessage {
 /// mirroring Python's b64decode(validate=True).
 public func strictBase64Decode(_ s: String) -> Data? {
     Data(base64Encoded: s)
+}
+
+/// Decode a kind:"files" message's entries into (name, rawBytes). Returns nil
+/// if the array is empty/nil OR ANY entry has non-strict base64 content — the
+/// caller drops the WHOLE frame (no partial apply). Names pass through raw;
+/// sanitize/uniquify happen write-side. Hashes are never trusted from the wire.
+public func decodeFileEntries(_ files: [WireFileEntry]?) -> [(name: String, data: Data)]? {
+    guard let files, !files.isEmpty else { return nil }
+    var out: [(name: String, data: Data)] = []
+    for e in files {
+        guard let data = strictBase64Decode(e.content) else { return nil }
+        out.append((name: e.name, data: data))
+    }
+    return out
 }

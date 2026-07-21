@@ -154,6 +154,14 @@ public final class Daemon: @unchecked Sendable {
                         "<- received file \(name) \(data.count) bytes from \(peer) "
                         + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
                     notify("AnyClip ← \(peer)", "file: \(name) (\(data.count / 1024) KB)")
+                case .files(let items):
+                    // Multi-file apply is wired by Task 7 (daemon). No producer
+                    // constructs .files at runtime yet, so this arm exists only
+                    // to keep the switch exhaustive.
+                    let total = items.reduce(0) { $0 + $1.data.count }
+                    AnyLog.shared.info(
+                        "<- received \(items.count) files \(total) bytes from \(peer) "
+                        + "(multi-file apply pending daemon support)")
                 }
             },
             emit: emit)
@@ -187,6 +195,10 @@ public final class Daemon: @unchecked Sendable {
             case .file(let name, let data):
                 AnyLog.shared.info("-> sent file \(name) \(data.count) bytes to \(peer)")
                 notify("AnyClip → \(peer)", "file: \(name) (\(data.count / 1024) KB)")
+            case .files(let items):
+                // Multi-file send is wired by Task 7 (daemon); exhaustiveness stub.
+                let total = items.reduce(0) { $0 + $1.data.count }
+                AnyLog.shared.info("-> sent \(items.count) files \(total) bytes to \(peer)")
             }
         }
 
