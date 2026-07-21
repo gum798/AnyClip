@@ -44,7 +44,7 @@ public class WireMessageTests
         Assert.Equal("node-1", root.GetProperty("node_id").GetString());
         Assert.Equal(1, root.GetProperty("version").GetInt32()); // legacy field
         Assert.Equal(1, root.GetProperty("protocol_major").GetInt32());
-        Assert.Equal(0, root.GetProperty("protocol_minor").GetInt32());
+        Assert.Equal(1, root.GetProperty("protocol_minor").GetInt32());
         Assert.Equal("1.2.3", root.GetProperty("app_version").GetString());
         // null fields are omitted entirely
         Assert.False(root.TryGetProperty("kind", out _));
