@@ -853,6 +853,66 @@ class EchoSuppressor:
         return self._last.get(kind) != payload_hash
 
 
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+_DENYLIST_CHARS = set('\\/<>:"|?*')
+
+
+def sanitize_filename(name: str) -> str:
+    """Cross-platform-safe basename for a received file. Denylist (not the
+    old alnum whitelist), so (), &, spaces, and non-ASCII letters survive.
+    Keep in lockstep with Swift sanitizeFilename and C# SanitizeFilename.
+
+    1. NFC normalize.
+    2. Basename: split on BOTH '/' and '\\', keep the last component.
+    3. Replace denylisted chars, control chars (< U+0020), and U+007F with '_'.
+    4. Trim TRAILING dots and spaces.
+    5. Empty / '.' / '..'  -> 'received.bin'.
+    6. Windows reserved device name (stem before the first dot) -> prefix '_'.
+    """
+    name = unicodedata.normalize("NFC", name)
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(
+        "_" if (ch in _DENYLIST_CHARS or ord(ch) < 0x20 or ord(ch) == 0x7F) else ch
+        for ch in name
+    )
+    name = name.rstrip(". ")
+    if name in ("", ".", ".."):
+        return "received.bin"
+    if name.split(".", 1)[0].upper() in _WIN_RESERVED:
+        name = "_" + name
+    return name
+
+
+def uniquify_names(names: list) -> list:
+    """Disambiguate duplicate names within one received batch (after
+    sanitization). First occurrence keeps its name; later duplicates get
+    ' (2)', ' (3)', ... inserted before the LAST extension (a leading dot
+    is not an extension: '.env' -> '.env (2)'). A candidate that collides
+    with an already-emitted name is bumped further. Keep in lockstep with
+    Swift uniquifyNames and C# TextHelpers.UniquifyNames."""
+    used = set()
+    result = []
+    for name in names:
+        if name not in used:
+            used.add(name)
+            result.append(name)
+            continue
+        dot = name.rfind(".")
+        stem, ext = (name, "") if dot <= 0 else (name[:dot], name[dot:])
+        n = 2
+        candidate = f"{stem} ({n}){ext}"
+        while candidate in used:
+            n += 1
+            candidate = f"{stem} ({n}){ext}"
+        used.add(candidate)
+        result.append(candidate)
+    return result
+
+
 class ClipboardWatcher:
     READ_FAIL_WARN_AT = 5
     # OS screenshot tools (notably macOS Screenshot.app) drop several
@@ -1066,16 +1126,10 @@ class ClipboardWatcher:
         Updates the fingerprint baseline so the very file we just wrote
         is not picked up as a fresh local change on the next poll.
         """
-        # Sanitize the name -- accept basename only and strip anything
-        # that would land outside the target directory. Normalize to NFC
-        # first: a macOS peer sends NFD (decomposed Hangul = conjoining jamo
-        # U+11xx Windows can't render). Keep in lockstep with Swift
-        # sanitizeFilename and C# TextHelpers.SanitizeFilename.
-        safe = os.path.basename(unicodedata.normalize("NFC", name)).strip() or "received.bin"
-        # Drop characters that are awkward on either OS.
-        safe = "".join(
-            c if c.isalnum() or c in "._- " else "_" for c in safe
-        )
+        # Cross-platform-safe basename via the shared denylist sanitizer
+        # (NFC + traversal strip + reserved-name guard). Keep in lockstep
+        # with Swift sanitizeFilename and C# TextHelpers.SanitizeFilename.
+        safe = sanitize_filename(name)
         target_dir = LOG_DIR / "received"
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
