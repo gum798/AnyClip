@@ -13,6 +13,17 @@ public sealed class PayloadTooLargeException(int size)
 public readonly record struct VersionInfo(
     string AppVersion, int ProtocolMajor, int ProtocolMinor);
 
+/// One entry of a kind:"files" clip. Field order name, content, hash, bytes
+/// is golden-vector material. Nullable so a malformed inbound entry decodes
+/// (then gets rejected in PeerLink) rather than failing the whole frame parse.
+public sealed record WireFileEntry
+{
+    [JsonPropertyName("name")] public string? Name { get; init; }
+    [JsonPropertyName("content")] public string? Content { get; init; }
+    [JsonPropertyName("hash")] public string? Hash { get; init; }
+    [JsonPropertyName("bytes")] public int? Bytes { get; init; }
+}
+
 /// One wire message. Optional-field class covers hello/clip/ping/pong —
 /// nulls omitted on encode, unknown fields ignored on decode, matching the
 /// Python dict protocol. JsonPropertyName values ARE the wire field names.
@@ -28,6 +39,7 @@ public sealed record WireMessage
     [JsonPropertyName("protocol_minor")] public int? ProtocolMinor { get; init; }
     [JsonPropertyName("kind")] public string? Kind { get; init; }
     [JsonPropertyName("content")] public string? Content { get; init; }
+    [JsonPropertyName("files")] public IReadOnlyList<WireFileEntry>? Files { get; init; }
     [JsonPropertyName("hash")] public string? Hash { get; init; }
     [JsonPropertyName("ts")] public double? Ts { get; init; }
     [JsonPropertyName("bytes")] public int? Bytes { get; init; }
@@ -71,11 +83,39 @@ public sealed record WireMessage
         Hash = Hashing.Sha256Hex(data), Ts = ts, Bytes = data.Length,
     };
 
+    public static WireMessage ClipFiles(
+        IReadOnlyList<(string Name, byte[] Data)> files, double ts)
+    {
+        var entries = new List<WireFileEntry>(files.Count);
+        var hashes = new List<string>(files.Count);
+        int total = 0;
+        foreach (var (name, data) in files)
+        {
+            var h = Hashing.Sha256Hex(data);
+            hashes.Add(h);
+            // NFC per name, same rule as ClipFile. Keep in lockstep with
+            // Swift WireMessage.clipFiles and anyclip.send_clip.
+            entries.Add(new WireFileEntry
+            {
+                Name = TextHelpers.ToNfc(name),
+                Content = Convert.ToBase64String(data),
+                Hash = h, Bytes = data.Length,
+            });
+            total += data.Length;
+        }
+        return new WireMessage
+        {
+            Type = "clip", Kind = "files", Files = entries,
+            Hash = Hashing.AggregateFilesHash(hashes), Ts = ts, Bytes = total,
+        };
+    }
+
     public static WireMessage Clip(ClipPayload payload, double ts) => payload switch
     {
         TextClip t => ClipText(t.Text, ts),
         ImageClip i => ClipImage(i.Png, ts),
         FileClip f => ClipFile(f.Name, f.Data, ts),
+        FilesClip fs => ClipFiles(fs.Files, ts),
         _ => throw new ArgumentOutOfRangeException(nameof(payload)),
     };
 

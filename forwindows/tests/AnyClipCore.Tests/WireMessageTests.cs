@@ -116,6 +116,74 @@ public class WireMessageTests
     }
 
     [Fact]
+    public void ClipFilesEncodesEntriesAndAggregateInContractOrder()
+    {
+        var files = new List<(string, byte[])>
+        {
+            ("노트.txt", "one"u8.ToArray()),
+            ("réport.bin", new byte[] { 2, 3 }),
+        };
+        var frame = WireMessage.ClipFiles(files, 7.5).EncodeFrame();
+        using var doc = JsonDocument.Parse(frame.AsSpan(4).ToArray());
+        var root = doc.RootElement;
+        Assert.Equal(new[] { "type", "kind", "files", "hash", "ts", "bytes" },
+            root.EnumerateObject().Select(p => p.Name).ToArray());
+        Assert.Equal("clip", root.GetProperty("type").GetString());
+        Assert.Equal("files", root.GetProperty("kind").GetString());
+        Assert.Equal(5, root.GetProperty("bytes").GetInt32()); // 3 + 2 raw bytes
+        var arr = root.GetProperty("files");
+        Assert.Equal(2, arr.GetArrayLength());
+        var e0 = arr[0];
+        Assert.Equal(new[] { "name", "content", "hash", "bytes" },
+            e0.EnumerateObject().Select(p => p.Name).ToArray());
+        Assert.Equal("노트.txt", e0.GetProperty("name").GetString());
+        Assert.Equal(Convert.ToBase64String("one"u8.ToArray()),
+            e0.GetProperty("content").GetString());
+        Assert.Equal(Hashing.Sha256Hex("one"u8.ToArray()),
+            e0.GetProperty("hash").GetString());
+        Assert.Equal(3, e0.GetProperty("bytes").GetInt32());
+        var expectedAgg = Hashing.AggregateFilesHash(new[]
+        {
+            Hashing.Sha256Hex("one"u8.ToArray()),
+            Hashing.Sha256Hex(new byte[] { 2, 3 }),
+        });
+        Assert.Equal(expectedAgg, root.GetProperty("hash").GetString());
+    }
+
+    [Fact]
+    public void ClipFilesRoundTripsThroughDecode()
+    {
+        var files = new List<(string, byte[])>
+        {
+            ("a.txt", "aa"u8.ToArray()),
+            ("b.bin", new byte[] { 0, 1, 2 }),
+        };
+        var frame = WireMessage.ClipFiles(files, 1.0).EncodeFrame();
+        var msg = WireMessage.DecodeBody(frame.AsSpan(4).ToArray())!;
+        Assert.Equal("files", msg.Kind);
+        Assert.NotNull(msg.Files);
+        Assert.Equal(2, msg.Files!.Count);
+        Assert.Equal("a.txt", msg.Files[0].Name);
+        Assert.Equal("aa", Encoding.UTF8.GetString(
+            WireMessage.StrictBase64Decode(msg.Files[0].Content!)!));
+        Assert.Equal(new byte[] { 0, 1, 2 },
+            WireMessage.StrictBase64Decode(msg.Files[1].Content!));
+    }
+
+    [Fact]
+    public void ClipFilesNormalizesEachNameToNFC()
+    {
+        var baseName = "결과보고서";
+        var nfd = baseName.Normalize(NormalizationForm.FormD) + ".pdf";
+        var nfc = baseName.Normalize(NormalizationForm.FormC) + ".pdf";
+        Assert.NotEqual(nfd, nfc);
+        var frame = WireMessage.ClipFiles(
+            new List<(string, byte[])> { (nfd, new byte[] { 1 }) }, 0).EncodeFrame();
+        var msg = WireMessage.DecodeBody(frame.AsSpan(4).ToArray())!;
+        Assert.Equal(nfc, msg.Files![0].Name);
+    }
+
+    [Fact]
     public void DecodeToleratesUnknownFieldsAndRejectsBadJson()
     {
         var msg = WireMessage.DecodeBody(
@@ -166,5 +234,21 @@ public class WireMessageTests
         Assert.Equal(Hashing.Sha256Hex("abc"), p.PayloadHash);
         Assert.Equal("image", new ImageClip(new byte[] { 1 }).Kind);
         Assert.Equal("file", new FileClip("a.txt", new byte[] { 1 }).Kind);
+    }
+
+    [Fact]
+    public void FilesClipKindAndAggregateHash()
+    {
+        var f = new FilesClip(new List<(string, byte[])>
+        {
+            ("a", "one"u8.ToArray()),
+            ("b", "two"u8.ToArray()),
+        });
+        Assert.Equal("files", f.Kind);
+        Assert.Equal(Hashing.AggregateFilesHash(new[]
+        {
+            Hashing.Sha256Hex("one"u8.ToArray()),
+            Hashing.Sha256Hex("two"u8.ToArray()),
+        }), f.PayloadHash);
     }
 }
