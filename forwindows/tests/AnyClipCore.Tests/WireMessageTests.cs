@@ -22,6 +22,18 @@ public class WireMessageTests
     }
 
     [Fact]
+    public void AggregateFilesHashIsOrderIndependentKnownAnswer()
+    {
+        var ha = Hashing.Sha256Hex("a"u8.ToArray());
+        var hb = Hashing.Sha256Hex("b"u8.ToArray());
+        const string expected =
+            "ab19ec537f09499b26f0f62eed7aefad46ab9f498e06a7328ce8e8ef90da6d86";
+        Assert.Equal(expected, Hashing.AggregateFilesHash(new[] { ha, hb }));
+        Assert.Equal(expected, Hashing.AggregateFilesHash(new[] { hb, ha })); // order-independent
+        Assert.NotEqual(expected, Hashing.AggregateFilesHash(new[] { ha, ha }));
+    }
+
+    [Fact]
     public void FrameIsFourByteBigEndianLengthPlusJson()
     {
         var frame = WireMessage.Ping(1.5).EncodeFrame();
