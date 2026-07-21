@@ -46,6 +46,8 @@ public final class ClipboardWatcher {
     /// Reserve ~256 KB for the JSON envelope and the b64 1.34× inflation.
     /// Mirrors Python: budget = int((MAX_PAYLOAD - 256*1024) * 0.74)
     static let fileBudget = Int(Double(Wire.maxPayload - 256 * 1024) * 0.74)
+    /// Sender-side cap; the receiver stays lenient. Matches MAX_FILES_PER_CLIP.
+    static let maxFilesPerClip = 100
 
     private let pasteboard: NSPasteboard
     private let pollInterval: Double
@@ -58,8 +60,7 @@ public final class ClipboardWatcher {
     private var lastText: String?
     private var lastImageHash: String?
     private var lastImageSendAt: Double = 0
-    private var lastFileFingerprint: FileFingerprint?
-    private var oversizeFileWarned = false
+    private var lastFileFingerprints: [FileFingerprint] = []
 
     public init(
         pasteboard: NSPasteboard = .general,
@@ -78,9 +79,7 @@ public final class ClipboardWatcher {
         if let png = Self.grabImage(pasteboard) {
             lastImageHash = sha256Hex(png)
         }
-        if let url = Self.grabFileURL(pasteboard) {
-            lastFileFingerprint = FileFingerprint(url: url)
-        }
+        lastFileFingerprints = Self.grabFileURLs(pasteboard).compactMap { FileFingerprint(url: $0) }
     }
 
     // MARK: - Run loop
@@ -139,44 +138,47 @@ public final class ClipboardWatcher {
     // MARK: - File clipboard
 
     private func checkFileClipboard() async {
-        guard let url = Self.grabFileURL(pasteboard) else { return }
-        guard let fingerprint = FileFingerprint(url: url) else { return }
-        guard fingerprint != lastFileFingerprint else { return }
+        let urls = Self.grabFileURLs(pasteboard)
+        guard !urls.isEmpty else { return }
+        let fingerprints = urls.compactMap { FileFingerprint(url: $0) }
+        guard fingerprints != lastFileFingerprints else { return }
+        // Record FIRST so the same selection is never re-detected (no retry loop),
+        // regardless of what we end up sending.
+        lastFileFingerprints = fingerprints
 
-        // Folders are an explicit scope-out. Record the fingerprint FIRST
-        // so the same copy is never re-detected (no retry-loop).
-        if fingerprint.isDirectory {
-            lastFileFingerprint = fingerprint
-            let display = url.lastPathComponent
-            AnyLog.shared.warning("folder on clipboard not synced (unsupported): \(url.path)")
-            if let onSkipped = callbacks.onFileSkipped {
-                await onSkipped("folder not synced — folders are not supported: \(display)")
+        var sendable: [(name: String, data: Data)] = []
+        var running = 0
+        var skippedForSize = 0
+        for url in urls {
+            guard let fp = FileFingerprint(url: url) else { continue }
+            if fp.isDirectory {
+                AnyLog.shared.warning("folder on clipboard not synced (unsupported): \(url.path)")
+                if let onSkipped = callbacks.onFileSkipped {
+                    await onSkipped(
+                        "folder not synced — folders are not supported: \(url.lastPathComponent)")
+                }
+                continue
             }
-            return
-        }
-
-        // Over-budget files are skipped; warn once.
-        if fingerprint.size > Self.fileBudget {
-            if !oversizeFileWarned {
-                AnyLog.shared.warning(
-                    "file \(url.path) too large to sync "
-                    + "(\(fingerprint.size) bytes > limit \(Self.fileBudget)); skipping")
-                oversizeFileWarned = true
+            if sendable.count >= Self.maxFilesPerClip || running + fp.size > Self.fileBudget {
+                skippedForSize += 1
+                continue
             }
-            lastFileFingerprint = fingerprint
-            return
+            guard let data = try? Data(contentsOf: url) else {
+                AnyLog.shared.warning("file read failed for \(url.path); skipping")
+                continue
+            }
+            running += fp.size
+            sendable.append((name: url.lastPathComponent, data: data))
         }
-        oversizeFileWarned = false
-
-        guard let data = try? Data(contentsOf: url) else {
-            // A path that cannot be read now will not become readable by
-            // polling it forever — update fingerprint to suppress retry.
-            lastFileFingerprint = fingerprint
-            AnyLog.shared.warning("file read failed for \(url.path); skipping")
-            return
+        if skippedForSize > 0, let onSkipped = callbacks.onFileSkipped {
+            await onSkipped("\(skippedForSize) file(s) skipped (too large to sync)")
         }
-        lastFileFingerprint = fingerprint
-        await callbacks.onChange(.file(name: url.lastPathComponent, data: data))
+        // 0 sendable -> nothing. 1 -> legacy .file. >=2 -> .files.
+        if sendable.count == 1 {
+            await callbacks.onChange(.file(name: sendable[0].name, data: sendable[0].data))
+        } else if sendable.count >= 2 {
+            await callbacks.onChange(.files(sendable))
+        }
     }
 
     // MARK: - Inbound (peer → local clipboard)
@@ -198,41 +200,62 @@ public final class ClipboardWatcher {
         return ok
     }
 
+    @discardableResult
     public func updateLocalFile(name: String, data: Data) -> Bool {
-        let safe = sanitizeFilename(name)
+        !updateLocalFiles([(name: name, data: data)]).isEmpty
+    }
+
+    /// Sanitize + uniquify, write every file into the flat receivedDir, then
+    /// place ALL written URLs on the clipboard in ONE writeObjects. Returns the
+    /// files actually PLACED (sanitized names) so the caller can baseline echo
+    /// suppression to the placed set.
+    @discardableResult
+    public func updateLocalFiles(_ files: [(name: String, data: Data)]) -> [(name: String, data: Data)] {
         do {
             try FileManager.default.createDirectory(
                 at: receivedDir, withIntermediateDirectories: true)
-            let target = receivedDir.appendingPathComponent(safe)
-            try data.write(to: target)
-            // Baseline before clipboard write.
-            lastFileFingerprint = FileFingerprint(url: target)
-            pasteboard.clearContents()
-            let ok = pasteboard.writeObjects([target as NSURL])
-            lastChangeCount = pasteboard.changeCount
-            if !ok { AnyLog.shared.warning("clipboard write (file) failed") }
-            return ok
         } catch {
-            AnyLog.shared.warning("file write to \(receivedDir.path) failed: \(error)")
-            return false
+            AnyLog.shared.warning("received dir create failed: \(error)")
+            return []
         }
+        let names = uniquifyNames(files.map { sanitizeFilename($0.name) })
+        var placedURLs: [NSURL] = []
+        var placed: [(name: String, data: Data)] = []
+        for (i, f) in files.enumerated() {
+            let target = receivedDir.appendingPathComponent(names[i])
+            do {
+                try f.data.write(to: target)
+                placedURLs.append(target as NSURL)
+                placed.append((name: names[i], data: f.data))
+            } catch {
+                AnyLog.shared.warning("file write to \(target.path) failed: \(error)")
+            }
+        }
+        guard !placedURLs.isEmpty else { return [] }
+        // Baseline the fingerprint list to the placed paths BEFORE the clipboard
+        // write so a racing poll cannot echo.
+        lastFileFingerprints = placedURLs.compactMap { FileFingerprint(url: $0 as URL) }
+        pasteboard.clearContents()
+        let ok = pasteboard.writeObjects(placedURLs)
+        lastChangeCount = pasteboard.changeCount
+        if !ok { AnyLog.shared.warning("clipboard write (files) failed") }
+        return placed
     }
 
     // MARK: - Pasteboard readers
 
-    static func grabFileURL(_ pb: NSPasteboard) -> URL? {
+    static func grabFileURLs(_ pb: NSPasteboard) -> [URL] {
         let options: [NSPasteboard.ReadingOptionKey: Any] =
             [.urlReadingFileURLsOnly: true]
-        // readObjects(forClasses:options:) returns [AnyObject]? on Swift 5.
         let raw = pb.readObjects(forClasses: [NSURL.self], options: options)
-        return (raw as? [URL])?.first
+        return (raw as? [URL]) ?? []
     }
 
     /// PNG bytes of an inline image, or nil.
     /// File references are handled by their own branch; grabImage returns nil
     /// when a file URL is on the clipboard (mirrors Python's behaviour).
     static func grabImage(_ pb: NSPasteboard) -> Data? {
-        if grabFileURL(pb) != nil { return nil }
+        if !grabFileURLs(pb).isEmpty { return nil }
         if let png = pb.data(forType: .png) { return png }
         if let tiff = pb.data(forType: .tiff),
            let rep = NSBitmapImageRep(data: tiff),

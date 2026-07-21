@@ -165,3 +165,118 @@ private func makeWatcher(
     await watcher.pollOnceForTesting()
     #expect(changes.get().isEmpty)
 }
+
+@Test @MainActor func twoFilesOnClipboardEmitsFilesPayload() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let f1 = dir.appendingPathComponent("a.txt"); try Data("one".utf8).write(to: f1)
+    let f2 = dir.appendingPathComponent("b.txt"); try Data("two".utf8).write(to: f2)
+    pb.clearContents()
+    pb.writeObjects([f1 as NSURL, f2 as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .files(let fs) = got[0] {
+        #expect(fs.count == 2)
+        #expect(fs.contains { $0.name == "a.txt" && $0.data == Data("one".utf8) })
+        #expect(fs.contains { $0.name == "b.txt" && $0.data == Data("two".utf8) })
+    } else { Issue.record("expected .files payload") }
+}
+
+@Test @MainActor func sameFileSelectionDetectedOnlyOnce() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let f1 = dir.appendingPathComponent("a.txt"); try Data("one".utf8).write(to: f1)
+    let f2 = dir.appendingPathComponent("b.txt"); try Data("two".utf8).write(to: f2)
+    pb.clearContents(); pb.writeObjects([f1 as NSURL, f2 as NSURL])
+    await watcher.pollOnceForTesting()
+    #expect(changes.get().count == 1)
+    // Re-copy the identical selection: changeCount ticks, but the fingerprint
+    // list is unchanged, so nothing re-emits.
+    pb.clearContents(); pb.writeObjects([f1 as NSURL, f2 as NSURL])
+    await watcher.pollOnceForTesting()
+    #expect(changes.get().count == 1)
+}
+
+@Test @MainActor func folderMixedWithFilesSkipsFolderSyncsFiles() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let folder = dir.appendingPathComponent("sub", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let f1 = dir.appendingPathComponent("a.txt"); try Data("one".utf8).write(to: f1)
+    let f2 = dir.appendingPathComponent("b.txt"); try Data("two".utf8).write(to: f2)
+    pb.clearContents()
+    pb.writeObjects([folder as NSURL, f1 as NSURL, f2 as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .files(let fs) = got[0] { #expect(fs.count == 2) } else { Issue.record("expected .files") }
+    #expect(skipped.get().contains { $0.contains("folders are not supported") })
+}
+
+@Test @MainActor func budgetGreedySkipOverflowFallsBackToSingleFile() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    // Two 7 MiB sparse files: the first fits the ~11.65 MB budget, the second
+    // overflows the cumulative sum and is skipped -> one survivor -> kind "file".
+    func sparse(_ name: String) throws -> URL {
+        let u = dir.appendingPathComponent(name)
+        FileManager.default.createFile(atPath: u.path, contents: nil)
+        let h = try FileHandle(forWritingTo: u)
+        try h.truncate(atOffset: UInt64(7 * 1024 * 1024)); try h.close()
+        return u
+    }
+    let f1 = try sparse("big1.bin"); let f2 = try sparse("big2.bin")
+    pb.clearContents(); pb.writeObjects([f1 as NSURL, f2 as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .file(let name, _) = got[0] { #expect(name == "big1.bin") }
+    else { Issue.record("expected single-file fallback, got \(got)") }
+    #expect(skipped.get().contains { $0.contains("skipped") })
+}
+
+@Test @MainActor func maxFilesCapEmitsAtMostOneHundred() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    var urls: [NSURL] = []
+    for i in 0..<101 {
+        let u = dir.appendingPathComponent("f\(i).txt")
+        try Data("x".utf8).write(to: u)
+        urls.append(u as NSURL)
+    }
+    pb.clearContents(); pb.writeObjects(urls)
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .files(let fs) = got[0] { #expect(fs.count == 100) } else { Issue.record("expected .files") }
+    #expect(skipped.get().contains { $0.contains("skipped") })
+}
+
+@Test @MainActor func updateLocalFilesWritesUniquifiedAndDoesNotEcho() async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    let placed = watcher.updateLocalFiles([
+        (name: "dup.txt", data: Data("1".utf8)),
+        (name: "dup.txt", data: Data("2".utf8)),
+    ])
+    #expect(placed.count == 2)
+    #expect(placed.map(\.name) == ["dup.txt", "dup (2).txt"])
+    #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("dup.txt").path))
+    #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("dup (2).txt").path))
+    // Placement baselines the fingerprint list, so the next poll does not echo.
+    await watcher.pollOnceForTesting()
+    #expect(changes.get().isEmpty)
+}
