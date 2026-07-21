@@ -132,6 +132,17 @@ public sealed class Daemon(
                         + $"({(ok ? "written to clipboard" : "WRITE FAILED")})");
                     toast($"AnyClip ← {peer}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
                     break;
+                case FilesClip fsc:
+                    // MarkReceived above recorded ("files", aggregate). A single
+                    // placed file re-detects as a legacy "file" clip; suppress that
+                    // too. (Windows places all N; N==1 only for a lenient 1-entry frame.)
+                    if (fsc.Files.Count == 1)
+                        coordinator.MarkReceived("file", Hashing.Sha256Hex(fsc.Files[0].Data));
+                    RotatingLog.Shared.Info(
+                        $"<- received {fsc.Files.Count} files from {peer} "
+                        + $"({(ok ? "written to clipboard" : "WRITE FAILED")})");
+                    toast($"AnyClip ← {peer}", $"{fsc.Files.Count} files");
+                    break;
             }
         };
 
@@ -142,6 +153,26 @@ public sealed class Daemon(
             {
                 RotatingLog.Shared.Debug($"skip echo of just-received {payload.Kind}");
                 return;
+            }
+            // Old-peer fallback: a peer on protocol minor 0 can't parse a
+            // "files" clip. Downgrade to the first file as a legacy "file" clip
+            // and report the dropped count via the skip-notification path.
+            if (payload is FilesClip multi && link.PeerProtocolMinor < 1)
+            {
+                int dropped = multi.Files.Count - 1;
+                var (fname, fdata) = multi.Files[0];
+                payload = new FileClip(fname, fdata);
+                if (!coordinator.ShouldSend(payload.Kind, payload.PayloadHash))
+                {
+                    RotatingLog.Shared.Debug("skip echo of just-received file (old-peer downgrade)");
+                    return;
+                }
+                RotatingLog.Shared.Info(
+                    $"peer protocol minor {link.PeerProtocolMinor} < 1: sending 1 of "
+                    + $"{multi.Files.Count} files, {dropped} dropped");
+                if (dropped > 0)
+                    _ = clipboard.OnFileSkipped?.Invoke(
+                        $"{dropped} file(s) not synced — update the peer's AnyClip for multi-file sync");
             }
             await link.SendClipAsync(payload);
             string peer = link.PeerName ?? "peer";
@@ -158,6 +189,10 @@ public sealed class Daemon(
                 case FileClip f:
                     RotatingLog.Shared.Info($"-> sent file {f.Name} {f.Data.Length} bytes to {peer}");
                     toast($"AnyClip → {peer}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
+                    break;
+                case FilesClip fsc:
+                    RotatingLog.Shared.Info($"-> sent {fsc.Files.Count} files to {peer}");
+                    toast($"AnyClip → {peer}", $"{fsc.Files.Count} files");
                     break;
             }
         };

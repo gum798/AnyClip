@@ -63,6 +63,96 @@ public class DaemonTests
     }
 
     [Fact]
+    public void SyncCoordinatorSuppressesFilesAggregateAndSingleFile()
+    {
+        var c = new SyncCoordinator();
+        var agg = Hashing.AggregateFilesHash(new[]
+        {
+            Hashing.Sha256Hex("one"u8.ToArray()),
+            Hashing.Sha256Hex("two"u8.ToArray()),
+        });
+        c.MarkReceived("files", agg);
+        Assert.False(c.ShouldSend("files", agg));        // echo of just-received set suppressed
+        Assert.True(c.ShouldSend("files", "other-agg"));  // a different set still sends
+        var h = Hashing.Sha256Hex("solo"u8.ToArray());
+        c.MarkReceived("file", h);                        // 1-placed receive rule also marks "file"
+        Assert.False(c.ShouldSend("file", h));
+    }
+
+    private static async Task<FramedConnection> ConnectWithRetry(int port, CancellationToken ct)
+    {
+        for (int i = 0; ; i++)
+        {
+            try { return await FramedConnection.ConnectAsync("127.0.0.1", port, 5, ct); }
+            catch when (i < 40) { await Task.Delay(100, ct); }
+        }
+    }
+
+    [Fact]
+    public async Task OldPeerDowngradesFilesClipToFirstFileWithNotification()
+    {
+        var stateDir = Path.Combine(Path.GetTempPath(), "anyclip-downgrade-" + Guid.NewGuid());
+        var clip = new FakeClipboard();
+        var notes = new List<string>();
+        var daemon = new Daemon(
+            new DaemonConfig("dg-token", 28625, "dg", NotificationsEnabled: true),
+            appVersion: "0.0.0-test", stateDir: stateDir,
+            clipboard: clip, mdns: new FakeMdns(), pidLock: new FakePidLock(),
+            primaryIPv4: () => "127.0.0.1",
+            notify: (_, body) => { lock (notes) notes.Add(body); }, onFatal: _ => { });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var run = daemon.RunForeverAsync(cts.Token);
+
+        using var raw = await ConnectWithRetry(28625, cts.Token);
+        var oldHello = WireMessage.Hello(
+            Hashing.Sha256Hex("dg-token"), "ffffffff-old", "old-peer", "1.0.0")
+            with { ProtocolMinor = 0 };
+        await raw.SendFrameAsync(oldHello, cts.Token);
+        _ = await raw.ReceiveMessageAsync(cts.Token); // daemon hello
+
+        // Wait for the link to register (guarantees link.IsActive before we fire).
+        async Task<bool> WaitForLinkUp(double seconds = 10)
+        {
+            using var to = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
+            try
+            {
+                while (await daemon.Events.WaitToReadAsync(to.Token))
+                    while (daemon.Events.TryRead(out var ev))
+                        if (ev is LinkUp) return true;
+            }
+            catch (OperationCanceledException) { }
+            return false;
+        }
+        Assert.True(await WaitForLinkUp());
+        Assert.NotNull(clip.OnLocalChange);
+
+        // Simulate a local 2-file copy through the daemon's wired handler.
+        await clip.OnLocalChange!(new FilesClip(new List<(string, byte[])>
+        {
+            ("first.txt", "one"u8.ToArray()),
+            ("second.txt", "two"u8.ToArray()),
+        }));
+
+        // Old peer receives a legacy single "file" clip (the first file).
+        var got = await raw.ReceiveMessageAsync(cts.Token);
+        Assert.Equal("clip", got!.Type);
+        Assert.Equal("file", got.Kind);
+        Assert.Equal("first.txt", got.Name);
+
+        async Task<bool> WaitUntil(Func<bool> cond, double seconds = 5)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < deadline) { if (cond()) return true; await Task.Delay(50); }
+            return cond();
+        }
+        Assert.True(await WaitUntil(() => { lock (notes) return notes.Any(n => n.Contains("1 file")); }));
+
+        cts.Cancel();
+        try { await run; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
     public void ClearDirectoryFilesKeepsSubdirs()
     {
         var dir = Path.Combine(Path.GetTempPath(), "anyclip-clear-" + Guid.NewGuid());
