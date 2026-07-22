@@ -129,6 +129,61 @@ private func startLoopbackListener(
     #expect(client.remoteIP == "127.0.0.1")
 }
 
+// Regression for the zombie-daemon wedge (2026-07-22): dialing a peer that is
+// down leaves NWConnection in .waiting (it retries forever on its own — it
+// never fails), and start()'s continuation ignored both that state and task
+// cancellation. tryConnect's withTimeout then could not reap its operation
+// child, so a daemon-restart escalation hung in awaitAllRemainingTasks with
+// every other child (clipboard watcher, outbound drain) already cancelled —
+// a receive-only daemon that never sends and never restarts. start() must
+// fail fast on .waiting; the mDNS reconnect loop owns retry/backoff.
+@Test func startFailsFastWhenPeerUnreachable() async throws {
+    // Nothing listens on this port: NWConnection goes .waiting (refused) and,
+    // unfixed, start() parks forever. Run it unawaited and poll an outcome box
+    // so the test itself cannot hang.
+    let client = FramedConnection.outbound(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 28499)!))
+    let outcome = Locked<String?>(nil)
+    let startTask = Task {
+        do { try await client.start(); outcome.set("connected") }
+        catch { outcome.set("failed") }
+    }
+    for _ in 0..<300 { // up to ~3 s
+        if outcome.get() != nil { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    startTask.cancel()
+    client.cancel()
+    #expect(outcome.get() == "failed") // before the fix: still nil (parked)
+}
+
+// Companion cancellation regression: even when a dial is parked, cancelling
+// the surrounding task must resume start() promptly — otherwise a structured
+// shutdown (daemon bounce, app quit) deadlocks exactly as observed live.
+//
+// NOTE the shape: `await task.value` ignores the AWAITER's cancellation, so
+// the deadline pattern used by receiveMessageHonorsCancellation would itself
+// deadlock while this bug exists. Watch completion through a Locked box and
+// poll with a budget instead; unwedge with client.cancel() before asserting
+// so a pre-fix run fails fast rather than hanging the suite.
+@Test func startHonorsCancellation() async throws {
+    let client = FramedConnection.outbound(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 28498)!))
+    let finished = Locked(false)
+    let startTask = Task { try? await client.start() }
+    let watchTask = Task { _ = await startTask.value; finished.set(true) }
+    try await Task.sleep(nanoseconds: 200_000_000) // let it park in .waiting
+    startTask.cancel()
+    for _ in 0..<200 { // up to ~2 s for the cancel to resume start()
+        if finished.get() { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    let ok = finished.get()
+    client.cancel() // unwedge the parked continuation on pre-fix builds
+    watchTask.cancel()
+    #expect(ok) // before the fix: false (task cancellation ignored)
+}
+
 // Regression: a parked receive (peer connected, sending nothing) must wake
 // up when its Task is cancelled. Without cancellation wired into
 // NWConnection.receive, the continuation never resumes, so a structured

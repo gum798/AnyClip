@@ -35,25 +35,67 @@ public final class FramedConnection: @unchecked Sendable {
     }
 
     /// Start and suspend until .ready (throws on .failed/.cancelled).
+    /// The continuation MUST be resumable from EITHER a state update OR task
+    /// cancellation — the same hardening rawSendFrame has. Two traps here
+    /// (the 2026-07-22 zombie-daemon wedge):
+    /// - `.waiting` (peer down / refused / no route) makes NWConnection retry
+    ///   forever on its own; treated as terminal instead — the mDNS reconnect
+    ///   loop owns retry/backoff, matching Python's fail-fast connect.
+    /// - task cancellation used to be ignored entirely: nobody cancelled the
+    ///   NWConnection and nothing resumed, so tryConnect's withTimeout could
+    ///   never reap its operation child and a daemon-bounce hung forever in
+    ///   awaitAllRemainingTasks (receive-only daemon, no supervisor restart).
     public func start() async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            let resumed = Locked(false)
-            connection.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    self?.captureRemoteIP()
-                    if !resumed.exchange(true) { cont.resume() }
-                case .failed(let error):
-                    if !resumed.exchange(true) { cont.resume(throwing: error) }
-                case .cancelled:
-                    if !resumed.exchange(true) {
-                        cont.resume(throwing: WireConnectionError.cancelled)
-                    }
-                default:
-                    break
-                }
+        enum StartState {
+            case idle                                       // no continuation yet
+            case cancelledBeforeWait                        // onCancel beat the body
+            case waiting(CheckedContinuation<Void, Error>)  // body parked
+            case finished                                   // resumed exactly once
+        }
+        let state = Locked<StartState>(.idle)
+        let complete: @Sendable (Error?) -> Void = { error in
+            let prev = state.exchange(.finished)
+            if case .waiting(let cont) = prev {
+                if let error { cont.resume(throwing: error) } else { cont.resume() }
             }
-            connection.start(queue: .global(qos: .userInitiated))
+        }
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<Void, Error>) in
+                let prev = state.exchange(.waiting(cont))
+                if case .cancelledBeforeWait = prev {
+                    _ = state.exchange(.finished)
+                    cont.resume(throwing: WireConnectionError.cancelled)
+                    return
+                }
+                connection.stateUpdateHandler = { [weak self] st in
+                    switch st {
+                    case .ready:
+                        self?.captureRemoteIP()
+                        complete(nil)
+                    case .waiting(let error):
+                        self?.connection.cancel()
+                        complete(error)
+                    case .failed(let error):
+                        complete(error)
+                    case .cancelled:
+                        complete(WireConnectionError.cancelled)
+                    default:
+                        break
+                    }
+                }
+                connection.start(queue: .global(qos: .userInitiated))
+            }
+        } onCancel: {
+            // Cancel the connection AND resume ourselves — a dropped or
+            // never-arriving state update can no longer strand the caller.
+            connection.cancel()
+            let prev = state.exchange(.cancelledBeforeWait)
+            if case .waiting(let cont) = prev {
+                _ = state.exchange(.finished)
+                cont.resume(throwing: WireConnectionError.cancelled)
+            }
         }
         connection.stateUpdateHandler = nil
     }
