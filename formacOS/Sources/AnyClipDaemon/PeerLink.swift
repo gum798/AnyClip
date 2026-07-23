@@ -317,7 +317,7 @@ public actor PeerLink {
             + "(\(inbound ? "inbound" : "outbound")) "
             + "peer_app_version=\(peerVersion.appVersion) "
             + "peer_proto=\(peerVersion.protocolMajor).\(peerVersion.protocolMinor)")
-        emit?(.linkUp(peerName: displayName, peerID: peerID))
+        emit?(.linkUp(nodeID: peerID, peerName: displayName))
 
         // Receive loop.
         while true {
@@ -348,6 +348,7 @@ public actor PeerLink {
         }
 
         let wasActive = (activeConn === framed)
+        let downID = peerNodeID
         if wasActive {
             activeConn = nil
             peerNodeID = nil
@@ -356,7 +357,7 @@ public actor PeerLink {
         }
         AnyLog.shared.info("peer disconnected")
         if wasActive {
-            emit?(.linkDown(reason: "peer disconnected"))
+            emit?(.linkDown(nodeID: downID ?? "", reason: "peer disconnected"))
         }
     }
 

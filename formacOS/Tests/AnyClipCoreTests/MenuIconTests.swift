@@ -2,7 +2,7 @@ import Testing
 @testable import AnyClipCore
 
 @Test func linkedIsPlainGlyph() {
-    let s = reducePeerState(.initial, .linkUp(peerName: "p", peerID: "x"), now: 1)
+    let s = reducePeerState(.initial, .linkUp(nodeID: "x", peerName: "p"), now: 1)
     #expect(menuIconSpec(for: s) == MenuIconSpec(text: "@", highlighted: false))
 }
 
