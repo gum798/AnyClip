@@ -206,21 +206,35 @@ public final class Daemon: @unchecked Sendable {
                 return
             }
             let result = await manager.broadcast(rawPayload)
+            // Per-peer `-> sent` LOG lines stay (logs are fine per peer), but the
+            // toast is aggregated to ONE per local copy: an 8-peer mesh otherwise
+            // fired 8 toasts for a single copy. Parity with the C# tray (one toast
+            // whose title lists the delivered peer names, sorted + comma-joined).
             for d in result.delivered {
                 switch d.payload {
                 case .text(let text):
                     AnyLog.shared.info("-> sent text \(text.count) chars to \(d.peerName)")
-                    notify("AnyClip → \(d.peerName)", preview(text))
                 case .image(let png):
                     AnyLog.shared.info("-> sent image \(png.count) bytes to \(d.peerName)")
-                    notify("AnyClip → \(d.peerName)", "image (\(png.count / 1024) KB)")
                 case .file(let name, let data):
                     AnyLog.shared.info("-> sent file \(name) \(data.count) bytes to \(d.peerName)")
-                    notify("AnyClip → \(d.peerName)", "file: \(name) (\(data.count / 1024) KB)")
                 case .files(let fs):
                     let total = fs.reduce(0) { $0 + $1.data.count }
                     AnyLog.shared.info("-> sent \(fs.count) files \(total) bytes to \(d.peerName)")
-                    notify("AnyClip → \(d.peerName)", "\(fs.count) files")
+                }
+            }
+            if !result.delivered.isEmpty {
+                let peers = result.delivered.map { $0.peerName }.sorted().joined(separator: ", ")
+                // Body keyed off the local payload kind (one copy -> one toast).
+                switch rawPayload {
+                case .text(let text):
+                    notify("AnyClip → \(peers)", preview(text))
+                case .image(let png):
+                    notify("AnyClip → \(peers)", "image (\(png.count / 1024) KB)")
+                case .file(let name, let data):
+                    notify("AnyClip → \(peers)", "file: \(name) (\(data.count / 1024) KB)")
+                case .files(let fs):
+                    notify("AnyClip → \(peers)", "\(fs.count) files")
                 }
             }
             // Old-peer fallback aggregated into ONE toast across all peers (same
