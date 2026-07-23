@@ -219,3 +219,50 @@ def test_two_managers_handshake_link_and_broadcast():
             await mgr_a.close()
             await mgr_b.close()
     asyncio.run(go())
+
+
+# ---- global mDNS escalator keyed on active-link count ------------------
+
+def test_idle_link_watchdog_fires_only_at_zero_active_links():
+    async def go():
+        import types as _types
+
+        class FakeBeacon:
+            def __init__(self):
+                self.refreshes = 0
+            async def refresh(self):
+                self.refreshes += 1
+
+        # One active link -> the global escalator must stay quiet.
+        mgr = LinkManager(_cfg(), "node-self", None)
+        mgr._links = {"a": FakeLink(name="a")}
+        beacon = FakeBeacon()
+        task = asyncio.create_task(
+            anyclip.idle_link_watchdog(beacon, mgr, idle_threshold=0.02,
+                                       refresh_attempts_before_bounce=3)
+        )
+        await asyncio.sleep(0.1)  # several idle_threshold ticks
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert beacon.refreshes == 0  # links active -> no refresh
+
+        # Zero active links -> escalation refreshes, then bounces.
+        mgr2 = LinkManager(_cfg(), "node-self", None)  # empty table
+        beacon2 = FakeBeacon()
+        with_bounce = asyncio.create_task(
+            anyclip.idle_link_watchdog(beacon2, mgr2, idle_threshold=0.02,
+                                       refresh_attempts_before_bounce=2)
+        )
+        raised = False
+        try:
+            await asyncio.wait_for(with_bounce, timeout=1.0)
+        except RuntimeError:
+            raised = True
+        except asyncio.TimeoutError:
+            with_bounce.cancel()
+        assert beacon2.refreshes >= 1
+        assert raised  # escalated to a daemon bounce after the refresh budget
+    asyncio.run(go())

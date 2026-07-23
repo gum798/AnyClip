@@ -96,6 +96,7 @@ def _build_config(token: str) -> anyclip.Config:
         verbose=False,
         peers=[],
         no_notify=False,
+        max_peers=anyclip.DEFAULT_MAX_PEERS,
     )
 
 
@@ -219,14 +220,7 @@ class AnyClipTrayApp:
         )
 
     def _status_label(self) -> str:
-        s = self._current_state
-        if s.kind == "linked":
-            return f"Linked: {s.peer_name or 'peer'}"
-        if s.kind == "searching":
-            return "Searching for peer"
-        if s.kind == "error":
-            return f"Error: {s.reason or 'unknown'}"
-        return "Idle"
+        return peer_state.status_label(self._current_state)
 
     def _last_sync_label(self) -> str:
         s = self._current_state

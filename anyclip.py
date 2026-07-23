@@ -2219,44 +2219,48 @@ async def network_watchdog(beacon: "MdnsBeacon", interval: float = 15.0) -> None
 
 async def idle_link_watchdog(
     beacon: "MdnsBeacon",
-    link: "PeerLink",
+    manager: "LinkManager",
     idle_threshold: float = 60.0,
     refresh_attempts_before_bounce: int = 3,
 ) -> None:
-    """Self-heal mDNS when the link sits dead for too long.
+    """Self-heal mDNS when the WHOLE mesh sits dead for too long.
 
-    network_watchdog only fires on IP change. If Wi-Fi blips but the
-    IP survives, zeroconf's multicast socket can end up silently
-    unbound (no Errno, no exception) and stop delivering peer
-    advertisements. mdns_reconnect_loop can't help because it depends
-    on `known_peers`, which were pruned the last time the link died.
+    network_watchdog only fires on IP change. If Wi-Fi blips but the IP
+    survives, zeroconf's multicast socket can end up silently unbound (no
+    Errno, no exception) and stop delivering peer advertisements.
+    mdns_reconnect_loop can't help because it depends on `known_peers`,
+    which were pruned the last time the links died.
+
+    Global scope, keyed on the manager's ACTIVE-LINK COUNT (never on a
+    single link's idleness): keyed per-link, one sleeping peer would bounce
+    the daemon and tear down every healthy link. Only when ZERO links are
+    active do we escalate.
 
     Recovery escalation:
       1..refresh_attempts: call beacon.refresh() to re-announce + re-issue
          the browse query. Cheap; reuses the existing AsyncZeroconf.
-      attempts+1: raise RuntimeError to unwind asyncio.gather() and let
-         the supervisor restart the whole runtime with a fresh zeroconf
-         socket. Same trick as network_watchdog.
+      attempts+1: raise RuntimeError to unwind asyncio.gather() and let the
+         supervisor restart the whole runtime with a fresh zeroconf socket.
 
-    Counter resets whenever the link comes back up.
+    Counter resets whenever any link is active.
     """
     consecutive_idle = 0
     while True:
         await asyncio.sleep(idle_threshold)
-        if link.active:
+        if manager.active_count() > 0:
             consecutive_idle = 0
             continue
         consecutive_idle += 1
         elapsed = idle_threshold * consecutive_idle
         if consecutive_idle <= refresh_attempts_before_bounce:
             log.info(
-                f"link idle {elapsed:.0f}s; refreshing mDNS "
+                f"no active links for {elapsed:.0f}s; refreshing mDNS "
                 f"(attempt {consecutive_idle}/{refresh_attempts_before_bounce})"
             )
             await beacon.refresh()
         else:
             raise RuntimeError(
-                f"link idle > {elapsed:.0f}s with no recovery after "
+                f"no active links > {elapsed:.0f}s with no recovery after "
                 f"{refresh_attempts_before_bounce} mDNS refresh attempts; "
                 f"bouncing daemon to re-bind zeroconf"
             )
@@ -2288,57 +2292,55 @@ async def link_ping_loop(
             link.drop_stale_link(idle)
 
 
-async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
-    """Retry mDNS-discovered peers when the link drops.
+async def mdns_reconnect_loop(beacon: "MdnsBeacon", manager: "LinkManager") -> None:
+    """Retry mDNS-discovered peers to keep the mesh filled up to the cap.
 
-    The zeroconf browser only fires ServiceStateChange.Added on first
-    sight. If a TCP link dies (e.g. the OS reassigns our IP and we hit
+    The zeroconf browser only fires ServiceStateChange.Added on first sight.
+    If a TCP link dies (e.g. the OS reassigns our IP and we hit
     EADDRNOTAVAIL on send) but the peer keeps advertising, no new event
-    arrives -- so the only chance to reconnect is to remember every peer
-    we ever resolved and poll them ourselves.
+    arrives -- so the only chance to reconnect is to remember every peer we
+    ever resolved and poll them ourselves. In the mesh this feeds N links:
+    dial every known address not already backing a live link, up to the cap.
 
     Backoff is the same shape as peer_keepalive (1s -> 60s, reset after a
-    session that survived 5s). Cheap when the link is up: just a 2s sleep.
+    session that survived 5s). Cheap when the mesh is full: just a 2s sleep.
     """
     backoff = 1.0
     while True:
-        if link.active:
+        if manager.active_count() >= manager.max_peers:
             backoff = 1.0
             await asyncio.sleep(2)
             continue
         # Dedup by (host, port). The same physical peer can leave several
-        # stale entries in known_peers because every restart of the remote
-        # daemon mints a new node_id, but the address stays the same -- we
-        # only need to attempt one outbound per address per cycle.
+        # stale entries in known_peers (every remote restart mints a new
+        # node_id at the same address) -- one outbound per address per cycle.
         peers = list(dict.fromkeys(beacon.known_peers.values()))
         if not peers:
             await asyncio.sleep(2)
             continue
-        # Try every known peer in turn; stop early if one of them links up.
         attempted = False
         for host, port in peers:
-            if link.active:
+            if manager.active_count() >= manager.max_peers:
                 break
+            if manager.has_link_to_addr(host, port):
+                continue
             attempted = True
             start = time.monotonic()
-            await link.try_connect(host, port)
+            await manager.ensure_link(host, port)
             elapsed = time.monotonic() - start
-            if link.active:
-                # Successful link -- clear any failure history for this addr.
+            if manager.has_link_to_addr(host, port):
+                # Linked -- clear any failure history for this addr.
                 beacon.address_fails.pop((host, port), None)
                 if elapsed > 5.0:
                     backoff = 1.0
-                break
-            # Link is not active *right now*, but if the call took longer
-            # than 5 s the handshake clearly succeeded and the session was
-            # up for a real time before dropping. That is a healthy peer
-            # whose link happened to die after the fact (a tie-breaker
-            # winner taking over, a transient network blip, ...) so we
-            # explicitly do NOT count it toward the prune threshold.
+                continue
+            # Not linked right now, but a >5s call means the handshake
+            # succeeded and the session ran before dropping -- a healthy peer
+            # whose link died after the fact. Do NOT count it toward pruning.
             if elapsed > 5.0:
                 beacon.address_fails.pop((host, port), None)
                 continue
-            # Real fast-fail (no route, refused, tie-breaker drop in ms).
+            # Real fast-fail (no route, refused, over-cap short-circuit, ...).
             fails = beacon.address_fails.get((host, port), 0) + 1
             beacon.address_fails[(host, port)] = fails
             if fails >= MAX_RECONNECT_FAILS:
@@ -2353,8 +2355,6 @@ async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
                     f"pruned stale peer address {host}:{port} after "
                     f"{fails} failed attempts; awaiting fresh mDNS discovery"
                 )
-        if link.active:
-            continue
         if attempted:
             await asyncio.sleep(min(backoff, 60))
             backoff = min(backoff * 2, 60)
@@ -2362,22 +2362,22 @@ async def mdns_reconnect_loop(beacon: "MdnsBeacon", link: "PeerLink") -> None:
             await asyncio.sleep(2)
 
 
-async def peer_keepalive(host: str, port: int, link: "PeerLink") -> None:
+async def peer_keepalive(host: str, port: int, manager: "LinkManager") -> None:
     """Maintain an outbound connection to a manually-configured peer.
 
-    Coexists with mDNS-driven discovery: if the link is already active
-    (from either source), this just polls until it drops, then retries
-    with exponential backoff (1s -> 60s cap). Backoff resets after a
-    session that lasted >5s (treated as 'real' uptime).
+    Coexists with mDNS-driven discovery: if a live link to this address
+    already exists (from either source), this just polls until it drops,
+    then retries with exponential backoff (1s -> 60s cap). Backoff resets
+    after a session that lasted >5s (treated as 'real' uptime).
     """
     backoff = 1.0
     while True:
-        if link.active:
+        if manager.has_link_to_addr(host, port):
             backoff = 1.0
             await asyncio.sleep(2)
             continue
         start = time.monotonic()
-        await link.try_connect(host, port)
+        await manager.ensure_link(host, port)
         elapsed = time.monotonic() - start
         if elapsed > 5.0:
             backoff = 1.0
@@ -2609,15 +2609,17 @@ async def run(config: Config) -> None:
     try:
         await beacon.start()
         coros = [
-            link.serve(),
+            manager.serve(),
+            manager.apply_loop(),
             watcher.run(),
-            mdns_reconnect_loop(beacon, link),
+            mdns_reconnect_loop(beacon, manager),
             network_watchdog(beacon),
-            idle_link_watchdog(beacon, link),
-            link_ping_loop(link),
+            idle_link_watchdog(beacon, manager),
         ]
+        # The per-link staleness dropper (link_ping_loop) is now started
+        # per link inside LinkManager._serve_link, not once globally here.
         for host, port in config.peers:
-            coros.append(peer_keepalive(host, port, link))
+            coros.append(peer_keepalive(host, port, manager))
         if sys.platform == "darwin":
             coros.append(_run_permission_probe(beacon))
         tasks = [asyncio.create_task(c) for c in coros]
@@ -2634,7 +2636,7 @@ async def run(config: Config) -> None:
                 t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await link.close()
+        await manager.close()
         await beacon.stop()
         release_pid_lock()
         clear_received_dir()

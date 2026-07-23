@@ -49,6 +49,7 @@ def _build_config(token: str) -> anyclip.Config:
         verbose=False,
         peers=[],
         no_notify=False,
+        max_peers=anyclip.DEFAULT_MAX_PEERS,
     )
 
 
@@ -175,7 +176,7 @@ class AnyClipMenubarApp:
         # Menubar title stays "@" regardless of state -- state info
         # lives in the dropdown menu items below.
         if kind == "linked":
-            self.status_item.title = f"Linked: {state.peer_name or 'peer'}"
+            self.status_item.title = peer_state.status_label(state)
             self.last_sync_item.title = (
                 f"Linked since: {time.strftime('%H:%M:%S')}"
             )
