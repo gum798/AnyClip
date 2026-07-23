@@ -311,7 +311,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
                 + $"({(inbound ? "inbound" : "outbound")}) "
                 + $"peer_app_version={peerVersion.AppVersion} "
                 + $"peer_proto={peerVersion.ProtocolMajor}.{peerVersion.ProtocolMinor}");
-            Emit?.Invoke(new LinkUp(displayName, peerId));
+            Emit?.Invoke(new LinkUp(peerId, displayName));
 
             // Receive loop.
             while (true)
@@ -344,10 +344,12 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
         finally
         {
             bool wasActive;
+            string? goneId;
             await _lock.WaitAsync(CancellationToken.None);
             try
             {
                 wasActive = ReferenceEquals(_activeConn, framed);
+                goneId = _peerNodeId;
                 if (wasActive)
                 {
                     _activeConn = null;
@@ -358,7 +360,7 @@ public sealed class PeerLink(PeerLink.LinkConfig config, string nodeId)
             }
             finally { _lock.Release(); }
             RotatingLog.Shared.Info("peer disconnected");
-            if (wasActive) Emit?.Invoke(new LinkDown("peer disconnected"));
+            if (wasActive) Emit?.Invoke(new LinkDown(goneId ?? "", "peer disconnected"));
         }
     }
 

@@ -129,7 +129,8 @@ public sealed class TrayIcon : IDisposable
         _currentState = state;
         string status = state.Kind switch
         {
-            PeerStateKind.Linked => $"Linked: {state.PeerName ?? "peer"}",
+            PeerStateKind.Linked => "Linked: " + (state.Peers.Count > 0
+                ? string.Join(", ", state.Peers.Values) : "peer"),
             PeerStateKind.Searching => "Searching for peer",
             PeerStateKind.Error => $"Error: {state.Reason ?? "unknown"}",
             _ => "Idle",
