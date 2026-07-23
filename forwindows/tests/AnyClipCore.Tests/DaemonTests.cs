@@ -153,6 +153,72 @@ public class DaemonTests
     }
 
     [Fact]
+    public async Task DowngradeSkipToastAggregatedToOneAcrossOldPeers()
+    {
+        var stateDir = Path.Combine(Path.GetTempPath(), "anyclip-agg-" + Guid.NewGuid());
+        var clip = new FakeClipboard();
+        var notes = new List<string>();
+        var daemon = new Daemon(
+            new DaemonConfig("agg-token", 28626, "agg", NotificationsEnabled: true),
+            appVersion: "0.0.0-test", stateDir: stateDir,
+            clipboard: clip, mdns: new FakeMdns(), pidLock: new FakePidLock(),
+            primaryIPv4: () => "127.0.0.1",
+            notify: (_, body) => { lock (notes) notes.Add(body); }, onFatal: _ => { });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var run = daemon.RunForeverAsync(cts.Token);
+
+        async Task<FramedConnection> ConnectOld(string node, string name)
+        {
+            var raw = await ConnectWithRetry(28626, cts.Token);
+            await raw.SendFrameAsync(WireMessage.Hello(
+                Hashing.Sha256Hex("agg-token"), node, name, "1.0.0") with { ProtocolMinor = 0 },
+                cts.Token);
+            _ = await raw.ReceiveMessageAsync(cts.Token);
+            return raw;
+        }
+        using var rawA = await ConnectOld("old-a", "old-a");
+        using var rawB = await ConnectOld("old-b", "old-b");
+
+        // Drain LinkUp events until both old peers are linked.
+        async Task<bool> WaitLinks(int n, double seconds = 12)
+        {
+            int count = 0;
+            var deadline = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < deadline)
+            {
+                while (daemon.Events.TryRead(out var ev)) if (ev is LinkUp) count++;
+                if (count >= n) return true;
+                await Task.Delay(50);
+            }
+            return count >= n;
+        }
+        Assert.True(await WaitLinks(2));
+        Assert.NotNull(clip.OnLocalChange);
+
+        await clip.OnLocalChange!(new FilesClip(new List<(string, byte[])>
+        {
+            ("a.txt", "one"u8.ToArray()),
+            ("b.txt", "two"u8.ToArray()),
+            ("c.txt", "three"u8.ToArray()),
+        }));
+
+        async Task<bool> WaitUntil(Func<bool> cond, double seconds = 5)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < deadline) { if (cond()) return true; await Task.Delay(50); }
+            return cond();
+        }
+        // ONE aggregated skip toast for the whole copy, not one per old peer.
+        Assert.True(await WaitUntil(() =>
+        { lock (notes) return notes.Count(n => n.Contains("not synced")) == 1; }));
+        lock (notes) Assert.Contains(notes, n => n.Contains("2 file(s) not synced"));
+
+        cts.Cancel();
+        try { await run; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
     public void ClearDirectoryFilesKeepsSubdirs()
     {
         var dir = Path.Combine(Path.GetTempPath(), "anyclip-clear-" + Guid.NewGuid());
