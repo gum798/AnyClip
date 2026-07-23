@@ -98,6 +98,10 @@ RACE_WINDOW_S = 1.5
 # re-adds it automatically. Keeps the daemon from poking forever at a
 # stale IP after the peer DHCP-renewed onto a different address.
 MAX_RECONNECT_FAILS = 3
+# Full-mesh cap: at most this many simultaneous active links. Shared
+# constant across all three implementations; overridable in the Python
+# build only via --max-peers (config.json stays token-only).
+DEFAULT_MAX_PEERS = 8
 
 log = logging.getLogger("anyclip")
 
@@ -714,6 +718,7 @@ class Config:
     verbose: bool
     peers: list  # list[tuple[str, int]]; manual fallback peers
     no_notify: bool
+    max_peers: int = DEFAULT_MAX_PEERS  # mesh cap; --max-peers overrides
 
 
 def parse_args() -> Config:
@@ -769,6 +774,12 @@ def parse_args() -> Config:
                         help="Enable DEBUG logging on the console (file log is always DEBUG)")
     parser.add_argument("--no-notify", action="store_true",
                         help="Suppress desktop toast notifications on clipboard sync")
+    parser.add_argument(
+        "--max-peers", type=int, default=DEFAULT_MAX_PEERS,
+        help="Maximum simultaneous mesh links (default: "
+             f"{DEFAULT_MAX_PEERS}). New peers beyond the cap are refused; "
+             "known peers reconnecting are always admitted.",
+    )
     parser.add_argument(
         "--headless",
         action="store_true",
@@ -847,6 +858,7 @@ def parse_args() -> Config:
         verbose=args.verbose,
         peers=list(args.peer or []),
         no_notify=args.no_notify,
+        max_peers=max(1, args.max_peers),
     )
 
 
@@ -1296,315 +1308,152 @@ class AuthGate:
             self._fails.pop(ip, None)
 
 
-class PeerLink:
-    """Owns the single active TCP link to a peer.
+def _safe_close(writer: asyncio.StreamWriter) -> None:
+    try:
+        writer.close()
+    except Exception:
+        pass
 
-    Acts as both server and client; resolves the simultaneous-connect
-    race via lexicographic node_id tie-break.
+
+def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
+    """Turn on TCP keepalive so the OS reaps silent zombies in ~30s.
+
+    Windows ignores the per-socket tuning (its KeepAliveTime is a registry
+    value defaulting to ~2h) -- the stale-link replacement handles that gap.
+    On macOS the KEEPIDLE symbolic constant is absent from Python stdlib, so
+    we use the raw value 0x10.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if sys.platform == "linux":
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        elif sys.platform == "darwin":
+            sock.setsockopt(socket.IPPROTO_TCP, 0x10, 15)  # TCP_KEEPALIVE
+    except OSError as exc:
+        log.debug(f"keepalive setup failed: {exc}")
+
+
+async def _write_frame(writer: asyncio.StreamWriter, obj: dict, timeout: float) -> bool:
+    """Length-prefixed JSON frame write for the LinkManager handshake.
+    Returns True on success; closes the writer and returns False on a wedged
+    drain or over-cap payload (mirrors PeerLink._send)."""
+    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    if len(data) > MAX_PAYLOAD:
+        log.warning(f"payload too large ({len(data)} bytes), dropping")
+        return False
+    try:
+        writer.write(len(data).to_bytes(4, "big"))
+        writer.write(data)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        log.info("handshake send timed out; dropping connection")
+        _safe_close(writer)
+        return False
+    except Exception as exc:
+        log.info(f"handshake send failed: {exc}")
+        return False
+
+
+async def _read_frame(reader: asyncio.StreamReader) -> Optional[dict]:
+    """Length-prefixed JSON frame read for the LinkManager handshake."""
+    try:
+        head = await reader.readexactly(4)
+    except asyncio.IncompleteReadError:
+        return None
+    n = int.from_bytes(head, "big")
+    if n == 0 or n > MAX_PAYLOAD:
+        log.warning(f"invalid frame length: {n}")
+        return None
+    try:
+        body = await reader.readexactly(n)
+    except asyncio.IncompleteReadError:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        log.warning(f"bad json: {exc}")
+        return None
+
+
+class PeerLink:
+    """One authenticated peer session (exactly one peer pair).
+
+    Created by LinkManager AFTER the hello exchange and gate; it never reads
+    a hello itself -- it receives the parsed identity (peer node_id, name,
+    protocol minor, app version) and the already-open reader/writer. Owns the
+    receive loop, per-link send, app-layer keepalive, and the per-link
+    staleness watchdog. The listening socket, active-link table, gate, and
+    broadcast live in LinkManager.
     """
 
-    def __init__(self, config: Config, node_id: str, on_clip) -> None:
-        self.config = config
-        self.node_id = node_id
-        self.on_clip = on_clip
-        self._writer: Optional[asyncio.StreamWriter] = None
-        self._peer_node_id: Optional[str] = None
-        self._peer_name: Optional[str] = None  # peer's display name (from hello)
-        self._peer_protocol_minor: Optional[int] = None  # from hello; gates kind:"files"
-        self._linked_at: float = 0.0  # monotonic time when _writer was last set
-        # Monotonic time of the last inbound frame on the active link. Drives
-        # half-open detection: a peer that slept or vanished without RST/FIN
-        # keeps the socket writable (our pings never error) yet sends nothing
-        # back, so staleness can only be judged from inbound silence.
-        self._last_inbound: float = 0.0
-        self._lock = asyncio.Lock()
-        self._send_timeout = SEND_TIMEOUT
-        self._token_hash = sha256_hex(config.token)
-        self._auth_gate = AuthGate()
-        # In-flight outbound attempts keyed by (host, port). Stops two
-        # background loops (mDNS reconnect + peer_keepalive) from racing
-        # each other into the same address.
-        self._connecting: set = set()
+    def __init__(
+        self,
+        node_id: str,
+        peer_node_id: str,
+        peer_name: str,
+        peer_protocol_minor: int,
+        reader: Optional[asyncio.StreamReader],
+        writer: Optional[asyncio.StreamWriter],
+        on_clip,
+        remote_addr: Optional[tuple] = None,
+        send_timeout: float = SEND_TIMEOUT,
+    ) -> None:
+        self.node_id = node_id            # our own node_id
+        self.peer_node_id = peer_node_id  # this peer's node_id (table key)
+        self.peer_name = peer_name
+        self.peer_protocol_minor = peer_protocol_minor
+        self._reader = reader
+        self._writer = writer
+        # async (kind, data, peer_name) -> None; LinkManager's serialized
+        # apply-queue enqueue. Never applies to the clipboard directly.
+        self._on_clip = on_clip
+        # (host, port) for OUTBOUND links (so re-admission can skip an
+        # address already backed by a live link); None for inbound.
+        self.remote_addr = remote_addr
+        self._send_timeout = send_timeout
+        self._linked_at = time.monotonic()
+        self._last_inbound = time.monotonic()
 
     @property
     def active(self) -> bool:
         return self._writer is not None and not self._writer.is_closing()
 
     @property
-    def peer_name(self) -> Optional[str]:
-        return self._peer_name
+    def linked_at(self) -> float:
+        return self._linked_at
 
-    @property
-    def peer_protocol_minor(self) -> Optional[int]:
-        return self._peer_protocol_minor
-
-    async def serve(self) -> None:
-        try:
-            server = await asyncio.start_server(
-                self._handle_inbound, host="0.0.0.0", port=self.config.port,
-            )
-        except OSError as exc:
-            if exc.errno == errno.EADDRINUSE:
-                raise FatalStartupError(
-                    f"port {self.config.port} still in use after cleanup attempt; "
-                    f"another process may have grabbed it -- try again or pick --port"
-                ) from exc
-            raise
-        log.info(f"listening on tcp/{self.config.port}")
-        async with server:
-            await server.serve_forever()
-
-    async def _handle_inbound(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-    ) -> None:
-        peer = writer.get_extra_info("peername")
-        log.debug(f"inbound from {peer}")
-        peer_ip = peer[0] if peer else None
-        if peer_ip and await self._auth_gate.is_blocked(peer_ip):
-            log.info(
-                f"auth gate: {peer_ip} blocked "
-                f"(>{AuthGate.MAX_FAILS} failures, cooldown {AuthGate.COOLDOWN:.0f}s)"
-            )
-            self._safe_close(writer)
-            return
-        self._enable_keepalive(writer)
-        try:
-            await self._session(reader, writer, inbound=True)
-        except Exception as exc:
-            log.debug(f"inbound session ended: {exc}")
-        finally:
-            self._safe_close(writer)
-
-    async def try_connect(self, host: str, port: int) -> None:
-        if self.active:
-            return
-        key = (host, port)
-        if key in self._connecting:
-            log.debug(f"connect to {host}:{port} already in flight, skipping")
-            return
-        self._connecting.add(key)
-        try:
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT,
-                )
-            except Exception as exc:
-                log.info(f"connect to {host}:{port} failed: {exc}")
-                return
-            log.debug(f"outbound connected to {host}:{port}")
-            self._enable_keepalive(writer)
-            try:
-                await self._session(reader, writer, inbound=False)
-            except Exception as exc:
-                log.debug(f"outbound session ended: {exc}")
-            finally:
-                self._safe_close(writer)
-        finally:
-            self._connecting.discard(key)
-
-    @staticmethod
-    def _safe_close(writer: asyncio.StreamWriter) -> None:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
-        """Turn on TCP keepalive so the OS reaps silent zombies in ~30s.
-
-        Windows ignores the per-socket tuning (its KeepAliveTime is a
-        registry value defaulting to ~2 h) -- the tie-breaker stale-link
-        replacement handles that gap. On macOS the symbolic constant for
-        KEEPIDLE is not in Python stdlib, so we use the raw value 0x10.
+    async def run_recv(self) -> None:
+        """Drain frames until EOF/error, enqueuing received clips through the
+        on_clip callback (LinkManager's serialized apply queue). Never reads a
+        hello -- that already happened in the manager handshake. Closes the
+        writer on exit so `active` flips False and the table entry is reaped.
         """
-        sock = writer.get_extra_info("socket")
-        if sock is None:
-            return
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            if sys.platform == "linux":
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-            elif sys.platform == "darwin":
-                sock.setsockopt(socket.IPPROTO_TCP, 0x10, 15)  # TCP_KEEPALIVE
-        except OSError as exc:
-            log.debug(f"keepalive setup failed: {exc}")
-
-    async def _session(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        inbound: bool,
-    ) -> None:
-        await self._send(writer, {
-            "type": "hello",
-            "token": self._token_hash,
-            "node_id": self.node_id,
-            "name": self.config.name,
-            # `version` is the legacy single-int field; kept for old peers
-            # that only know about it. New peers also read the explicit
-            # protocol_major/minor + app_version fields below.
-            "version": PROTOCOL_VERSION,
-            "app_version": APP_VERSION,
-            "protocol_major": PROTOCOL_MAJOR,
-            "protocol_minor": PROTOCOL_MINOR,
-        })
-        peer_ip_for_emit = ""
-        try:
-            peer = writer.get_extra_info("peername")
-            if peer:
-                peer_ip_for_emit = peer[0]
-        except Exception:
-            pass
-        try:
-            hello = await asyncio.wait_for(self._recv(reader), timeout=HANDSHAKE_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.warning("handshake timeout")
-            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason="timeout"))
-            return
-        if not hello or hello.get("type") != "hello":
-            log.warning("invalid hello, closing")
-            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason="invalid"))
-            return
-        peer_ip = None
-        if inbound:
-            peer = writer.get_extra_info("peername")
-            peer_ip = peer[0] if peer else None
-        if hello.get("token") != self._token_hash:
-            log.warning(f"auth failed from peer name={hello.get('name')!r}")
-            if peer_ip:
-                await self._auth_gate.record_fail(peer_ip)
-            emit_event(HandshakeFailed(addr=peer_ip or peer_ip_for_emit, reason="auth"))
-            return
-        # Parse peer's version info with backward-compat defaults: an old
-        # peer only sends `version`, so treat that as protocol_major and
-        # assume protocol_minor=0 / unknown app_version.
-        peer_proto_major_raw = hello.get("protocol_major")
-        if not isinstance(peer_proto_major_raw, int):
-            peer_proto_major_raw = hello.get("version", 0)
-            if not isinstance(peer_proto_major_raw, int):
-                peer_proto_major_raw = 0
-        peer_proto_minor_raw = hello.get("protocol_minor", 0)
-        if not isinstance(peer_proto_minor_raw, int):
-            peer_proto_minor_raw = 0
-        peer_app_version = hello.get("app_version")
-        if not isinstance(peer_app_version, str) or not peer_app_version:
-            peer_app_version = "unknown"
-
-        peer_version = VersionInfo(
-            app_version=peer_app_version,
-            protocol_major=peer_proto_major_raw,
-            protocol_minor=peer_proto_minor_raw,
-        )
-        local_version = VersionInfo(
-            app_version=APP_VERSION,
-            protocol_major=PROTOCOL_MAJOR,
-            protocol_minor=PROTOCOL_MINOR,
-        )
-        compat = negotiate(local_version, peer_version)
-        if not link_allowed(compat):
-            log.warning(
-                f"version refused: local proto={PROTOCOL_MAJOR}.{PROTOCOL_MINOR} "
-                f"app={APP_VERSION} vs peer proto="
-                f"{peer_version.protocol_major}.{peer_version.protocol_minor} "
-                f"app={peer_version.app_version} -> {compat.value}"
-            )
-            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason=f"version:{compat.value}"))
-            return
-        if compat != Compatibility.COMPATIBLE:
-            log.info(
-                f"version mismatch (link kept): {compat.value} "
-                f"local proto={PROTOCOL_MAJOR}.{PROTOCOL_MINOR} vs peer proto="
-                f"{peer_version.protocol_major}.{peer_version.protocol_minor}"
-            )
-        peer_id = hello.get("node_id")
-        if not isinstance(peer_id, str) or peer_id == self.node_id:
-            log.debug("self loopback or bad node_id, dropping")
-            return
-        if peer_ip:
-            await self._auth_gate.record_ok(peer_ip)
-
-        async with self._lock:
-            if self.active:
-                # Two distinct cases:
-                #
-                # (a) Genuine concurrent connect race. Both peers must agree
-                #     on the same surviving socket -- "smaller node_id keeps
-                #     outbound, larger node_id keeps inbound" -- so each
-                #     peer keeps its own end of the *same* TCP link and
-                #     drops the other.
-                #
-                # (b) Post-race-window arrival. The peer would not be
-                #     re-handshaking with us if its end of the existing
-                #     link were healthy (mdns_reconnect_loop and
-                #     peer_keepalive only fire on link.active==False on
-                #     their side). So a fresh, fully-authenticated handshake
-                #     after RACE_WINDOW_S is itself proof the existing link
-                #     is a zombie (silent TCP death: peer crash, force-kill,
-                #     Wi-Fi flap with no FIN/RST). Replace it.
-                #
-                # Without (b) the larger-id side ends up hugging a dead
-                # writer whose `is_closing()` still reports False, and
-                # every retry from the peer loops "linked -> peer
-                # disconnected" until the peer prunes our address.
-                race = (time.monotonic() - self._linked_at) < RACE_WINDOW_S
-                if race:
-                    keep_this_link = (
-                        (not inbound and self.node_id < peer_id) or
-                        (inbound and self.node_id > peer_id)
-                    )
-                    if not keep_this_link:
-                        log.debug("tie-breaker: dropping duplicate link (race)")
-                        return
-                    log.debug("tie-breaker: replacing existing link (race)")
-                else:
-                    log.info(
-                        f"tie-breaker: stale link to {self._peer_name!r} "
-                        f"replaced by fresh handshake from {hello.get('name')!r}"
-                    )
-                self._safe_close(self._writer)  # type: ignore[arg-type]
-            self._writer = writer
-            self._peer_node_id = peer_id
-            self._peer_protocol_minor = peer_proto_minor_raw
-            self._peer_name = hello.get("name") or peer_id[:8]
-            self._linked_at = time.monotonic()
-            self._last_inbound = time.monotonic()
-
-        log.info(
-            f"linked with peer name={hello.get('name')!r} "
-            f"id={peer_id[:8]} ({'inbound' if inbound else 'outbound'}) "
-            f"peer_app_version={peer_version.app_version} "
-            f"peer_proto={peer_version.protocol_major}.{peer_version.protocol_minor}"
-        )
-        emit_event(LinkUp(
-            peer_name=str(hello.get("name") or peer_id[:8]),
-            peer_id=peer_id,
-        ))
-
+        reader, writer = self._reader, self._writer
         try:
             while True:
                 msg = await self._recv(reader)
                 if msg is None:
                     break
-                # Any inbound frame proves the peer is alive; refresh the
-                # liveness clock for the heartbeat deadline.
-                if self._writer is writer:
-                    self._last_inbound = time.monotonic()
+                self._last_inbound = time.monotonic()
                 msg_type = msg.get("type")
                 if msg_type == "clip":
                     kind = msg.get("kind", "text")
                     content = msg.get("content")
                     if kind == "text" and isinstance(content, str):
-                        await self.on_clip("text", content)
+                        await self._on_clip("text", content, self.peer_name)
                     elif kind == "image" and isinstance(content, str):
                         try:
                             png = base64.b64decode(content, validate=True)
                         except Exception as exc:
                             log.warning(f"bad image payload from peer: {exc}")
                             continue
-                        await self.on_clip("image", png)
+                        await self._on_clip("image", png, self.peer_name)
                     elif kind == "file" and isinstance(content, str):
                         try:
                             raw = base64.b64decode(content, validate=True)
@@ -1614,35 +1463,23 @@ class PeerLink:
                         name = msg.get("name") or "received.bin"
                         if not isinstance(name, str):
                             name = "received.bin"
-                        await self.on_clip("file", (name, raw))
+                        await self._on_clip("file", (name, raw), self.peer_name)
                     elif kind == "files":
                         decoded = decode_files_payload(msg)
                         if decoded is None:
                             continue  # whole-frame drop already logged
-                        await self.on_clip("files", decoded)
+                        await self._on_clip("files", decoded, self.peer_name)
                     else:
                         log.debug(f"ignoring clip with kind={kind!r}")
                 elif msg_type == "ping":
-                    # Reply with a pong; the actual liveness test is on
-                    # the send side -- if drain fails the TCP socket is
-                    # dead and _recv returns None next loop.
                     await self._send(writer, {"type": "pong", "ts": time.time()})
                 elif msg_type == "pong":
-                    # Presence is enough -- the link sent SOMETHING.
                     pass
                 else:
                     log.debug(f"ignoring message type: {msg_type!r}")
         finally:
-            async with self._lock:
-                was_active = self._writer is writer
-                if was_active:
-                    self._writer = None
-                    self._peer_node_id = None
-                    self._peer_protocol_minor = None
-                    self._peer_name = None
-            log.info("peer disconnected")
-            if was_active:
-                emit_event(LinkDown(reason="peer disconnected"))
+            _safe_close(writer)
+            self._writer = None
 
     async def _send(self, writer: asyncio.StreamWriter, obj: dict) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1654,11 +1491,11 @@ class PeerLink:
             writer.write(data)
             await asyncio.wait_for(writer.drain(), timeout=self._send_timeout)
         except asyncio.TimeoutError:
-            # The write parked past the budget -- half-open/wedged socket. Close
-            # the writer so the next _recv returns EOF and the reconnect loop
-            # takes over; never let a stuck send freeze the caller's loop.
+            # The write parked past the budget -- half-open/wedged socket.
+            # Close the writer so the next _recv returns EOF and the session
+            # tears down; never let a stuck send freeze the caller's loop.
             log.info("send timed out (link wedged); dropping link to force reconnect")
-            self._safe_close(writer)
+            _safe_close(writer)
         except Exception as exc:
             log.info(f"send failed (link likely down): {exc}")
 
@@ -1682,28 +1519,24 @@ class PeerLink:
             return None
 
     async def close(self) -> None:
-        """Drop the active link if any. Safe to call multiple times."""
-        async with self._lock:
-            if self._writer is not None:
-                self._safe_close(self._writer)
-                self._writer = None
-                self._peer_node_id = None
-                self._peer_name = None
+        """Drop this link's socket. Safe to call multiple times."""
+        if self._writer is not None:
+            _safe_close(self._writer)
+            self._writer = None
 
     async def send_ping(self) -> None:
         """App-layer keepalive frame. Drives traffic on an otherwise idle
-        link so a silently-dead TCP socket surfaces as a send failure +
-        EOF on the next recv -- important on Windows where the OS
-        KeepAliveTime defaults to ~2h.
-        """
+        link so a silently-dead TCP socket surfaces as a send failure + EOF
+        on the next recv -- important on Windows where the OS KeepAliveTime
+        defaults to ~2h."""
         writer = self._writer
         if writer is None or writer.is_closing():
             return
         await self._send(writer, {"type": "ping", "ts": time.time()})
 
     def seconds_since_inbound(self) -> Optional[float]:
-        """Seconds since the last inbound frame on the active link, or None if
-        not linked. The heartbeat loop compares this against its deadline."""
+        """Seconds since the last inbound frame, or None if not linked. The
+        per-link heartbeat compares this against its deadline."""
         if not self.active:
             return None
         return time.monotonic() - self._last_inbound
@@ -1712,20 +1545,20 @@ class PeerLink:
         """Drop a link gone silent -- half-open socket: the peer slept or
         vanished without RST/FIN, so sends never error and _recv never
         returns. Closing the writer makes the next _recv return None, the
-        session tears down (clearing the active link), and the reconnect loop
-        takes over. No-op if already unlinked."""
+        session tears down (freeing the table slot), and re-admission runs.
+        No-op if already unlinked."""
         writer = self._writer
         if writer is None:
             return
         log.info(
-            f"link to {self._peer_name!r} idle {int(idle_seconds)}s with no "
+            f"link to {self.peer_name!r} idle {int(idle_seconds)}s with no "
             f"inbound (peer likely asleep / half-open); dropping to force reconnect"
         )
-        self._safe_close(writer)
+        _safe_close(writer)
 
     async def send_clip(self, kind: str, content) -> None:
-        """Send a clipboard payload. kind=='text' expects str, kind=='image'
-        expects raw PNG bytes (will be base64-encoded on the wire)."""
+        """Send one clipboard payload to THIS peer. kind=='text' expects str,
+        'image' raw PNG bytes, 'file' (name, raw), 'files' [(name, raw), ...]."""
         writer = self._writer
         if writer is None or writer.is_closing():
             return
@@ -1752,7 +1585,6 @@ class PeerLink:
                 "bytes": len(content),
             }
         elif kind == "file":
-            # content is expected to be (name, raw_bytes)
             if not isinstance(content, tuple) or len(content) != 2:
                 return
             name, raw = content
@@ -1770,7 +1602,6 @@ class PeerLink:
                 "bytes": len(raw_b),
             }
         elif kind == "files":
-            # content is expected to be a list of (name, raw_bytes) tuples.
             if not isinstance(content, list) or not content:
                 return
             files_arr = []
@@ -1804,6 +1635,392 @@ class PeerLink:
             log.debug(f"send_clip: unknown kind {kind!r}, dropping")
             return
         await self._send(writer, payload)
+
+
+class LinkManager:
+    """Owns the listening socket, the active-link table keyed by peer
+    node_id, the pre-routing gate, and clip broadcast. Splits the old
+    single-link PeerLink into a router (this) + N per-peer PeerLink sessions.
+    """
+
+    def __init__(self, config: "Config", node_id: str, on_clip,
+                 max_peers: int = DEFAULT_MAX_PEERS) -> None:
+        self.config = config
+        self.node_id = node_id
+        # async (kind, data, peer_name) -> None; the REAL apply handler
+        # (on_remote_clip), invoked serially by apply_loop.
+        self._on_clip = on_clip
+        self.max_peers = max_peers
+        self._token_hash = sha256_hex(config.token)
+        self._auth_gate = AuthGate()          # moved here: fails aggregate per IP
+        self._links: dict = {}                # peer node_id -> PeerLink
+        self._lock = asyncio.Lock()
+        self._apply_queue: asyncio.Queue = asyncio.Queue()
+        self._connecting: set = set()         # (host, port) dials in flight
+        self._beacon = None                   # set via attach_beacon
+
+    # ---- introspection -------------------------------------------------
+    def active_count(self) -> int:
+        return sum(1 for l in self._links.values() if l.active)
+
+    def has_link_to_addr(self, host: str, port: int) -> bool:
+        key = (host, port)
+        return any(l.active and l.remote_addr == key for l in self._links.values())
+
+    def peer_names(self) -> list:
+        return [l.peer_name for l in self._links.values() if l.active]
+
+    def attach_beacon(self, beacon) -> None:
+        """Wire the discovery snapshot so link drops can actively re-dial."""
+        self._beacon = beacon
+
+    # ---- serialized receive apply --------------------------------------
+    async def _enqueue_received(self, kind, data, peer_name) -> None:
+        await self._apply_queue.put((kind, data, peer_name))
+
+    async def apply_loop(self) -> None:
+        """Single consumer across ALL links: applies received clips one at a
+        time so the global EchoSuppressor slot stays consistent (each apply
+        marks the suppressor before touching the clipboard, in on_clip)."""
+        while True:
+            kind, data, peer_name = await self._apply_queue.get()
+            try:
+                await self._on_clip(kind, data, peer_name)
+            except Exception as exc:
+                log.exception(f"apply handler failed: {exc}")
+
+    # ---- inbound listener ----------------------------------------------
+    async def serve(self) -> None:
+        try:
+            server = await asyncio.start_server(
+                self._handle_inbound, host="0.0.0.0", port=self.config.port,
+            )
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise FatalStartupError(
+                    f"port {self.config.port} still in use after cleanup attempt; "
+                    f"another process may have grabbed it -- try again or pick --port"
+                ) from exc
+            raise
+        log.info(f"listening on tcp/{self.config.port}")
+        # start_server() already began accepting; park until cancelled.
+        # We deliberately avoid Server.serve_forever() / `async with server`:
+        # on Python 3.12.1+ both await Server.wait_closed() on their
+        # cancellation path, which blocks until every accepted connection
+        # drops. During shutdown those are still held open by live PeerLink
+        # recv loops, so that await would deadlock teardown. close() alone
+        # (no wait_closed) tears the listener down promptly; live links are
+        # dropped separately via close().
+        try:
+            await asyncio.Event().wait()
+        finally:
+            server.close()
+            close_clients = getattr(server, "close_clients", None)
+            if close_clients is not None:
+                close_clients()  # 3.13+: drop accepted conns promptly
+
+    async def _handle_inbound(self, reader, writer) -> None:
+        peer = writer.get_extra_info("peername")
+        log.debug(f"inbound from {peer}")
+        peer_ip = peer[0] if peer else None
+        # AuthGate IP-block check up front so failures aggregate per source IP
+        # across connections that never form a link.
+        if peer_ip and await self._auth_gate.is_blocked(peer_ip):
+            log.info(
+                f"auth gate: {peer_ip} blocked "
+                f"(>{AuthGate.MAX_FAILS} failures, cooldown {AuthGate.COOLDOWN:.0f}s)"
+            )
+            _safe_close(writer)
+            return
+        _enable_keepalive(writer)
+        try:
+            await self._handshake_and_route(reader, writer, inbound=True)
+        except Exception as exc:
+            log.debug(f"inbound handshake failed: {exc}")
+            _safe_close(writer)
+
+    # ---- outbound dialer -----------------------------------------------
+    async def ensure_link(self, host: str, port: int) -> None:
+        """Dial a discovered peer if we have capacity and no live link to it.
+        Returns promptly: on success the session serves in a background task."""
+        if self.active_count() >= self.max_peers:
+            return
+        key = (host, port)
+        if key in self._connecting:
+            log.debug(f"connect to {host}:{port} already in flight, skipping")
+            return
+        if self.has_link_to_addr(host, port):
+            return
+        self._connecting.add(key)
+        try:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT,
+                )
+            except Exception as exc:
+                log.info(f"connect to {host}:{port} failed: {exc}")
+                return
+            log.debug(f"outbound connected to {host}:{port}")
+            _enable_keepalive(writer)
+            try:
+                await self._handshake_and_route(
+                    reader, writer, inbound=False, remote_addr=key,
+                )
+            except Exception as exc:
+                log.debug(f"outbound handshake failed: {exc}")
+                _safe_close(writer)
+        finally:
+            self._connecting.discard(key)
+
+    # ---- handshake + pre-routing gate ----------------------------------
+    async def _handshake_and_route(self, reader, writer, inbound,
+                                   remote_addr=None) -> None:
+        ok = await _write_frame(writer, {
+            "type": "hello",
+            "token": self._token_hash,
+            "node_id": self.node_id,
+            "name": self.config.name,
+            "version": PROTOCOL_VERSION,
+            "app_version": APP_VERSION,
+            "protocol_major": PROTOCOL_MAJOR,
+            "protocol_minor": PROTOCOL_MINOR,
+        }, timeout=SEND_TIMEOUT)
+        if not ok:
+            _safe_close(writer)
+            return
+        peer_ip_for_emit = ""
+        try:
+            peer = writer.get_extra_info("peername")
+            if peer:
+                peer_ip_for_emit = peer[0]
+        except Exception:
+            pass
+        try:
+            hello = await asyncio.wait_for(_read_frame(reader), timeout=HANDSHAKE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("handshake timeout")
+            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason="timeout"))
+            _safe_close(writer)
+            return
+        if not hello or hello.get("type") != "hello":
+            log.warning("invalid hello, closing")
+            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason="invalid"))
+            _safe_close(writer)
+            return
+        peer_ip = None
+        if inbound:
+            peer = writer.get_extra_info("peername")
+            peer_ip = peer[0] if peer else None
+        if hello.get("token") != self._token_hash:
+            log.warning(f"auth failed from peer name={hello.get('name')!r}")
+            if peer_ip:
+                await self._auth_gate.record_fail(peer_ip)
+            emit_event(HandshakeFailed(addr=peer_ip or peer_ip_for_emit, reason="auth"))
+            _safe_close(writer)
+            return
+        # Version parse with backward-compat defaults (old peer: only `version`).
+        peer_proto_major_raw = hello.get("protocol_major")
+        if not isinstance(peer_proto_major_raw, int):
+            peer_proto_major_raw = hello.get("version", 0)
+            if not isinstance(peer_proto_major_raw, int):
+                peer_proto_major_raw = 0
+        peer_proto_minor_raw = hello.get("protocol_minor", 0)
+        if not isinstance(peer_proto_minor_raw, int):
+            peer_proto_minor_raw = 0
+        peer_app_version = hello.get("app_version")
+        if not isinstance(peer_app_version, str) or not peer_app_version:
+            peer_app_version = "unknown"
+        peer_version = VersionInfo(
+            app_version=peer_app_version,
+            protocol_major=peer_proto_major_raw,
+            protocol_minor=peer_proto_minor_raw,
+        )
+        local_version = VersionInfo(
+            app_version=APP_VERSION,
+            protocol_major=PROTOCOL_MAJOR,
+            protocol_minor=PROTOCOL_MINOR,
+        )
+        compat = negotiate(local_version, peer_version)
+        if not link_allowed(compat):
+            log.warning(
+                f"version refused: local proto={PROTOCOL_MAJOR}.{PROTOCOL_MINOR} "
+                f"app={APP_VERSION} vs peer proto="
+                f"{peer_version.protocol_major}.{peer_version.protocol_minor} "
+                f"app={peer_version.app_version} -> {compat.value}"
+            )
+            emit_event(HandshakeFailed(addr=peer_ip_for_emit, reason=f"version:{compat.value}"))
+            _safe_close(writer)
+            return
+        if compat != Compatibility.COMPATIBLE:
+            log.info(
+                f"version mismatch (link kept): {compat.value} "
+                f"local proto={PROTOCOL_MAJOR}.{PROTOCOL_MINOR} vs peer proto="
+                f"{peer_version.protocol_major}.{peer_version.protocol_minor}"
+            )
+        peer_id = hello.get("node_id")
+        if not isinstance(peer_id, str) or peer_id == self.node_id:
+            log.debug("self loopback or bad node_id, dropping")
+            _safe_close(writer)
+            return
+        if peer_ip:
+            await self._auth_gate.record_ok(peer_ip)
+        peer_name = str(hello.get("name") or peer_id[:8])
+        link = await self._route(
+            peer_id, peer_name, peer_proto_minor_raw, peer_version.app_version,
+            reader, writer, inbound, remote_addr,
+        )
+        if link is None:
+            _safe_close(writer)
+            return
+        # Serve in the background so the dialer/accept loop moves on to other
+        # peers. run_recv owns the writer for the rest of the link's life.
+        asyncio.create_task(self._serve_link(link, peer_id))
+
+    # ---- routing: replacement / tie-break / cap ------------------------
+    def _keep_new(self, inbound: bool, peer_id: str) -> bool:
+        """Existing tie-break rule for the genuine simultaneous-connect race:
+        smaller node_id keeps its OUTBOUND end, larger keeps its INBOUND end."""
+        return ((not inbound and self.node_id < peer_id) or
+                (inbound and self.node_id > peer_id))
+
+    async def _route(self, peer_id, peer_name, minor, app_version,
+                     reader, writer, inbound, remote_addr):
+        """Under the lock, decide accept/replace/refuse for an authenticated
+        connection and, on accept, install a PeerLink in the table. Returns
+        the installed PeerLink, or None if refused/dropped (caller closes)."""
+        async with self._lock:
+            existing = self._links.get(peer_id)
+            if existing is not None:
+                # Known node_id: reconnect/duplicate/race. Never refused by
+                # the cap. The tie-break applies only inside the race window;
+                # otherwise a fresh authenticated handshake for a live link
+                # means the peer considers the old link dead -> replace it.
+                if existing.active:
+                    race = (time.monotonic() - existing.linked_at) < RACE_WINDOW_S
+                    if race and not self._keep_new(inbound, peer_id):
+                        log.debug("tie-breaker: dropping duplicate link (race)")
+                        return None
+                    if race:
+                        log.debug("tie-breaker: replacing existing link (race)")
+                    else:
+                        log.info(
+                            f"replacing link with {existing.peer_name!r} "
+                            f"(peer reconnected)"
+                        )
+                await existing.close()
+                self._links.pop(peer_id, None)
+            else:
+                # New node_id -> enforce the peer cap.
+                if len(self._links) >= self.max_peers:
+                    log.info(
+                        f"peer cap reached ({len(self._links)}); refusing {peer_name!r}"
+                    )
+                    return None
+            link = PeerLink(
+                self.node_id, peer_id, peer_name, minor, reader, writer,
+                self._enqueue_received, remote_addr=remote_addr,
+            )
+            self._links[peer_id] = link
+        log.info(
+            f"linked with peer name={peer_name!r} id={peer_id[:8]} "
+            f"({'inbound' if inbound else 'outbound'}) app_version={app_version} "
+            f"peer_proto={PROTOCOL_MAJOR}.{minor}"
+        )
+        emit_event(LinkUp(
+            node_id=peer_id, peer_name=peer_name,
+            app_version=app_version, protocol_minor=minor,
+        ))
+        return link
+
+    async def _serve_link(self, link, peer_id) -> None:
+        """Run one link's receive loop + its own per-link staleness watchdog.
+        On teardown, remove the table entry (freeing a cap slot), emit
+        LinkDown, and re-scan discovery to re-admit a waiting peer."""
+        ping_task = asyncio.create_task(link_ping_loop(link))
+        try:
+            await link.run_recv()
+        finally:
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
+            removed = False
+            async with self._lock:
+                # Identity guard: a replacement already swapped the table
+                # entry, so the replaced link must NOT emit LinkDown.
+                if self._links.get(peer_id) is link:
+                    del self._links[peer_id]
+                    removed = True
+            if removed:
+                log.info(f"peer {link.peer_name!r} disconnected")
+                emit_event(LinkDown(node_id=peer_id, reason="peer disconnected"))
+                if self._beacon is not None:
+                    await self.redial_discovered(self._beacon)
+
+    async def _drop_link(self, link) -> None:
+        """Force-close one link (used on a broadcast send failure)."""
+        await link.close()
+
+    # ---- broadcast -----------------------------------------------------
+    async def broadcast_clip(self, kind, content) -> None:
+        """Fan out a simple (text/image/file) clip to all active links; a
+        per-link failure drops only that link."""
+        for link in list(self._links.values()):
+            if not link.active:
+                continue
+            try:
+                await link.send_clip(kind, content)
+            except Exception as exc:
+                log.info(f"send to {link.peer_name!r} failed: {exc}; dropping link")
+                await self._drop_link(link)
+
+    async def broadcast_files(self, data) -> tuple:
+        """Fan out a multi-file selection with per-link minor gating. Returns
+        (sent_full, sent_fallback, max_dropped) aggregated across links for a
+        single toast. The global echo check is done by the caller."""
+        sent_full = sent_fallback = max_dropped = 0
+        for link in list(self._links.values()):
+            if not link.active:
+                continue
+            try:
+                decision, n = await send_files_to_link(link, data)
+            except Exception as exc:
+                log.info(f"send to {link.peer_name!r} failed: {exc}; dropping link")
+                await self._drop_link(link)
+                continue
+            if decision == "files":
+                sent_full += 1
+            else:  # "file" legacy fallback for a minor-0 peer
+                sent_fallback += 1
+                max_dropped = max(max_dropped, n)
+        return sent_full, sent_fallback, max_dropped
+
+    # ---- re-admission --------------------------------------------------
+    async def redial_discovered(self, beacon) -> None:
+        """Dial every discovered peer we are not yet linked to, up to the cap.
+        Called on link drop and each retry cycle. Keyed by the advertised
+        node_id (== the peer's hello node_id); addresses already backing a
+        live link are skipped."""
+        linked_addrs = {l.remote_addr for l in self._links.values()
+                        if l.active and l.remote_addr}
+        for nid, (host, port) in list(beacon.known_peers.items()):
+            if nid == self.node_id:
+                continue
+            if self.active_count() >= self.max_peers:
+                break
+            existing = self._links.get(nid)
+            if existing is not None and existing.active:
+                continue
+            if (host, port) in linked_addrs:
+                continue
+            await self.ensure_link(host, port)
+
+    async def close(self) -> None:
+        """Drop every active link. Safe to call multiple times."""
+        for link in list(self._links.values()):
+            await link.close()
+        self._links.clear()
 
 
 class MdnsBeacon:
@@ -2197,9 +2414,24 @@ async def _run_permission_probe(beacon: "MdnsBeacon") -> None:
         log.debug("permission probe: ok")
 
 
+async def send_files_to_link(link, data) -> tuple:
+    """Per-link minor gating for a multi-file clip (NO echo check). Reused by
+    the mesh broadcast loop so gating is evaluated per link:
+      minor >= 1 -> one kind:"files" clip, returns ("files", len(data)).
+      minor 0    -> first file as legacy kind:"file", returns ("file", dropped).
+    """
+    minor = link.peer_protocol_minor or 0
+    if minor >= 1:
+        await link.send_clip("files", data)
+        return ("files", len(data))
+    first_name, first_raw = data[0]
+    await link.send_clip("file", (first_name, bytes(first_raw)))
+    return ("file", len(data) - 1)
+
+
 async def emit_files_clip(link, suppressor, data) -> tuple:
-    """Decide how to send a local multi-file selection to the peer and do it.
-    ``data`` is [(name, raw_bytes), ...] with len >= 2. Returns:
+    """Single-link send decision + echo suppression. ``data`` is
+    [(name, raw_bytes), ...] with len >= 2. Returns:
       ("suppressed", 0) -- echo of a just-received set; nothing sent.
       ("files", n)      -- sent all n files as one kind:"files" clip.
       ("file", dropped) -- peer protocol_minor 0; sent the first file as a
@@ -2209,13 +2441,7 @@ async def emit_files_clip(link, suppressor, data) -> tuple:
     aggregate = aggregate_files_hash(hashes)
     if not suppressor.should_send("files", aggregate):
         return ("suppressed", 0)
-    minor = link.peer_protocol_minor or 0
-    if minor >= 1:
-        await link.send_clip("files", data)
-        return ("files", len(data))
-    first_name, first_raw = data[0]
-    await link.send_clip("file", (first_name, bytes(first_raw)))
-    return ("file", len(data) - 1)
+    return await send_files_to_link(link, data)
 
 
 async def run(config: Config) -> None:
@@ -2233,8 +2459,8 @@ async def run(config: Config) -> None:
 
     notify_enabled = not config.no_notify and sys.platform in ("darwin", "win32")
 
-    async def on_remote_clip(kind: str, data) -> None:
-        peer = link.peer_name or "peer"
+    async def on_remote_clip(kind: str, data, peer_name: str = "peer") -> None:
+        peer = peer_name or "peer"
         if kind == "text":
             assert isinstance(data, str)
             suppressor.mark_received("text", sha256_hex(data))
@@ -2298,38 +2524,33 @@ async def run(config: Config) -> None:
                     message=f"{len(data)} files",
                 )
 
-    link = PeerLink(config, node_id, on_remote_clip)
+    manager = LinkManager(config, node_id, on_remote_clip, max_peers=config.max_peers)
 
     async def on_local_change(kind: str, data) -> None:
-        if not link.active:
+        # Broadcast one local clip to EVERY active link. The watcher and the
+        # EchoSuppressor stay global (content-hash based); the should_send
+        # check gates the whole broadcast once, before the fan-out.
+        if manager.active_count() == 0:
             return
         if kind == "text":
             assert isinstance(data, str)
             if not suppressor.should_send("text", sha256_hex(data)):
                 log.debug("skip echo of just-received text")
                 return
-            await link.send_clip("text", data)
-            peer = link.peer_name or "peer"
-            log.info(f"-> sent text {len(data)} chars to {peer!r}")
+            await manager.broadcast_clip("text", data)
+            log.info(f"-> sent text {len(data)} chars to {manager.active_count()} peer(s)")
             if notify_enabled:
-                await notify_async(
-                    title=f"AnyClip → {peer}",
-                    message=preview(data),
-                )
+                await notify_async(title="AnyClip →", message=preview(data))
         elif kind == "image":
             assert isinstance(data, (bytes, bytearray))
             png = bytes(data)
             if not suppressor.should_send("image", sha256_bytes(png)):
                 log.debug("skip echo of just-received image")
                 return
-            await link.send_clip("image", png)
-            peer = link.peer_name or "peer"
-            log.info(f"-> sent image {len(png)} bytes to {peer!r}")
+            await manager.broadcast_clip("image", png)
+            log.info(f"-> sent image {len(png)} bytes to {manager.active_count()} peer(s)")
             if notify_enabled:
-                await notify_async(
-                    title=f"AnyClip → {peer}",
-                    message=f"image ({len(png)//1024} KB)",
-                )
+                await notify_async(title="AnyClip →", message=f"image ({len(png)//1024} KB)")
         elif kind == "file":
             assert isinstance(data, tuple) and len(data) == 2
             name, raw = data
@@ -2337,39 +2558,37 @@ async def run(config: Config) -> None:
             if not suppressor.should_send("file", sha256_bytes(raw_b)):
                 log.debug("skip echo of just-received file")
                 return
-            await link.send_clip("file", (name, raw_b))
-            peer = link.peer_name or "peer"
-            log.info(f"-> sent file {name!r} {len(raw_b)} bytes to {peer!r}")
+            await manager.broadcast_clip("file", (name, raw_b))
+            log.info(f"-> sent file {name!r} {len(raw_b)} bytes to {manager.active_count()} peer(s)")
             if notify_enabled:
                 await notify_async(
-                    title=f"AnyClip → {peer}",
-                    message=f"file: {name} ({len(raw_b)//1024} KB)",
+                    title="AnyClip →", message=f"file: {name} ({len(raw_b)//1024} KB)",
                 )
         elif kind == "files":
             assert isinstance(data, list)
-            decision, count = await emit_files_clip(link, suppressor, data)
-            peer = link.peer_name or "peer"
-            if decision == "suppressed":
+            # Global echo check once; per-link minor gating inside the loop.
+            hashes = [sha256_bytes(bytes(raw)) for _name, raw in data]
+            aggregate = aggregate_files_hash(hashes)
+            if not suppressor.should_send("files", aggregate):
                 log.debug("skip echo of just-received files")
                 return
-            if decision == "files":
-                log.info(f"-> sent {count} files to {peer!r}")
-                if notify_enabled:
-                    await notify_async(
-                        title=f"AnyClip → {peer}", message=f"{count} files",
-                    )
-            else:  # "file" old-peer fallback
-                log.info(
-                    f"-> sent 1 file to {peer!r} "
-                    f"(peer proto minor 0, {count} dropped)"
-                )
-                if notify_enabled:
-                    await notify_async(
-                        title=f"AnyClip → {peer}", message="file (1 of many)",
-                    )
+            sent_full, sent_fallback, max_dropped = await manager.broadcast_files(data)
+            total = sent_full + sent_fallback
+            if total == 0:
+                return
+            log.info(
+                f"-> sent files to {total} peer(s) "
+                f"({sent_full} full, {sent_fallback} first-file fallback)"
+            )
+            if notify_enabled:
+                await notify_async(title="AnyClip →", message=f"{len(data)} files")
+            # One aggregated skip toast across ALL peers that could only take
+            # the first file (protocol_minor 0). Same principle as the
+            # folder-skip aggregation in d8894a0.
+            if max_dropped > 0:
                 await on_file_skipped(
-                    f"{count} file(s) not sent — peer needs an update for "
-                    "multi-file sync"
+                    f"{max_dropped} file(s) not sent to {sent_fallback} peer(s) — "
+                    "they need an update for multi-file sync"
                 )
 
     async def on_file_skipped(message: str) -> None:
@@ -2380,7 +2599,8 @@ async def run(config: Config) -> None:
         config.poll_interval, on_local_change,
         on_file_skipped=on_file_skipped,
     )
-    beacon = MdnsBeacon(config, node_id, link.try_connect)
+    beacon = MdnsBeacon(config, node_id, manager.ensure_link)
+    manager.attach_beacon(beacon)
 
     log.info(f"AnyClip starting (node {node_id[:8]}, name={config.name!r})")
     if config.peers:

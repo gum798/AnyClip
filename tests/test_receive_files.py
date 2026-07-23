@@ -25,9 +25,14 @@ class _FakeLink:
 
 
 def test_peer_protocol_minor_initialized_by_init():
-    cfg = types.SimpleNamespace(token="tok")
-    link = anyclip.PeerLink(cfg, "node-1", None)
-    assert link.peer_protocol_minor is None
+    # Narrowed PeerLink now receives the parsed hello identity directly.
+    link = anyclip.PeerLink(
+        "node-self", "peer-node", "peer", 1,
+        reader=None, writer=None, on_clip=None,
+    )
+    assert link.peer_protocol_minor == 1
+    assert link.peer_name == "peer"
+    assert link.remote_addr is None
 
 
 def test_emit_files_new_peer_sends_files():
