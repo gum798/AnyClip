@@ -43,8 +43,12 @@ public static class PeerStateReducer
                          && prev.Kind is PeerStateKind.Idle or PeerStateKind.Error =>
             prev with { Kind = PeerStateKind.Searching },
         PeerDiscovered => prev,
+        // An established link masks the auth escalation: one stranger failing
+        // auth must not flip a working multi-peer UI into error. The counter
+        // still increments while linked, but escalation waits until NO peer is
+        // linked (parity with Swift PeerState + Python peer_state).
         HandshakeFailed =>
-            prev.ConsecutiveHandshakeFails + 1 >= HandshakeFailThreshold
+            prev.ConsecutiveHandshakeFails + 1 >= HandshakeFailThreshold && prev.Peers.Count == 0
                 ? prev with { Kind = PeerStateKind.Error, Reason = "auth",
                               ConsecutiveHandshakeFails = prev.ConsecutiveHandshakeFails + 1 }
                 : prev with { ConsecutiveHandshakeFails = prev.ConsecutiveHandshakeFails + 1 },

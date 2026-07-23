@@ -143,6 +143,18 @@ def test_two_linkups_track_both_peers() -> None:
     assert final.since == 5.0  # first link sets since; second keeps it
 
 
+def test_handshake_fails_do_not_trip_error_while_a_peer_is_linked() -> None:
+    # An established link masks the auth escalation: a stranger failing auth
+    # must not flip a working multi-peer UI into error (parity with Swift's
+    # handshakeFailsDoNotTripErrorWhileAPeerIsLinked). The counter may climb
+    # past the threshold while linked, but the state stays linked, peers intact.
+    state = _fold([_up("id-a", "alice"), _up("id-b", "bob")], now=5.0)
+    for i in range(HANDSHAKE_FAIL_THRESHOLD + 2):
+        state = reduce(state, HandshakeFailed(addr="a", reason="auth"), now=float(i))
+    assert state.kind == "linked"
+    assert state.peers == {"id-a": "alice", "id-b": "bob"}
+
+
 def test_second_linkup_keeps_first_since() -> None:
     state = reduce(INITIAL, _up("id-a", "alice"), now=5.0)
     state = reduce(state, _up("id-b", "bob"), now=9.0)

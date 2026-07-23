@@ -135,7 +135,11 @@ def reduce(prev: State, event: DaemonEvent, now: float) -> State:
 
     if isinstance(event, HandshakeFailed):
         new_count = prev.consecutive_handshake_fails + 1
-        if new_count >= HANDSHAKE_FAIL_THRESHOLD:
+        # An established link masks the auth escalation: one stranger failing
+        # auth must not flip a working multi-peer UI into error. While linked
+        # the counter still increments, but escalation waits until NO peer is
+        # linked (parity with Swift PeerState + C# PeerStateReducer).
+        if new_count >= HANDSHAKE_FAIL_THRESHOLD and not prev.peers:
             return State(
                 kind="error",
                 reason="auth",

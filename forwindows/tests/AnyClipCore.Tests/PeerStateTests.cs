@@ -103,6 +103,23 @@ public class PeerStateTests
         Assert.Equal(1, s.ConsecutiveHandshakeFails);
     }
 
+    [Fact]
+    public void HandshakeFailsDoNotTripErrorWhileAPeerIsLinked()
+    {
+        // An established link masks the auth escalation: a stranger failing auth
+        // must not flip a working multi-peer UI into error (parity with Swift's
+        // handshakeFailsDoNotTripErrorWhileAPeerIsLinked). The counter may climb
+        // past the threshold while linked, but the state stays linked, peers intact.
+        var s = PeerStateReducer.Reduce(PeerUiState.Initial, new LinkUp("a", "mac"), 1);
+        s = PeerStateReducer.Reduce(s, new LinkUp("b", "win"), 2);
+        for (int i = 0; i < PeerStateReducer.HandshakeFailThreshold + 2; i++)
+            s = PeerStateReducer.Reduce(s, new HandshakeFailed("x", "auth"), i);
+        Assert.Equal(PeerStateKind.Linked, s.Kind);
+        Assert.Equal(2, s.Peers.Count);
+        Assert.Equal("mac", s.Peers["a"]);
+        Assert.Equal("win", s.Peers["b"]);
+    }
+
     [Fact] public void ThresholdConstantIsFive() =>
         Assert.Equal(5, PeerStateReducer.HandshakeFailThreshold);
 
