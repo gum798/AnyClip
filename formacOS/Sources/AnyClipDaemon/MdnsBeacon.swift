@@ -9,7 +9,7 @@ import AnyClipCore
 public actor MdnsBeacon {
     private let nodeID: String
     private let emit: @Sendable (DaemonEvent) -> Void
-    private let onPeer: @Sendable (NWEndpoint, String) async -> Void
+    private let onPeer: @Sendable (NWEndpoint, String, String) async -> Void
 
     private var browser: NWBrowser?
     /// peer node id -> (endpoint, label). A restarting peer mints a new
@@ -23,7 +23,7 @@ public actor MdnsBeacon {
     public init(
         nodeID: String,
         emit: @escaping @Sendable (DaemonEvent) -> Void,
-        onPeer: @escaping @Sendable (NWEndpoint, String) async -> Void
+        onPeer: @escaping @Sendable (NWEndpoint, String, String) async -> Void
     ) {
         self.nodeID = nodeID
         self.emit = emit
@@ -71,7 +71,7 @@ public actor MdnsBeacon {
         addressFails[label] = nil
         AnyLog.shared.info("discovered peer \(label)")
         emit(.peerDiscovered(name: label, addr: label))
-        await onPeer(endpoint, label)
+        await onPeer(endpoint, label, peerID)
     }
 
     private func endpointLabel(_ endpoint: NWEndpoint) -> String {
@@ -94,14 +94,15 @@ public actor MdnsBeacon {
 
     // ---- reconnect-loop bookkeeping ------------------------------------
 
-    /// Known peers deduped by address label (a restarted remote daemon
-    /// leaves several stale node ids behind for the same address).
-    public func peersSnapshot() -> [(endpoint: NWEndpoint, label: String)] {
+    /// Known peers deduped by address label (a restarted remote daemon leaves
+    /// several stale node ids behind for the same address). Carries the node_id
+    /// so the reconnect loop skips peers already in the manager's link table.
+    public func peersSnapshot() -> [(endpoint: NWEndpoint, label: String, peerID: String)] {
         var seen = Set<String>()
-        var out: [(endpoint: NWEndpoint, label: String)] = []
-        for (_, value) in knownPeers where !seen.contains(value.label) {
+        var out: [(endpoint: NWEndpoint, label: String, peerID: String)] = []
+        for (peerID, value) in knownPeers where !seen.contains(value.label) {
             seen.insert(value.label)
-            out.append(value)
+            out.append((value.endpoint, value.label, peerID))
         }
         return out
     }

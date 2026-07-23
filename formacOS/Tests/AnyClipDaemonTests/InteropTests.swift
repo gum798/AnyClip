@@ -48,21 +48,21 @@ private func scriptsDir() -> URL {
 
     let clips = Locked<[ClipPayload]>([])
     let events = Locked<[DaemonEvent]>([])
-    let link = PeerLink(
-        config: PeerLink.LinkConfig(
+    let peerNameBox = Locked<String?>(nil)
+    // Tight per-link ping so the automatic keepalive surfaces a ping frame to
+    // the fake peer within the test window; the fake peer pongs each ping so
+    // the large deadFactor never trips the staleness dropper.
+    let manager = LinkManager(
+        config: LinkManager.LinkConfig(
             token: "interop-token", port: 28492, name: "swift-interop",
             appVersion: "0.0.0-test"),
-        nodeID: UUID().uuidString.lowercased())
-    await link.setHandlers(
-        onClip: { clips.set(clips.get() + [$0]) },
+        nodeID: UUID().uuidString.lowercased(),
+        pingInterval: 0.5, pingDeadFactor: 20)
+    await manager.setHandlers(
+        onClip: { payload, peer in
+            clips.set(clips.get() + [payload]); peerNameBox.set(peer)
+        },
         emit: { events.set(events.get() + [$0]) })
-
-    let sessionTask = Task {
-        await link.tryConnect(
-            to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!),
-            label: "127.0.0.1:\(port)")
-    }
-    defer { sessionTask.cancel() }
 
     func waitUntil(_ timeout: Double, _ cond: @escaping () async -> Bool) async -> Bool {
         let deadline = monotonicNow() + timeout
@@ -73,23 +73,26 @@ private func scriptsDir() -> URL {
         return await cond()
     }
 
-    // Link comes up with the Python peer's name.
-    #expect(await waitUntil(5) { await link.isActive })
-    #expect(await link.peerName == "fake-peer")
+    // Link comes up with the Python peer after a routed dial.
+    let outcome = await manager.tryConnect(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!),
+        label: "127.0.0.1:\(port)")
+    #expect(outcome == .routed)
+    #expect(await waitUntil(5) { await manager.activeLinkCount() == 1 })
 
-    // Python -> Swift text clip arrives.
+    // Python -> Swift text clip arrives, tagged with the peer's name.
     #expect(await waitUntil(5) {
         clips.get().contains {
             if case .text(let s) = $0 { return s == "hello-from-python" }
             return false
         }
     })
+    #expect(peerNameBox.get() == "fake-peer")
 
-    // Swift -> Python: text + image + file + ping.
-    await link.sendClip(.text("hello-from-swift"))
-    await link.sendClip(.image(Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3])))
-    await link.sendClip(.file(name: "노트.txt", data: Data("file-content".utf8)))
-    await link.sendPing()
+    // Swift -> Python: text + image + file (+ automatic ping from the loop).
+    _ = await manager.broadcast(.text("hello-from-swift"))
+    _ = await manager.broadcast(.image(Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3])))
+    _ = await manager.broadcast(.file(name: "노트.txt", data: Data("file-content".utf8)))
 
     #expect(await waitUntil(5) {
         guard let lines = try? String(contentsOf: outFile, encoding: .utf8) else {
@@ -102,18 +105,17 @@ private func scriptsDir() -> URL {
             && lines.contains("\"type\": \"ping\"")
     })
 
-    // Swift -> Python: a two-file kind:"files" clip. The fake peer records it
-    // verbatim; assert both names and the aggregate hash land in the outfile.
-    let mf1 = (name: "노트.txt", data: Data("files body one".utf8))
+    // Swift -> a legacy (minor-0) Python peer: a two-file kind:"files" copy is
+    // downgraded per-link to its first file on the wire (dropped == 1). The
+    // second file never reaches the peer; the first does.
+    let mf1 = (name: "노트-multi.txt", data: Data("files body one".utf8))
     let mf2 = (name: "(E&S) plan.txt", data: Data("files body two".utf8))
-    await link.sendClip(.files([mf1, mf2]))
-    let expectedAgg = aggregateFilesHash([sha256Hex(mf1.data), sha256Hex(mf2.data)])
+    let filesResult = await manager.broadcast(.files([mf1, mf2]))
+    #expect(filesResult.maxDropped == 1)
     #expect(await waitUntil(5) {
         guard let lines = try? String(contentsOf: outFile, encoding: .utf8) else { return false }
-        return lines.contains("\"kind\": \"files\"")
-            && lines.contains("노트.txt")
-            && lines.contains("(E&S) plan.txt")
-            && lines.contains(expectedAgg)
+        return lines.contains("노트-multi.txt")     // first file, sent as kind:"file"
+            && !lines.contains("(E&S) plan.txt")    // second file dropped for the old peer
     })
 
     // The hello we sent must satisfy Python's field expectations.
@@ -123,7 +125,7 @@ private func scriptsDir() -> URL {
     #expect(hello.contains("\"version\": 1"))
     #expect(hello.contains("\"protocol_major\": 1"))
 
-    await link.shutdown()
+    await manager.shutdown()
 }
 
 @Test func interopReceivesMultipleFilesFromFakePeer() async throws {
@@ -159,21 +161,14 @@ private func scriptsDir() -> URL {
 
     let clips = Locked<[ClipPayload]>([])
     let events = Locked<[DaemonEvent]>([])
-    let link = PeerLink(
-        config: PeerLink.LinkConfig(
+    let manager = LinkManager(
+        config: LinkManager.LinkConfig(
             token: "interop-token", port: 28494, name: "swift-interop",
             appVersion: "0.0.0-test"),
         nodeID: UUID().uuidString.lowercased())
-    await link.setHandlers(
-        onClip: { clips.set(clips.get() + [$0]) },
+    await manager.setHandlers(
+        onClip: { payload, _ in clips.set(clips.get() + [payload]) },
         emit: { events.set(events.get() + [$0]) })
-
-    let sessionTask = Task {
-        await link.tryConnect(
-            to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!),
-            label: "127.0.0.1:\(port)")
-    }
-    defer { sessionTask.cancel() }
 
     func waitUntil(_ timeout: Double, _ cond: @escaping () async -> Bool) async -> Bool {
         let deadline = monotonicNow() + timeout
@@ -184,7 +179,11 @@ private func scriptsDir() -> URL {
         return await cond()
     }
 
-    #expect(await waitUntil(5) { await link.isActive })
+    let outcome = await manager.tryConnect(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!),
+        label: "127.0.0.1:\(port)")
+    #expect(outcome == .routed)
+    #expect(await waitUntil(5) { await manager.activeLinkCount() == 1 })
 
     // Python -> Swift: the two-file batch surfaces with intact names, incl. the
     // parens/ampersand name the OLD whitelist would have mangled.
@@ -211,5 +210,5 @@ private func scriptsDir() -> URL {
         return false
     })
 
-    await link.shutdown()
+    await manager.shutdown()
 }

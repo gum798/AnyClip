@@ -5,7 +5,7 @@ import Network
 @testable import AnyClipCore
 
 private func makeBeacon(nodeID: String = "self-node") -> MdnsBeacon {
-    MdnsBeacon(nodeID: nodeID, emit: { _ in }, onPeer: { _, _ in })
+    MdnsBeacon(nodeID: nodeID, emit: { _ in }, onPeer: { _, _, _ in })
 }
 
 @Test func selfAdvertisementIsIgnored() async {

@@ -51,84 +51,63 @@ public func networkWatchdog(beacon: MdnsBeacon, interval: Double = 15) async thr
     }
 }
 
-/// Self-heal mDNS when the link sits dead too long: refresh browse +
-/// re-announce up to `refreshAttempts` times, then bounce the daemon.
-/// Deviation from Python: also calls link.reAnnounce() because in Swift
-/// the Bonjour advertisement lives on PeerLink's NWListener (not MdnsBeacon),
-/// so both sides need to be refreshed.
+/// Self-heal mDNS when NO link is active for too long: refresh browse +
+/// re-announce up to `refreshAttempts` times, then bounce the daemon. Keys on
+/// the manager's active-link count, never on a single link's idleness — keyed
+/// per-link, one sleeping peer would bounce the daemon and tear down every
+/// healthy link (spec: global escalator fires only at zero active links).
 public func idleLinkWatchdog(
-    beacon: MdnsBeacon, link: PeerLink,
+    beacon: MdnsBeacon, manager: LinkManager,
     idleThreshold: Double = 60, refreshAttempts: Int = 3
 ) async throws {
     var consecutiveIdle = 0
     while true {
         try await sleepSeconds(idleThreshold)
-        if await link.isActive {
+        if await manager.activeLinkCount() > 0 {
             consecutiveIdle = 0
             continue
         }
         consecutiveIdle += 1
         if consecutiveIdle <= refreshAttempts {
             AnyLog.shared.info(
-                "link idle \(Int(idleThreshold * Double(consecutiveIdle)))s; refreshing mDNS "
-                + "(attempt \(consecutiveIdle)/\(refreshAttempts))")
+                "no active links for \(Int(idleThreshold * Double(consecutiveIdle)))s; "
+                + "refreshing mDNS (attempt \(consecutiveIdle)/\(refreshAttempts))")
             await beacon.refresh()
-            await link.reAnnounce()
+            await manager.reAnnounce()
         } else {
             throw DaemonRestartError(
-                "link idle with no recovery after \(refreshAttempts) mDNS refresh "
-                + "attempts; bouncing daemon")
+                "no active links after \(refreshAttempts) mDNS refresh attempts; "
+                + "bouncing daemon")
         }
     }
 }
 
-/// Retry every known mDNS peer while unlinked. Backoff 1s -> 60s; sessions
-/// that lasted > 5s reset it; 3 consecutive fast fails prune the address.
-public func mdnsReconnectLoop(beacon: MdnsBeacon, link: PeerLink) async throws {
-    var backoff: Double = 1
+/// Ensure a link to every discovered peer (up to the cap). Keyed per address on
+/// the beacon; the manager's node_id table de-dupes so an already-meshed peer is
+/// never re-dialed. Re-admission after a drop happens here on the next pass (no
+/// new timer). Backoff is per-address via recordFail/pruneAddress.
+public func mdnsReconnectLoop(beacon: MdnsBeacon, manager: LinkManager) async throws {
     while true {
-        if await link.isActive {
-            backoff = 1
-            try await sleepSeconds(2)
-            continue
-        }
         let peers = await beacon.peersSnapshot()
-        if peers.isEmpty {
-            try await sleepSeconds(2)
-            continue
-        }
-        var attempted = false
         for peer in peers {
-            if await link.isActive { break }
-            attempted = true
-            let start = monotonicNow()
-            await link.tryConnect(to: peer.endpoint, label: peer.label)
-            let elapsed = monotonicNow() - start
-            if await link.isActive {
+            if await manager.atCap { break }               // no free slots this pass
+            if await manager.hasLink(nodeID: peer.peerID) { continue }  // already meshed
+            let outcome = await manager.tryConnect(to: peer.endpoint, label: peer.label)
+            switch outcome {
+            case .routed:
                 await beacon.clearFails(label: peer.label)
-                if elapsed > 5 { backoff = 1 }
-                break
-            }
-            if elapsed > 5 {
-                // Handshake succeeded and the session lived a while before
-                // dropping — a healthy peer, not a prune candidate.
-                await beacon.clearFails(label: peer.label)
-                continue
-            }
-            let fails = await beacon.recordFail(label: peer.label)
-            if fails >= Wire.maxReconnectFails {
-                await beacon.pruneAddress(label: peer.label)
-                AnyLog.shared.info(
-                    "pruned stale peer address \(peer.label) after \(fails) failed "
-                    + "attempts; awaiting fresh mDNS discovery")
+            case .atCap, .busy:
+                break                                       // don't penalise the address
+            case .failed:
+                let fails = await beacon.recordFail(label: peer.label)
+                if fails >= Wire.maxReconnectFails {
+                    await beacon.pruneAddress(label: peer.label)
+                    AnyLog.shared.info(
+                        "pruned stale peer address \(peer.label) after \(fails) failed "
+                        + "attempts; awaiting fresh mDNS discovery")
+                }
             }
         }
-        if await link.isActive { continue }
-        if attempted {
-            try await sleepSeconds(min(backoff, 60))
-            backoff = min(backoff * 2, 60)
-        } else {
-            try await sleepSeconds(2)
-        }
+        try await sleepSeconds(2)
     }
 }

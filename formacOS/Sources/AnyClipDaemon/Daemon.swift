@@ -128,109 +128,106 @@ public final class Daemon: @unchecked Sendable {
             if notifyEnabled { capturedNotifier(title, body) }
         }
 
-        let link = PeerLink(
-            config: PeerLink.LinkConfig(
+        let manager = LinkManager(
+            config: LinkManager.LinkConfig(
                 token: config.token, port: config.port,
                 name: config.name, appVersion: appVersion),
             nodeID: nodeID)
 
-        // Holder breaks the watcher <-> link callback cycle (Python uses a
-        // forward-declared closure variable for the same reason).
+        // Holder breaks the watcher <-> apply callback cycle.
         let watcherBox = Locked<ClipboardWatcher?>(nil)
 
-        // [weak link]: the closure is stored BY link itself; a strong
-        // capture would leak one PeerLink per supervisor restart.
-        await link.setHandlers(
-            onClip: { [coordinator, weak link] payload in
-                // Mark BEFORE writing local clipboard so the outbound
-                // poller sees the suppression flag in time.
-                await coordinator.markReceived(kind: payload.kind, hash: payload.payloadHash)
-                let peer = await link?.peerName ?? "peer"
-                switch payload {
-                case .text(let text):
-                    await MainActor.run { watcherBox.get()?.updateLocalText(text) }
-                    AnyLog.shared.info("<- received text \(text.count) chars from \(peer)")
-                    notify("AnyClip ← \(peer)", preview(text))
-                case .image(let png):
-                    let ok = await MainActor.run {
-                        watcherBox.get()?.updateLocalImage(png) ?? false
-                    }
-                    AnyLog.shared.info(
-                        "<- received image \(png.count) bytes from \(peer) "
-                        + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
-                    notify("AnyClip ← \(peer)", "image (\(png.count / 1024) KB)")
-                case .file(let name, let data):
-                    let ok = await MainActor.run {
-                        watcherBox.get()?.updateLocalFile(name: name, data: data) ?? false
-                    }
-                    AnyLog.shared.info(
-                        "<- received file \(name) \(data.count) bytes from \(peer) "
-                        + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
-                    notify("AnyClip ← \(peer)", "file: \(name) (\(data.count / 1024) KB)")
-                case .files(let fs):
-                    let placed = await MainActor.run {
-                        watcherBox.get()?.updateLocalFiles(fs) ?? []
-                    }
-                    // markReceived("files", aggregate) already ran at the top of
-                    // this handler. If exactly one file landed, the watcher will
-                    // re-detect it as a single-file copy (kind "file"), so also
-                    // suppress that hash.
-                    if placed.count == 1 {
-                        await coordinator.markReceived(
-                            kind: "file", hash: sha256Hex(placed[0].data))
-                    }
-                    AnyLog.shared.info(
-                        "<- received \(fs.count) files from \(peer) "
-                        + "(\(placed.count) written to clipboard)")
-                    notify("AnyClip ← \(peer)", "\(placed.count) files")
+        // Serialized inbound applies: every link delivers here; a single drain
+        // task applies them in FIFO order so markReceived + the clipboard write
+        // stay ordered across ALL peers. That ordering (apply order == mark
+        // order) is what keeps the single-slot-per-kind suppressor sufficient
+        // under N peers.
+        let (inboundStream, inboundCont) =
+            AsyncStream.makeStream(of: (ClipPayload, String).self)
+
+        let applyClip: @Sendable (ClipPayload, String) async -> Void = { payload, peer in
+            // Mark BEFORE writing local clipboard so the outbound poller sees the
+            // suppression flag in time.
+            await coordinator.markReceived(kind: payload.kind, hash: payload.payloadHash)
+            switch payload {
+            case .text(let text):
+                await MainActor.run { watcherBox.get()?.updateLocalText(text) }
+                AnyLog.shared.info("<- received text \(text.count) chars from \(peer)")
+                notify("AnyClip ← \(peer)", preview(text))
+            case .image(let png):
+                let ok = await MainActor.run {
+                    watcherBox.get()?.updateLocalImage(png) ?? false
                 }
-            },
+                AnyLog.shared.info(
+                    "<- received image \(png.count) bytes from \(peer) "
+                    + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
+                notify("AnyClip ← \(peer)", "image (\(png.count / 1024) KB)")
+            case .file(let name, let data):
+                let ok = await MainActor.run {
+                    watcherBox.get()?.updateLocalFile(name: name, data: data) ?? false
+                }
+                AnyLog.shared.info(
+                    "<- received file \(name) \(data.count) bytes from \(peer) "
+                    + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
+                notify("AnyClip ← \(peer)", "file: \(name) (\(data.count / 1024) KB)")
+            case .files(let fs):
+                let placed = await MainActor.run {
+                    watcherBox.get()?.updateLocalFiles(fs) ?? []
+                }
+                // If exactly one file landed the watcher re-detects it as a
+                // single-file copy (kind "file"), so also suppress that hash.
+                if placed.count == 1 {
+                    await coordinator.markReceived(
+                        kind: "file", hash: sha256Hex(placed[0].data))
+                }
+                AnyLog.shared.info(
+                    "<- received \(fs.count) files from \(peer) "
+                    + "(\(placed.count) written to clipboard)")
+                notify("AnyClip ← \(peer)", "\(placed.count) files")
+            }
+        }
+
+        await manager.setHandlers(
+            onClip: { payload, peer in inboundCont.yield((payload, peer)) },
             emit: emit)
 
         // Outbound sends run on their OWN task, fed by a non-blocking queue, so
-        // the single clipboard poll loop can NEVER be frozen by a send that
-        // stalls, errors, times out, or leaks its continuation. (Root cause of
-        // the v1.1.10 outbound-silence wedge: onChange awaited the send inline,
-        // so one parked send killed all future polling.) sendOutbound is the
-        // former onLocalChange body, now driven by the drain task below.
+        // the clipboard poll loop can NEVER be frozen by a stalled send.
         let outbound = OutboundQueue()
 
-        let sendOutbound: @Sendable (ClipPayload) async -> Void = { [coordinator, weak link] rawPayload in
-            guard let link else { return }
-            guard await link.isActive else { return }
-
-            // Old-peer fallback: a peer that predates protocol 1.1 cannot decode
-            // kind:"files". Degrade a batch to its first file and notify.
-            let (maybePayload, dropped) = downgradeForPeer(
-                rawPayload, peerMinor: await link.peerProtocolMinor)
-            guard let payload = maybePayload else { return }
-            if dropped > 0 {
-                notify("AnyClip",
-                    "\(dropped) file(s) not synced — update the peer to receive multiple files")
-            }
-
+        let sendOutbound: @Sendable (ClipPayload) async -> Void = { rawPayload in
+            // Global echo-suppression, evaluated ONCE per local copy: a
+            // just-received clip must not be rebroadcast to any peer. This is
+            // what makes the full mesh relay-free.
             guard await coordinator.shouldSend(
-                kind: payload.kind, hash: payload.payloadHash)
+                kind: rawPayload.kind, hash: rawPayload.payloadHash)
             else {
-                AnyLog.shared.debug("skip echo of just-received \(payload.kind)")
+                AnyLog.shared.debug("skip echo of just-received \(rawPayload.kind)")
                 return
             }
-            await link.sendClip(payload)
-            let peer = await link.peerName ?? "peer"
-            switch payload {
-            case .text(let text):
-                AnyLog.shared.info("-> sent text \(text.count) chars to \(peer)")
-                notify("AnyClip → \(peer)", preview(text))
-            case .image(let png):
-                AnyLog.shared.info("-> sent image \(png.count) bytes to \(peer)")
-                notify("AnyClip → \(peer)", "image (\(png.count / 1024) KB)")
-            case .file(let name, let data):
-                AnyLog.shared.info("-> sent file \(name) \(data.count) bytes to \(peer)")
-                notify("AnyClip → \(peer)", "file: \(name) (\(data.count / 1024) KB)")
-            case .files(let fs):
-                let total = fs.reduce(0) { $0 + $1.data.count }
-                AnyLog.shared.info("-> sent \(fs.count) files \(total) bytes to \(peer)")
-                notify("AnyClip → \(peer)", "\(fs.count) files")
+            let result = await manager.broadcast(rawPayload)
+            for d in result.delivered {
+                switch d.payload {
+                case .text(let text):
+                    AnyLog.shared.info("-> sent text \(text.count) chars to \(d.peerName)")
+                    notify("AnyClip → \(d.peerName)", preview(text))
+                case .image(let png):
+                    AnyLog.shared.info("-> sent image \(png.count) bytes to \(d.peerName)")
+                    notify("AnyClip → \(d.peerName)", "image (\(png.count / 1024) KB)")
+                case .file(let name, let data):
+                    AnyLog.shared.info("-> sent file \(name) \(data.count) bytes to \(d.peerName)")
+                    notify("AnyClip → \(d.peerName)", "file: \(name) (\(data.count / 1024) KB)")
+                case .files(let fs):
+                    let total = fs.reduce(0) { $0 + $1.data.count }
+                    AnyLog.shared.info("-> sent \(fs.count) files \(total) bytes to \(d.peerName)")
+                    notify("AnyClip → \(d.peerName)", "\(fs.count) files")
+                }
+            }
+            // Old-peer fallback aggregated into ONE toast across all peers (same
+            // principle as the folder-skip aggregation, commit d8894a0).
+            if result.maxDropped > 0 {
+                notify("AnyClip",
+                    "\(result.maxDropped) file(s) not synced — update the peer to receive multiple files")
             }
         }
 
@@ -246,8 +243,12 @@ public final class Daemon: @unchecked Sendable {
 
         let beacon = MdnsBeacon(
             nodeID: nodeID, emit: emit,
-            onPeer: { [weak link] endpoint, label in
-                await link?.tryConnect(to: endpoint, label: label)
+            onPeer: { [weak manager] endpoint, label, peerID in
+                guard let manager else { return }
+                // Skip peers we already mesh with (keyed by the mDNS TXT id) so a
+                // re-discovery never triggers a spurious reconnect/replacement.
+                if await manager.hasLink(nodeID: peerID) { return }
+                _ = await manager.tryConnect(to: endpoint, label: label)
             })
 
         let txtData = TXTCodec.encode([
@@ -257,7 +258,7 @@ public final class Daemon: @unchecked Sendable {
             ("protocol_major", "\(Wire.protocolMajor)"),
             ("protocol_minor", "\(Wire.protocolMinor)"),
         ])
-        await link.configureAdvertising(
+        await manager.configureAdvertising(
             instanceName: "\(config.name)-\(nodeID.prefix(8))", txtData: txtData)
         await beacon.start()
         AnyLog.shared.info(
@@ -265,15 +266,19 @@ public final class Daemon: @unchecked Sendable {
 
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { try await link.serve() }
+                group.addTask { try await manager.serve() }
                 group.addTask { try await watcher.run() }
-                // Drain outbound clips on a dedicated task: a stuck send stalls
-                // only here, never the watcher's poll loop.
                 group.addTask { await outbound.run(send: sendOutbound) }
-                group.addTask { try await mdnsReconnectLoop(beacon: beacon, link: link) }
+                // Serialized inbound applies (ONE drain across all links).
+                group.addTask {
+                    for await (payload, peer) in inboundStream {
+                        if Task.isCancelled { break }
+                        await applyClip(payload, peer)
+                    }
+                }
+                group.addTask { try await mdnsReconnectLoop(beacon: beacon, manager: manager) }
                 group.addTask { try await networkWatchdog(beacon: beacon) }
-                group.addTask { try await idleLinkWatchdog(beacon: beacon, link: link) }
-                group.addTask { try await linkPingLoop(link: link) }
+                group.addTask { try await idleLinkWatchdog(beacon: beacon, manager: manager) }
                 group.addTask { [emit] in
                     let result = try await runProbe(
                         eventsSeen: { await beacon.eventsSeen },
@@ -291,23 +296,19 @@ public final class Daemon: @unchecked Sendable {
                         AnyLog.shared.debug("permission probe: ok")
                     }
                 }
-                // Wait for ALL tasks (= asyncio.gather): the first throw
-                // cancels the rest and the for-loop rethrows.
                 for try await _ in group {}
             }
         } catch {
-            // Cleanup runs even on CancellationError — file ops and
-            // shutdown() do not check task cancellation, so they execute
-            // cleanly in a cancelled task context. Rethrow afterward so
-            // runForever sees CancellationError and exits.
-            await cleanup(link: link, beacon: beacon, receivedDir: receivedDir)
+            inboundCont.finish()
+            await cleanup(manager: manager, beacon: beacon, receivedDir: receivedDir)
             throw error
         }
-        await cleanup(link: link, beacon: beacon, receivedDir: receivedDir)
+        inboundCont.finish()
+        await cleanup(manager: manager, beacon: beacon, receivedDir: receivedDir)
     }
 
-    private func cleanup(link: PeerLink, beacon: MdnsBeacon, receivedDir: URL) async {
-        await link.shutdown()
+    private func cleanup(manager: LinkManager, beacon: MdnsBeacon, receivedDir: URL) async {
+        await manager.shutdown()
         await beacon.stop()
         PidLock.release(dir: stateDir)
         clearDirectoryFiles(receivedDir)
