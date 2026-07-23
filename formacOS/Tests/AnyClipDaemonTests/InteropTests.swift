@@ -212,3 +212,108 @@ private func scriptsDir() -> URL {
 
     await manager.shutdown()
 }
+
+/// Spawn a wire-compatible fake peer that listens on `port`, handshakes, and
+/// auto-sends one text clip; returns the process (for teardown) and its
+/// record outfile. Waits for READY on stdout.
+private func startFakePeer(port: UInt16, token: String) async throws -> (Process, URL) {
+    let outFile = FileManager.default.temporaryDirectory
+        .appendingPathComponent("fake-peer-\(UUID().uuidString).jsonl")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = [
+        "python3", scriptsDir().appendingPathComponent("fake_peer.py").path,
+        "--port", "\(port)", "--token", token, "--out", outFile.path,
+    ]
+    let stdout = Pipe()
+    process.standardOutput = stdout
+    try process.run()
+    var ready = false
+    let deadline = Date().addingTimeInterval(10)
+    var accumulated = Data()
+    while Date() < deadline {
+        let chunk = stdout.fileHandleForReading.availableData
+        if !chunk.isEmpty { accumulated.append(chunk) }
+        if let s = String(data: accumulated, encoding: .utf8), s.contains("READY") {
+            ready = true; break
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    guard ready else { throw WireConnectionError.closed }
+    return (process, outFile)
+}
+
+/// Count of frames the fake peer RECEIVED from us (its "recv" event lines).
+private func recvClipCount(_ url: URL) -> Int {
+    guard let s = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+    return s.split(separator: "\n").filter { $0.contains("\"event\": \"recv\"") }.count
+}
+
+private func fileContains(_ url: URL, _ needle: String) -> Bool {
+    (try? String(contentsOf: url, encoding: .utf8))?.contains(needle) ?? false
+}
+
+@Test func meshLinksBothPeersAndNeverRelays() async throws {
+    let portA: UInt16 = 28495
+    let portB: UInt16 = 28496
+    let (procA, outA) = try await startFakePeer(port: portA, token: "mesh-token")
+    let (procB, outB) = try await startFakePeer(port: portB, token: "mesh-token")
+    defer {
+        if procA.isRunning { procA.terminate() }
+        if procB.isRunning { procB.terminate() }
+    }
+
+    let clips = Locked<[(ClipPayload, String)]>([])
+    let manager = LinkManager(
+        config: LinkManager.LinkConfig(
+            token: "mesh-token", port: 28497, name: "swift-mesh", appVersion: "0.0.0-test"),
+        nodeID: UUID().uuidString.lowercased())
+    await manager.setHandlers(
+        onClip: { payload, peer in clips.set(clips.get() + [(payload, peer)]) },
+        emit: { _ in })
+
+    func waitUntil(_ timeout: Double, _ cond: @escaping () async -> Bool) async -> Bool {
+        let deadline = monotonicNow() + timeout
+        while monotonicNow() < deadline {
+            if await cond() { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return await cond()
+    }
+
+    // Dial BOTH peers: full mesh from this node's side.
+    _ = await manager.tryConnect(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: portA)!), label: "a")
+    _ = await manager.tryConnect(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: portB)!), label: "b")
+    #expect(await waitUntil(5) { await manager.activeLinkCount() == 2 })
+
+    // Both fake peers auto-send "hello-from-python"; the manager APPLIES both
+    // locally (onClip records them). This proves both links carry traffic.
+    #expect(await waitUntil(5) {
+        clips.get().filter {
+            if case .text(let s) = $0.0 { return s == "hello-from-python" }; return false
+        }.count == 2
+    })
+
+    // Non-relay: the manager received A's (and B's) clip but has NO relay path,
+    // so it must forward nothing to the other peer. Give it a bounded window,
+    // then assert neither fake peer received ANY clip frame from us. (This is
+    // also the echo-suppression-under-mesh guarantee: an applied clip is never
+    // rebroadcast.)
+    try await Task.sleep(nanoseconds: 1_000_000_000)
+    #expect(recvClipCount(outA) == 0)
+    #expect(recvClipCount(outB) == 0)
+
+    // The mesh works the other way: one LOCAL clip reaches BOTH peers.
+    _ = await manager.broadcast(.text("local-broadcast"))
+    #expect(await waitUntil(5) {
+        fileContains(outA, "local-broadcast") && fileContains(outB, "local-broadcast")
+    })
+    // That broadcast is the ONLY frame each peer received — still no relay of
+    // the other peer's hello clip.
+    #expect(await waitUntil(3) { recvClipCount(outA) == 1 })
+    #expect(await waitUntil(3) { recvClipCount(outB) == 1 })
+
+    await manager.shutdown()
+}

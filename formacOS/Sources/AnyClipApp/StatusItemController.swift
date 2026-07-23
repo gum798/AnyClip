@@ -116,7 +116,7 @@ final class StatusItemController: NSObject {
         }
         switch state.kind {
         case .linked:
-            statusMenuItem.title = "Linked: \(state.peerName ?? "peer")"
+            statusMenuItem.title = "Linked: " + state.sortedPeerNames.joined(separator: ", ")
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
             lastSyncItem.title = "Linked since: \(formatter.string(from: Date()))"
