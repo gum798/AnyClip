@@ -127,14 +127,7 @@ public sealed class TrayIcon : IDisposable
     public void Apply(PeerUiState state)
     {
         _currentState = state;
-        string status = state.Kind switch
-        {
-            PeerStateKind.Linked => "Linked: " + (state.Peers.Count > 0
-                ? string.Join(", ", state.Peers.Values) : "peer"),
-            PeerStateKind.Searching => "Searching for peer",
-            PeerStateKind.Error => $"Error: {state.Reason ?? "unknown"}",
-            _ => "Idle",
-        };
+        string status = PeerStatus.Line(state);
         _statusItem.Text = $"Status: {status}";
         _lastSyncItem.Text = state.Kind == PeerStateKind.Linked
             ? $"Linked since: {DateTime.Now:HH:mm:ss}"
