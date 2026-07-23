@@ -216,6 +216,13 @@ private func rawHandshake(
     try await Task.sleep(nanoseconds: 1_700_000_000)
     let p1b = try await rawHandshake(port: 28488, token: "tok", nodeID: "n1", name: "p1-again")
     defer { p1b.cancel() }
+    // rawHandshake returns when the CLIENT's hello exchange finishes, but the
+    // manager routes/replaces asynchronously. Broadcasting before route() lands
+    // hits the OLD n1 link (p1 still open) — p1b never receives it (timeout), or
+    // the send races the mid-replacement teardown (ECANCELED). Wait for the
+    // manager to close the replaced socket first, exactly as
+    // duplicateNodeReplacesLiveSession does, before broadcasting.
+    #expect(await waitUntil { (try? await withTimeout(seconds: 2) { try await p1.receiveMessage() }) == nil })
     _ = await a.broadcast(.text("to-p1-again"))
     let got = try await withTimeout(seconds: 5) { try await p1b.receiveMessage() }
     #expect(got?.content == "to-p1-again")
