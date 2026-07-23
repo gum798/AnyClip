@@ -1,5 +1,3 @@
-using System.Diagnostics;
-
 namespace AnyClip.Core;
 
 /// Thrown by watchdogs to unwind the daemon task set; the in-process
@@ -20,9 +18,6 @@ public interface IMdnsService
 /// Loops are exact ports of anyclip.py:1679-1862 / formacOS Watchdogs.swift.
 public static class Watchdogs
 {
-    private static readonly Stopwatch Clock = Stopwatch.StartNew();
-    private static double MonotonicNow() => Clock.Elapsed.TotalSeconds;
-
     /// App-layer heartbeat while linked. Two jobs:
     ///  1. Ping every interval, so an actively broken socket surfaces as a
     ///     send failure + EOF.
@@ -66,67 +61,49 @@ public static class Watchdogs
     }
 
     public static async Task IdleLinkWatchdogAsync(
-        IMdnsService mdns, PeerLink link,
+        IMdnsService mdns, LinkManager manager,
         double idleThresholdSeconds, int refreshAttempts, CancellationToken ct)
     {
         int consecutiveIdle = 0;
         while (true)
         {
             await Task.Delay(TimeSpan.FromSeconds(idleThresholdSeconds), ct);
-            if (link.IsActive) { consecutiveIdle = 0; continue; }
+            // Global escalator: only when the WHOLE mesh is down (zero links).
+            if (manager.ActiveLinkCount > 0) { consecutiveIdle = 0; continue; }
             consecutiveIdle++;
             if (consecutiveIdle <= refreshAttempts)
             {
                 RotatingLog.Shared.Info(
-                    $"link idle {(int)(idleThresholdSeconds * consecutiveIdle)}s; "
+                    $"no active links for {(int)(idleThresholdSeconds * consecutiveIdle)}s; "
                     + $"refreshing mDNS (attempt {consecutiveIdle}/{refreshAttempts})");
                 mdns.Refresh();
             }
             else
             {
                 throw new DaemonRestartException(
-                    $"link idle with no recovery after {refreshAttempts} mDNS "
+                    $"no active links with no recovery after {refreshAttempts} mDNS "
                     + "refresh attempts; bouncing daemon");
             }
         }
     }
 
     public static async Task MdnsReconnectLoopAsync(
-        PeerDirectory directory, PeerLink link, CancellationToken ct)
+        PeerDirectory directory, LinkManager manager, CancellationToken ct)
     {
         double backoff = 1;
         while (true)
         {
-            if (link.IsActive)
-            {
-                backoff = 1;
-                await Task.Delay(TimeSpan.FromSeconds(2), ct);
-                continue;
-            }
             var peers = directory.PeersSnapshot();
-            if (peers.Count == 0)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(2), ct);
-                continue;
-            }
             bool attempted = false;
             foreach (var (host, port, label) in peers)
             {
-                if (link.IsActive) break;
+                if (ct.IsCancellationRequested) return;
+                if (manager.AtCap) break;                    // no slots: stop dialing this cycle
+                if (manager.HasLinkToHost(host)) continue;   // already meshed with this peer
                 attempted = true;
-                double start = MonotonicNow();
-                await link.TryConnectAsync(host, port, label, ct);
-                double elapsed = MonotonicNow() - start;
-                if (link.IsActive)
+                await manager.TryConnectAsync(host, port, label, ct);
+                if (manager.HasLinkToHost(host))
                 {
-                    directory.ClearFails(label);
-                    if (elapsed > 5) backoff = 1;
-                    break;
-                }
-                if (elapsed > 5)
-                {
-                    // Long session that later died — healthy peer, not a
-                    // prune candidate.
                     directory.ClearFails(label);
                     continue;
                 }
@@ -139,13 +116,12 @@ public static class Watchdogs
                         + "attempts; awaiting fresh mDNS discovery");
                 }
             }
-            if (link.IsActive) continue;
             if (attempted)
             {
                 await Task.Delay(TimeSpan.FromSeconds(Math.Min(backoff, 60)), ct);
                 backoff = Math.Min(backoff * 2, 60);
             }
-            else await Task.Delay(TimeSpan.FromSeconds(2), ct);
+            else { backoff = 1; await Task.Delay(TimeSpan.FromSeconds(2), ct); }
         }
     }
 }

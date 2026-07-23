@@ -104,20 +104,19 @@ public sealed class Daemon(
         Action<string, string> toast = config.NotificationsEnabled
             ? notify : (_, _) => { };
 
-        var link = new PeerLink(
-            new PeerLink.LinkConfig(config.Token, config.Port, config.Name, appVersion),
-            nodeId);
-        link.Emit = emit;
-        link.OnClip = async payload =>
+        var manager = new LinkManager(
+            new LinkConfig(config.Token, config.Port, config.Name, appVersion), nodeId);
+        manager.Emit = emit;
+        // Received applies arrive already serialized through the manager's single
+        // apply queue; mark the (global) suppressor BEFORE touching the clipboard.
+        manager.OnClip = async (payload, peer) =>
         {
             coordinator.MarkReceived(payload.Kind, payload.PayloadHash);
-            string peer = link.PeerName ?? "peer";
             bool ok = await clipboard.ApplyRemoteAsync(payload);
             switch (payload)
             {
                 case TextClip t:
-                    RotatingLog.Shared.Info(
-                        $"<- received text {t.Text.Length} chars from {peer}");
+                    RotatingLog.Shared.Info($"<- received text {t.Text.Length} chars from {peer}");
                     toast($"AnyClip ← {peer}", TextHelpers.Preview(t.Text));
                     break;
                 case ImageClip i:
@@ -133,9 +132,6 @@ public sealed class Daemon(
                     toast($"AnyClip ← {peer}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
                     break;
                 case FilesClip fsc:
-                    // MarkReceived above recorded ("files", aggregate). A single
-                    // placed file re-detects as a legacy "file" clip; suppress that
-                    // too. (Windows places all N; N==1 only for a lenient 1-entry frame.)
                     if (fsc.Files.Count == 1)
                         coordinator.MarkReceived("file", Hashing.Sha256Hex(fsc.Files[0].Data));
                     RotatingLog.Shared.Info(
@@ -148,58 +144,46 @@ public sealed class Daemon(
 
         clipboard.OnLocalChange = async payload =>
         {
-            if (!link.IsActive) return;
+            if (manager.ActiveLinkCount == 0) return;
             if (!coordinator.ShouldSend(payload.Kind, payload.PayloadHash))
             {
                 RotatingLog.Shared.Debug($"skip echo of just-received {payload.Kind}");
                 return;
             }
-            // Old-peer fallback: a peer on protocol minor 0 can't parse a
-            // "files" clip. Downgrade to the first file as a legacy "file" clip
-            // and report the dropped count via the skip-notification path.
-            if (payload is FilesClip multi && link.PeerProtocolMinor < 1)
-            {
-                int dropped = multi.Files.Count - 1;
-                var (fname, fdata) = multi.Files[0];
-                payload = new FileClip(fname, fdata);
-                if (!coordinator.ShouldSend(payload.Kind, payload.PayloadHash))
-                {
-                    RotatingLog.Shared.Debug("skip echo of just-received file (old-peer downgrade)");
-                    return;
-                }
-                RotatingLog.Shared.Info(
-                    $"peer protocol minor {link.PeerProtocolMinor} < 1: sending 1 of "
-                    + $"{multi.Files.Count} files, {dropped} dropped");
-                if (dropped > 0)
-                    _ = clipboard.OnFileSkipped?.Invoke(
-                        $"{dropped} file(s) not synced — update the peer's AnyClip for multi-file sync");
-            }
-            await link.SendClipAsync(payload);
-            string peer = link.PeerName ?? "peer";
+            // Fan out to all links; per-link minor gating (files vs first-file
+            // fallback) happens inside BroadcastAsync. OldPeerDrops is aggregated
+            // so at most ONE skip toast fires for this local copy across all peers.
+            var result = await manager.BroadcastAsync(payload);
+            if (result.Sent == 0) return;
+            if (result.OldPeerDrops > 0)
+                _ = clipboard.OnFileSkipped?.Invoke(
+                    $"{result.OldPeerDrops} file(s) not synced — update the peer's AnyClip for multi-file sync");
+            string peers = string.Join(", ", manager.LinkedPeerNames);
+            if (string.IsNullOrEmpty(peers)) peers = "peer";
             switch (payload)
             {
                 case TextClip t:
-                    RotatingLog.Shared.Info($"-> sent text {t.Text.Length} chars to {peer}");
-                    toast($"AnyClip → {peer}", TextHelpers.Preview(t.Text));
+                    RotatingLog.Shared.Info($"-> sent text {t.Text.Length} chars to {peers}");
+                    toast($"AnyClip → {peers}", TextHelpers.Preview(t.Text));
                     break;
                 case ImageClip i:
-                    RotatingLog.Shared.Info($"-> sent image {i.Png.Length} bytes to {peer}");
-                    toast($"AnyClip → {peer}", $"image ({i.Png.Length / 1024} KB)");
+                    RotatingLog.Shared.Info($"-> sent image {i.Png.Length} bytes to {peers}");
+                    toast($"AnyClip → {peers}", $"image ({i.Png.Length / 1024} KB)");
                     break;
                 case FileClip f:
-                    RotatingLog.Shared.Info($"-> sent file {f.Name} {f.Data.Length} bytes to {peer}");
-                    toast($"AnyClip → {peer}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
+                    RotatingLog.Shared.Info($"-> sent file {f.Name} {f.Data.Length} bytes to {peers}");
+                    toast($"AnyClip → {peers}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
                     break;
                 case FilesClip fsc:
-                    RotatingLog.Shared.Info($"-> sent {fsc.Files.Count} files to {peer}");
-                    toast($"AnyClip → {peer}", $"{fsc.Files.Count} files");
+                    RotatingLog.Shared.Info($"-> sent {fsc.Files.Count} files to {peers}");
+                    toast($"AnyClip → {peers}", $"{fsc.Files.Count} files");
                     break;
             }
         };
         clipboard.OnFileSkipped = msg => { toast("AnyClip", msg); return Task.CompletedTask; };
 
         var directory = new PeerDirectory(nodeId, emit,
-            (host, port, label) => link.TryConnectAsync(host, port, label, outerCt));
+            (host, port, label) => manager.TryConnectAsync(host, port, label, outerCt));
         // The App's MdnsBeacon needs the directory to ingest into; expose it.
         CurrentDirectory = directory;
 
@@ -220,12 +204,11 @@ public sealed class Daemon(
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
         var tasks = new[]
         {
-            link.ServeAsync(cts.Token),
+            manager.ServeAsync(cts.Token),
             clipboard.RunAsync(cts.Token),
-            Watchdogs.MdnsReconnectLoopAsync(directory, link, cts.Token),
+            Watchdogs.MdnsReconnectLoopAsync(directory, manager, cts.Token),
             Watchdogs.NetworkWatchdogAsync(mdns, primaryIPv4, 15, cts.Token),
-            Watchdogs.IdleLinkWatchdogAsync(mdns, link, 60, 3, cts.Token),
-            Watchdogs.LinkPingLoopAsync(link, 30, cts.Token),
+            Watchdogs.IdleLinkWatchdogAsync(mdns, manager, 60, 3, cts.Token),
         };
         try
         {
@@ -251,7 +234,7 @@ public sealed class Daemon(
         }
         finally
         {
-            link.Shutdown();
+            manager.Shutdown();
             mdns.Stop();
             pidLock.Release();
             ClearDirectoryFiles(receivedDir);
