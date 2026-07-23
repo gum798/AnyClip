@@ -178,4 +178,59 @@ public class InteropTests
         }
         finally { if (!proc.HasExited) proc.Kill(); }
     }
+
+    [Fact]
+    public async Task InteropTwoPeersReceiveBroadcastAndNoRelay()
+    {
+        int portA = 28637, portB = 28638;
+        string outA = Path.Combine(Path.GetTempPath(), $"fake-peer-A-{Guid.NewGuid()}.jsonl");
+        string outB = Path.Combine(Path.GetTempPath(), $"fake-peer-B-{Guid.NewGuid()}.jsonl");
+        using var procA = Process.Start(FakePeerPsi(portA, outA))!;
+        using var procB = Process.Start(FakePeerPsi(portB, outB))!;
+        try
+        {
+            Assert.Equal("READY", await procA.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Equal("READY", await procB.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+
+            var clips = new List<(ClipPayload Payload, string Peer)>();
+            var manager = new LinkManager(
+                new LinkConfig("interop-token", 28639, "csharp-interop", "0.0.0-test"),
+                Guid.NewGuid().ToString().ToLowerInvariant());
+            manager.OnClip = (p, peer) => { lock (clips) clips.Add((p, peer)); return Task.CompletedTask; };
+            manager.Emit = _ => { };
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await manager.TryConnectAsync("127.0.0.1", portA, $"127.0.0.1:{portA}", cts.Token);
+            await manager.TryConnectAsync("127.0.0.1", portB, $"127.0.0.1:{portB}", cts.Token);
+            Assert.True(await WaitUntil(() => manager.ActiveLinkCount == 2));
+
+            // Both peers pushed their own "hello-from-python" clip; both applied locally.
+            Assert.True(await WaitUntil(() =>
+            { lock (clips) return clips.Count(c => c.Payload is TextClip t && t.Text == "hello-from-python") >= 2; }));
+
+            // One local clip broadcasts to BOTH peers.
+            await manager.BroadcastAsync(new TextClip("mesh-broadcast"));
+            Assert.True(await WaitUntil(() => File.Exists(outA) && ReadShared(outA).Contains("mesh-broadcast")));
+            Assert.True(await WaitUntil(() => File.Exists(outB) && ReadShared(outB).Contains("mesh-broadcast")));
+
+            // Non-relay: peer A's clip was applied locally, NEVER forwarded to B.
+            // Drain B for a bounded interval; every text clip B received is our
+            // broadcast, never a relayed "hello-from-python" (this doubles as the
+            // echo-suppression-under-mesh check).
+            await Task.Delay(1000);
+            var recvTextFrames = ReadShared(outB).Split('\n')
+                .Where(l => l.Contains("\"event\": \"recv\"") && l.Contains("\"kind\": \"text\""))
+                .ToList();
+            Assert.NotEmpty(recvTextFrames);
+            Assert.All(recvTextFrames, l => Assert.DoesNotContain("hello-from-python", l));
+            Assert.Contains(recvTextFrames, l => l.Contains("mesh-broadcast"));
+
+            manager.Shutdown();
+        }
+        finally
+        {
+            if (!procA.HasExited) procA.Kill();
+            if (!procB.HasExited) procB.Kill();
+        }
+    }
 }
