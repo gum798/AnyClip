@@ -276,9 +276,12 @@ public sealed class LinkManager
                 {
                     RotatingLog.Shared.Info($"replacing link with {existing.PeerName} (peer reconnected)");
                 }
-                existing.MarkSuperseded(); // its teardown won't emit LinkDown
                 existing.Dispose();
                 _links.Remove(peerId);
+                // No LinkDown for the replaced link: RunLinkAsync's finally gates
+                // its emit on ReferenceEquals(cur, link), and the table entry for
+                // peerId is about to point at the fresh link — so the old session's
+                // teardown finds a different current link and stays silent.
             }
             else if (_links.Count >= _maxPeers)
             {
@@ -288,7 +291,6 @@ public sealed class LinkManager
                 framed.Dispose(); return;
             }
             link = new PeerLink(peerId, displayName, peerVersion, framed, inbound, label);
-            link.Emit = Emit;
             link.OnClip = p => DispatchReceiveAsync(p, displayName);
             _links[peerId] = link;
             // Emit LinkUp synchronously inside the registration critical section:
@@ -318,11 +320,21 @@ public sealed class LinkManager
         finally
         {
             linkCts.Cancel();
-            // Remove only if still the current entry — a replacement already
-            // swapped in a new link under this node_id (ReferenceEquals guard,
-            // ported from the old single-PeerLink teardown).
+            // Remove AND emit LinkDown only if still the current entry — a
+            // replacement already swapped in a new link under this node_id
+            // (ReferenceEquals guard). Emitting LinkDown here, under the same lock
+            // that guards removal and gated by the same identity check, makes it
+            // symmetric with the under-lock LinkUp at registration: a replaced
+            // link can never emit LinkDown(X) after its replacement's LinkUp(X)
+            // (parity with Python _serve_link + Swift linkClosed).
             lock (_lock)
-            { if (_links.TryGetValue(peerId, out var cur) && ReferenceEquals(cur, link)) _links.Remove(peerId); }
+            {
+                if (_links.TryGetValue(peerId, out var cur) && ReferenceEquals(cur, link))
+                {
+                    _links.Remove(peerId);
+                    Emit?.Invoke(new LinkDown(peerId, "peer disconnected"));
+                }
+            }
             try { await ping; } catch { /* cancelled */ }
             framed.Dispose();
         }
@@ -369,8 +381,11 @@ public sealed class LinkManager
     {
         lock (_lock)
         {
-            foreach (var link in _links.Values) { link.MarkSuperseded(); link.Dispose(); }
+            foreach (var link in _links.Values) link.Dispose();
             _links.Clear();
+            // Table cleared under the lock -> each disposed session's RunLinkAsync
+            // finally finds no matching entry and stays silent (no LinkDown storm
+            // on shutdown), same as the old MarkSuperseded path.
         }
         _listener?.Stop();
         IsServing = false;

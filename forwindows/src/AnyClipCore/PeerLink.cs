@@ -20,7 +20,6 @@ public sealed class PeerLink
 
     private readonly FramedConnection _conn;
     private volatile bool _alive = true;
-    private volatile bool _superseded;
     private readonly double _linkedAt = MonotonicNow();
     // Monotonic timestamp of the last inbound frame. Drives half-open detection:
     // a peer that slept without RST/FIN keeps the socket "writable" yet sends
@@ -38,7 +37,6 @@ public sealed class PeerLink
     public bool IsActive => _alive;
 
     public Func<ClipPayload, Task>? OnClip { get; set; }
-    public Action<DaemonEvent>? Emit { get; set; }
 
     public PeerLink(string peerNodeId, string peerName, VersionInfo peerVersion,
         FramedConnection conn, bool inbound, string? dialLabel)
@@ -51,17 +49,12 @@ public sealed class PeerLink
         DialLabel = dialLabel;
     }
 
-    /// Mark this link as being replaced by a fresh connection for the same
-    /// node_id: teardown then skips its LinkDown emit (the peer is still linked,
-    /// just on a new socket). Mirrors the old single-PeerLink
-    /// ReferenceEquals(_activeConn, framed) guard that suppressed the spurious
-    /// LinkDown when one connection displaced another.
-    public void MarkSuperseded() => _superseded = true;
-
     /// The receive loop. LinkManager emits LinkUp synchronously at registration
     /// (before this detached session starts), so this method only pumps frames
-    /// until the connection closes, then emits LinkDown on teardown unless
-    /// superseded.
+    /// until the connection closes. LinkDown is emitted by LinkManager.RunLinkAsync's
+    /// finally — under the table lock, gated by the same identity check that guards
+    /// table removal — so a link replaced under one node_id never emits LinkDown
+    /// after its replacement's LinkUp (symmetric with the under-lock LinkUp).
     public async Task RunSessionAsync(CancellationToken ct)
     {
         try
@@ -95,7 +88,10 @@ public sealed class PeerLink
         {
             _alive = false;
             RotatingLog.Shared.Info($"peer {PeerName} disconnected");
-            if (!_superseded) Emit?.Invoke(new LinkDown(PeerNodeId, "peer disconnected"));
+            // LinkDown is emitted by LinkManager.RunLinkAsync (under the table
+            // lock, gated by the same identity check that guards removal), not
+            // here — a superseded link must not emit LinkDown for a node_id whose
+            // replacement is already linked.
         }
     }
 
