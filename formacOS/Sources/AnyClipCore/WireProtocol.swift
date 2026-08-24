@@ -2,29 +2,80 @@ import Foundation
 
 /// Protocol constants — keep in lockstep with anyclip.py.
 public enum Wire {
-    public static let maxPayload = 16 * 1024 * 1024
+    /// 64 MiB hard cap per frame (fits a ~16 MB pptx).
+    public static let maxPayload = 64 * 1024 * 1024
+    /// The receive cap enforced by peers on protocol minor < 2: they CLOSE the
+    /// session on a bigger frame, so the broadcast fan-out gates per link on
+    /// this value rather than letting an oversize clip tear an old peer's link
+    /// down. See linkAcceptsFrame.
+    public static let legacyMaxPayload = 16 * 1024 * 1024
     public static let protocolMajor = 1
-    public static let protocolMinor = 1
+    /// Cumulative feature level: minor >= 1 accepts kind:"files", minor >= 2
+    /// accepts frames up to maxPayload (64 MiB) instead of legacyMaxPayload.
+    public static let protocolMinor = 2
     /// Legacy single-int field old peers read; equals protocolMajor.
     public static let legacyVersion = 1
     public static let defaultPort: UInt16 = 24816
     public static let serviceType = "_anyclip._tcp"
     public static let handshakeTimeout: Double = 5.0
     public static let connectTimeout: Double = 5.0
-    /// Upper bound on a single app-initiated send. A send whose completion is
-    /// lost (connection cancelled mid-send) or that parks on a full TCP buffer
-    /// would otherwise freeze the caller -- the clipboard poll loop and the
-    /// heartbeat self-heal both await sends inline. On timeout the connection
-    /// is cancelled to force a reconnect.
+    /// BASE upper bound on a single app-initiated send. A send whose completion
+    /// is lost (connection cancelled mid-send) or that parks on a full TCP
+    /// buffer would otherwise freeze the caller -- the clipboard poll loop and
+    /// the heartbeat self-heal both await sends inline. On timeout the
+    /// connection is cancelled to force a reconnect. The EFFECTIVE budget
+    /// scales with the frame; see sendTimeoutFor.
     public static let sendTimeout: Double = 10.0
     /// Window after link-up in which a duplicate handshake is a connect
     /// race (node_id tie-breaker); later arrivals replace a stale link.
     public static let raceWindow: Double = 1.5
     public static let maxReconnectFails = 3
+
+    /// Drain budget for a frame body of `bytes`: the base timeout plus one
+    /// second per MiB (a 1 MiB/s floor). A fixed 10 s could not carry a 64 MiB
+    /// frame over a slow LAN, and a timeout closes the connection.
+    ///
+    /// Invariant: worst case 64 MiB -> 10 + 64 = 74 s, which stays below the
+    /// 90 s per-link staleness deadline (linkPingLoop: 30 s ping x dead factor
+    /// 3), so a legitimately slow big send can never be mistaken for a
+    /// half-open link. Keep in lockstep with anyclip.send_timeout_for.
+    public static func sendTimeoutFor(bytes: Int, base: Double = sendTimeout) -> Double {
+        base + Double(bytes) / (1024 * 1024)
+    }
+
+    /// False when a frame body of `bytes` would breach the legacy 16 MiB
+    /// receive cap that a peer on protocol minor < 2 still enforces. Such a
+    /// peer closes the session on an over-cap frame, so the fan-out skips the
+    /// send and KEEPS the link instead.
+    public static func linkAcceptsFrame(bytes: Int, peerMinor: Int) -> Bool {
+        bytes <= legacyMaxPayload || peerMinor >= 2
+    }
+
+    /// Receive-side frame-length guard: a body of 1...maxPayload bytes. Peers
+    /// on protocol minor < 2 apply this same rule against legacyMaxPayload,
+    /// which is exactly what linkAcceptsFrame protects them from.
+    public static func acceptsFrameLength(_ n: Int) -> Bool {
+        n > 0 && n <= maxPayload
+    }
 }
 
 public enum WireFrameError: Error, Equatable {
     case payloadTooLarge(Int)
+}
+
+/// One encoded wire frame: the bytes to write, plus the BODY length separately.
+/// Every cap in the protocol (Wire.maxPayload on receive, Wire.legacyMaxPayload
+/// in the per-link send gate) is expressed on the body, not on the 4-byte
+/// length prefix, so carrying `bodyCount` alongside keeps the boundary exact
+/// and lets the mesh fan-out encode a payload variant ONCE and reuse the same
+/// bytes for both the size gate and every send of that variant.
+public struct EncodedFrame: Sendable, Equatable {
+    public let bytes: Data
+    public let bodyCount: Int
+    public init(bytes: Data, bodyCount: Int) {
+        self.bytes = bytes
+        self.bodyCount = bodyCount
+    }
 }
 
 /// A semantic clipboard payload, decoupled from its wire encoding.
@@ -186,8 +237,9 @@ extension WireMessage {
 }
 
 extension WireMessage {
-    /// 4-byte big-endian length prefix + UTF-8 JSON body.
-    public func encodeFrame() throws -> Data {
+    /// 4-byte big-endian length prefix + UTF-8 JSON body, with the body length
+    /// carried alongside for the size gates (see EncodedFrame).
+    public func encode() throws -> EncodedFrame {
         let encoder = JSONEncoder()
         // ensure_ascii=False equivalent: JSONEncoder already outputs raw
         // Unicode by default (non-ASCII chars pass through unescaped).
@@ -196,14 +248,17 @@ extension WireMessage {
             throw WireFrameError.payloadTooLarge(body.count)
         }
         var out = Data(capacity: 4 + body.count)
-        let n = UInt32(body.count) // safe: guarded to maxPayload (16 MiB) above, far below UInt32.max
+        let n = UInt32(body.count) // safe: guarded to maxPayload (64 MiB) above, far below UInt32.max
         out.append(UInt8((n >> 24) & 0xFF))
         out.append(UInt8((n >> 16) & 0xFF))
         out.append(UInt8((n >> 8) & 0xFF))
         out.append(UInt8(n & 0xFF))
         out.append(body)
-        return out
+        return EncodedFrame(bytes: out, bodyCount: body.count)
     }
+
+    /// Frame bytes only, for callers that do not need the body length.
+    public func encodeFrame() throws -> Data { try encode().bytes }
 
     /// Big-endian length from the 4-byte header. Alignment-safe for slices.
     public static func frameLength(_ header: Data) -> Int {

@@ -38,7 +38,7 @@ import Foundation
     #expect(body?["version"] as? Int == 1)          // legacy field MUST exist
     #expect(body?["app_version"] as? String == "1.2.3")
     #expect(body?["protocol_major"] as? Int == 1)
-    #expect(body?["protocol_minor"] as? Int == 1)   // our live hello now advertises minor 1
+    #expect(body?["protocol_minor"] as? Int == 2)   // our live hello now advertises minor 2
 }
 
 @Test func clipTextRoundTrip() throws {
@@ -191,6 +191,8 @@ import Foundation
         sha256Hex(Data("one".utf8)), sha256Hex(Data("two".utf8))]))
 }
 
-@Test func protocolMinorIsOne() {
-    #expect(Wire.protocolMinor == 1)
+@Test func protocolMinorCoversFilesAnd64MiBFrames() {
+    // Cumulative feature level: >= 1 accepts kind:"files", >= 2 accepts frames
+    // up to 64 MiB (see LargeFrameTests).
+    #expect(Wire.protocolMinor == 2)
 }

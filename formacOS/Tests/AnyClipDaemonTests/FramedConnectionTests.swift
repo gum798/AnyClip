@@ -84,18 +84,22 @@ private func startLoopbackListener(
     client.sendTimeout = 0.3
     defer { client.cancel() }
 
-    // 15 MiB (just under the 16 MiB frame cap): must exceed the runner's
-    // combined loopback send+recv buffer so the send parks on the closed TCP
-    // window. On this machine the send wedges after ~1 MiB, so this is a wide
-    // margin; sized near the cap to stay robust against CI buffer autotuning.
-    let big = String(repeating: "x", count: 15 * 1024 * 1024)
+    // 4 MiB: must exceed the runner's combined loopback send+recv buffer so the
+    // send parks on the closed TCP window. On this machine the send wedges
+    // after ~1 MiB, so this is a 4x margin against CI buffer autotuning.
+    //
+    // Sized DOWN from the old 15 MiB because the drain budget now scales with
+    // the frame (Wire.sendTimeoutFor: base + 1 s/MiB) — 15 MiB would push the
+    // effective deadline to ~15 s no matter how small `sendTimeout` is. Here it
+    // is 0.3 + 4 = 4.3 s, which the poll window below covers.
+    let big = String(repeating: "x", count: 4 * 1024 * 1024)
     let outcome = Locked<String?>(nil)
     let sendTask = Task {
         do { try await client.sendFrame(.clipText(big, ts: 0)); outcome.set("returned") }
         catch is TimeoutError { outcome.set("timeout") }
         catch { outcome.set("other") }
     }
-    for _ in 0..<400 { // up to ~4 s, past the 0.3 s budget
+    for _ in 0..<1000 { // up to ~10 s, past the ~4.3 s scaled budget
         if outcome.get() != nil { break }
         try await Task.sleep(nanoseconds: 10_000_000)
     }

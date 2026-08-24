@@ -61,6 +61,18 @@ public func downgradeForPeer(
     return (.file(name: first.name, data: first.data), fs.count - 1)
 }
 
+/// One aggregated toast for the peers a clip was too large for — their protocol
+/// is < 1.2, so they still enforce the legacy 16 MiB receive cap and the
+/// fan-out skipped them (their links stayed up). nil when nothing was skipped;
+/// at most ONE per clip. Keep in lockstep with anyclip.size_skip_message.
+public func sizeSkipMessage(_ names: [String]) -> String? {
+    guard !names.isEmpty else { return nil }
+    if names.count == 1 {
+        return "clip not sent to \(names[0]) (too large for its AnyClip version)"
+    }
+    return "clip not sent to \(names.count) peer(s) (too large for their AnyClip version)"
+}
+
 /// Assembles and supervises one daemon runtime: PeerLink + MdnsBeacon +
 /// ClipboardWatcher + watchdogs, restarting with 1s -> 60s backoff on
 /// errors (improvement over the Python GUI build, where watchdog-raised
@@ -242,6 +254,11 @@ public final class Daemon: @unchecked Sendable {
             if result.maxDropped > 0 {
                 notify("AnyClip",
                     "\(result.maxDropped) file(s) not synced — update the peer to receive multiple files")
+            }
+            // Same aggregation for the peers the legacy 16 MiB size gate
+            // skipped: ONE toast per local copy, never one per peer.
+            if let message = sizeSkipMessage(result.sizeSkipped) {
+                notify("AnyClip", message)
             }
         }
 

@@ -43,8 +43,11 @@ public final class ClipboardWatcher {
     }
 
     static let imageCooldown: Double = 1.0
-    /// Reserve ~256 KB for the JSON envelope and the b64 1.34× inflation.
-    /// Mirrors Python: budget = int((MAX_PAYLOAD - 256*1024) * 0.74)
+    /// Greedy send budget, applied to the SUM of raw file sizes in one clip.
+    /// Reserves ~256 KB for the JSON envelope and the b64 1.34× inflation.
+    /// Formula unchanged since the 16 MiB days; against the 64 MiB cap it lands
+    /// at 49,466,572 (was ~12,221,153).
+    /// Mirrors Python: FILE_BUDGET = int((MAX_PAYLOAD - 256*1024) * 0.74)
     static let fileBudget = Int(Double(Wire.maxPayload - 256 * 1024) * 0.74)
     /// Sender-side cap; the receiver stays lenient. Matches MAX_FILES_PER_CLIP.
     static let maxFilesPerClip = 100

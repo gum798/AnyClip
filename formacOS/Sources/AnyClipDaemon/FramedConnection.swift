@@ -109,7 +109,14 @@ public final class FramedConnection: @unchecked Sendable {
     }
 
     public func sendFrame(_ message: WireMessage) async throws {
-        let data = try message.encodeFrame()
+        try await sendFrame(message.encode())
+    }
+
+    /// Send an ALREADY-encoded frame. The mesh broadcast encodes each payload
+    /// variant once and hands the same bytes to every link that takes it, so
+    /// an N-peer fan-out never re-encodes (or re-measures) the same clip.
+    public func sendFrame(_ frame: EncodedFrame) async throws {
+        let data = frame.bytes
         // Bound the send: a write whose completion is lost (connection
         // cancelled mid-send) or that parks on a full TCP buffer (wedged peer)
         // would otherwise hang the caller forever. The clipboard poll loop and
@@ -118,7 +125,13 @@ public final class FramedConnection: @unchecked Sendable {
         // cancels the operation task, whose onCancel cancels the connection
         // (firing the parked completion + tearing the link down to reconnect),
         // and rethrows TimeoutError to the caller.
-        try await withTimeout(seconds: sendTimeout) { [self] in
+        //
+        // The budget SCALES with the frame (1 MiB/s floor on top of the base):
+        // a flat 10 s could not carry a 64 MiB frame over a slow LAN, and a
+        // timeout tears the link down. `sendTimeout` stays the base so tests
+        // can still shrink it.
+        let budget = Wire.sendTimeoutFor(bytes: frame.bodyCount, base: sendTimeout)
+        try await withTimeout(seconds: budget) { [self] in
             try await rawSendFrame(data)
         }
     }
@@ -184,7 +197,11 @@ public final class FramedConnection: @unchecked Sendable {
     public func receiveMessage() async throws -> WireMessage? {
         let header = try await receiveExactly(4)
         let n = WireMessage.frameLength(header)
-        guard n > 0, n <= Wire.maxPayload else {
+        // Frames up to 64 MiB are accepted; anything larger is rejected without
+        // reading the body. Peers on protocol < 1.2 apply the same rule against
+        // the 16 MiB legacy cap — LinkManager's send gate keeps us from ever
+        // handing them a frame they would close the session over.
+        guard Wire.acceptsFrameLength(n) else {
             AnyLog.shared.warning("invalid frame length: \(n)")
             return nil
         }

@@ -138,19 +138,54 @@ private func makeWatcher(
     } else { Issue.record("not a file payload") }
 }
 
+/// A file of exactly `size` bytes without writing `size` bytes, so the real
+/// ~49 MB budget boundary can be exercised cheaply.
+private func sparseFile(_ url: URL, size: Int) throws -> URL {
+    FileManager.default.createFile(atPath: url.path, contents: nil)
+    let h = try FileHandle(forWritingTo: url)
+    try h.truncate(atOffset: UInt64(size))
+    try h.close()
+    return url
+}
+
+@Test func fileBudgetKeepsItsFormulaAgainstTheNewCap() {
+    #expect(ClipboardWatcher.fileBudget
+        == Int(Double(Wire.maxPayload - 256 * 1024) * 0.74))
+    #expect(ClipboardWatcher.fileBudget == 49_466_572)   // in lockstep with Python
+}
+
+@Test @MainActor func singleFileAtTheBudgetIsAccepted() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let file = try sparseFile(
+        tempDir().appendingPathComponent("at-budget.bin"),
+        size: ClipboardWatcher.fileBudget)
+    pb.clearContents()
+    pb.writeObjects([file as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .file(let name, let data) = got.first {
+        #expect(name == "at-budget.bin")
+        #expect(data.count == ClipboardWatcher.fileBudget)
+    } else { Issue.record("expected a single-file payload, got \(got)") }
+    #expect(skipped.get().isEmpty)
+}
+
 @Test @MainActor func oversizedFileIsSkipped() async throws {
     let pb = privatePasteboard()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
-    let file = tempDir().appendingPathComponent("big.bin")
-    FileManager.default.createFile(atPath: file.path, contents: nil)
-    let handle = try FileHandle(forWritingTo: file)
-    try handle.truncate(atOffset: UInt64(12 * 1024 * 1024)) // > ~11.6MB budget
-    try handle.close()
+    // One byte past the greedy budget (never read: the size check comes first).
+    let file = try sparseFile(
+        tempDir().appendingPathComponent("big.bin"),
+        size: ClipboardWatcher.fileBudget + 1)
     pb.clearContents()
     pb.writeObjects([file as NSURL])
     await watcher.pollOnceForTesting()
     #expect(changes.get().isEmpty)
+    #expect(skipped.get() == ["1 file(s) skipped (too large to sync)"])
 }
 
 @Test @MainActor func updateLocalFileWritesToReceivedDirAndDoesNotEcho() async throws {
@@ -252,14 +287,12 @@ private func makeWatcher(
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
     let dir = tempDir()
-    // Two 7 MiB sparse files: the first fits the ~11.65 MB budget, the second
-    // overflows the cumulative sum and is skipped -> one survivor -> kind "file".
+    // Two sparse files just over half the ~49.4 MB budget each: the first fits,
+    // the second overflows the cumulative sum and is skipped -> one survivor ->
+    // kind "file". Sized off the constant so the boundary tracks the frame cap.
+    let each = ClipboardWatcher.fileBudget / 2 + 1
     func sparse(_ name: String) throws -> URL {
-        let u = dir.appendingPathComponent(name)
-        FileManager.default.createFile(atPath: u.path, contents: nil)
-        let h = try FileHandle(forWritingTo: u)
-        try h.truncate(atOffset: UInt64(7 * 1024 * 1024)); try h.close()
-        return u
+        try sparseFile(dir.appendingPathComponent(name), size: each)
     }
     let f1 = try sparse("big1.bin"); let f2 = try sparse("big2.bin")
     pb.clearContents(); pb.writeObjects([f1 as NSURL, f2 as NSURL])

@@ -14,13 +14,21 @@ public enum ConnectOutcome: Sendable {
 }
 
 /// Per-copy broadcast result: which peers got the (possibly downgraded) clip,
-/// and the largest old-peer file-drop count for the aggregated fallback toast.
+/// the largest old-peer file-drop count for the aggregated fallback toast, and
+/// the peers the legacy size gate skipped for the aggregated size toast.
 public struct BroadcastResult: Sendable {
     public var delivered: [(peerName: String, payload: ClipPayload)]
     public var maxDropped: Int
-    public init(delivered: [(peerName: String, payload: ClipPayload)], maxDropped: Int) {
+    /// Peers whose 16 MiB receive cap this clip would have breached (protocol
+    /// < 1.2). Their links stay UP; the caller emits ONE toast per clip.
+    public var sizeSkipped: [String]
+    public init(
+        delivered: [(peerName: String, payload: ClipPayload)], maxDropped: Int,
+        sizeSkipped: [String] = []
+    ) {
         self.delivered = delivered
         self.maxDropped = maxDropped
+        self.sizeSkipped = sizeSkipped
     }
 }
 
@@ -382,23 +390,63 @@ public actor LinkManager {
     /// Fan a local clip out to every active link. Per-link protocol-minor
     /// downgrade is evaluated per link; a per-link send failure drops ONLY that
     /// link. Echo-suppression (shouldSend) is the caller's job — evaluated once.
+    ///
+    /// Two per-link gates run here, both keyed on the peer's advertised minor:
+    ///  - minor < 1: a kind:"files" clip degrades to its first file (downgradeForPeer).
+    ///  - minor < 2: a frame over the legacy 16 MiB receive cap is SKIPPED (the
+    ///    peer would close the session on it). The link stays up and the peer
+    ///    name lands in `sizeSkipped` for one aggregated toast.
+    ///
+    /// Each distinct payload variant is encoded at most ONCE per broadcast (and
+    /// shares one timestamp): the same bytes back the size gate and every send
+    /// of that variant, so an 8-peer mesh never re-encodes the same clip.
     public func broadcast(_ payload: ClipPayload) async -> BroadcastResult {
         var delivered: [(peerName: String, payload: ClipPayload)] = []
+        var sizeSkipped: [String] = []
         var maxDropped = 0
+        let ts = Date().timeIntervalSince1970
+        // Variant kind ("text"/"image"/"file"/"files") -> its encoded frame, or
+        // nil when the payload does not fit even the 64 MiB cap.
+        var frames: [String: EncodedFrame?] = [:]
+
         for entry in links.values {
             let link = entry.link
             let (maybe, dropped) = downgradeForPeer(payload, peerMinor: link.peerProtocolMinor)
             guard let outPayload = maybe else { continue }
-            maxDropped = max(maxDropped, dropped)
-            let ok = await link.sendClip(outPayload)
+            let variant = outPayload.kind
+            let encoded: EncodedFrame?
+            if let cached = frames[variant] {
+                encoded = cached
+            } else {
+                encoded = try? WireMessage.clip(outPayload, ts: ts).encode()
+                if encoded == nil {
+                    AnyLog.shared.warning(
+                        "payload too large (> \(Wire.maxPayload) bytes), dropping")
+                }
+                frames[variant] = encoded
+            }
+            guard let frame = encoded else { continue }
+            guard Wire.linkAcceptsFrame(
+                bytes: frame.bodyCount, peerMinor: link.peerProtocolMinor)
+            else {
+                AnyLog.shared.info(
+                    "clip too large for '\(link.peerName)' (peer protocol < 1.2); skipping")
+                sizeSkipped.append(link.peerName)
+                continue
+            }
+            let ok = await link.sendEncoded(frame)
             if !ok {
                 AnyLog.shared.info("send failed to \(link.peerName); dropping link")
                 link.close()   // wakes run(); its task removes the entry + emits linkDown
                 continue
             }
+            // Only a DELIVERED downgrade counts toward the fallback toast: a
+            // gated or failed link received nothing to leave files behind on.
+            maxDropped = max(maxDropped, dropped)
             delivered.append((peerName: link.peerName, payload: outPayload))
         }
-        return BroadcastResult(delivered: delivered, maxDropped: maxDropped)
+        return BroadcastResult(
+            delivered: delivered, maxDropped: maxDropped, sizeSkipped: sizeSkipped)
     }
 
     // ---- shutdown ------------------------------------------------------

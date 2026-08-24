@@ -92,15 +92,26 @@ public actor PeerLink {
         }
     }
 
-    /// Per-link broadcast send. Returns false only on a "link likely down"
+    /// Per-link send of one clip. Returns false only on a "link likely down"
     /// error, so the caller drops this link; an oversize payload keeps the link.
     public func sendClip(_ payload: ClipPayload) async -> Bool {
         if closed { return false }
         let msg = WireMessage.clip(payload, ts: Date().timeIntervalSince1970)
-        do { try await conn.sendFrame(msg); return true }
-        catch let error as WireFrameError {
+        let frame: EncodedFrame
+        do { frame = try msg.encode() }
+        catch {
             AnyLog.shared.warning("payload too large, dropping: \(error)"); return true
         }
+        return await sendEncoded(frame)
+    }
+
+    /// Send an ALREADY-encoded frame on THIS link. The mesh broadcast encodes
+    /// each payload variant once and reuses the bytes for the per-link legacy
+    /// size gate and every send of that variant. Same failure contract as
+    /// sendClip: false only when the link looks down.
+    public func sendEncoded(_ frame: EncodedFrame) async -> Bool {
+        if closed { return false }
+        do { try await conn.sendFrame(frame); return true }
         catch {
             AnyLog.shared.info("send failed (link likely down): \(error)"); return false
         }
