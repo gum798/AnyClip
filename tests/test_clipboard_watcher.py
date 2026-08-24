@@ -24,6 +24,14 @@ def quiet_clipboard(monkeypatch):
     monkeypatch.setattr(anyclip.pyperclip, "paste", lambda: "")
 
 
+def _sparse_file(path, size: int):
+    """A file of exactly `size` bytes without writing `size` bytes, so the
+    real ~49 MB FILE_BUDGET boundary can be exercised cheaply."""
+    with open(path, "wb") as fh:
+        fh.truncate(size)
+    return path
+
+
 def _make_watcher(on_change=None, on_file_skipped=None) -> ClipboardWatcher:
     async def _noop(kind, data) -> None:
         return None
@@ -244,6 +252,74 @@ async def test_budget_greedy_partial_send(monkeypatch, tmp_path):
     await watcher._check_file_clipboard()
     assert changes == [("files", [("a.txt", b"123456"), ("c.txt", b"XY")])]
     assert any("skipped" in m for m in skipped)
+
+
+@pytest.mark.asyncio
+async def test_sum_exactly_at_budget_is_accepted(monkeypatch, tmp_path):
+    """Greedy accept is `<= FILE_BUDGET`: a selection summing to exactly the
+    budget goes out whole, one more byte drops the last file."""
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    budget = 12
+    monkeypatch.setattr(anyclip, "FILE_BUDGET", budget)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    f1 = tmp_path / "a.bin"; f1.write_bytes(b"a" * (budget // 2))
+    f2 = tmp_path / "b.bin"; f2.write_bytes(b"b" * (budget - budget // 2))
+    monkeypatch.setattr(anyclip, "grab_clipboard_files",
+                        lambda: [str(f1), str(f2)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("files", [("a.bin", b"a" * 6), ("b.bin", b"b" * 6)])]
+    assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_single_file_at_the_real_budget_is_accepted(monkeypatch, tmp_path):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    f = _sparse_file(tmp_path / "at-budget.bin", anyclip.FILE_BUDGET)
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(f)])
+
+    await watcher._check_file_clipboard()
+    assert len(changes) == 1
+    kind, (name, data) = changes[0]
+    assert kind == "file" and name == "at-budget.bin"
+    assert len(data) == anyclip.FILE_BUDGET
+    assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_single_file_one_byte_over_the_real_budget_is_skipped(
+    monkeypatch, tmp_path,
+):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    f = _sparse_file(tmp_path / "over-budget.bin", anyclip.FILE_BUDGET + 1)
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(f)])
+
+    await watcher._check_file_clipboard()
+    assert changes == []
+    assert skipped == ["1 file(s) skipped (too large to sync)"]
 
 
 @pytest.mark.asyncio

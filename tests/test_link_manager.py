@@ -5,6 +5,8 @@ broadcast over loopback. Uses the repo's asyncio.run(go()) test pattern."""
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import socket
 import types
 
@@ -37,7 +39,11 @@ class FakeWriter:
 
 
 class FakeLink:
-    """Duck-typed PeerLink for broadcast tests."""
+    """Duck-typed PeerLink for broadcast tests.
+
+    The fan-out sends pre-encoded frame bytes (encoded once per payload
+    variant), so `sent` decodes them back into (kind, payload) pairs.
+    """
     def __init__(self, minor=1, fail=False, name="peer", addr=None):
         self.peer_protocol_minor = minor
         self.peer_name = name
@@ -46,10 +52,11 @@ class FakeLink:
         self.sent = []
         self.closed = False
         self._fail = fail
-    async def send_clip(self, kind, content):
+    async def send_frame(self, data):
         if self._fail:
             raise ConnectionError("boom")
-        self.sent.append((kind, content))
+        payload = json.loads(data.decode("utf-8"))
+        self.sent.append((payload["kind"], payload))
     async def close(self):
         self.closed = True
         self.active = False
@@ -138,8 +145,10 @@ def test_broadcast_clip_fans_out_and_isolates_failure():
         good = FakeLink(name="good")
         bad = FakeLink(name="bad", fail=True)
         mgr._links = {"g": good, "b": bad}
-        await mgr.broadcast_clip("text", "hello")
-        assert good.sent == [("text", "hello")]
+        sent, skipped = await mgr.broadcast_clip("text", "hello")
+        assert sent == 1 and skipped == []
+        assert [k for k, _ in good.sent] == ["text"]
+        assert good.sent[0][1]["content"] == "hello"
         assert bad.closed  # failed link dropped, others unaffected
     asyncio.run(go())
 
@@ -151,10 +160,16 @@ def test_broadcast_files_per_link_minor_gating():
         old_peer = FakeLink(minor=0, name="old")
         mgr._links = {"n": new_peer, "o": old_peer}
         data = [("a.txt", b"one"), ("b.txt", b"two"), ("c.txt", b"three")]
-        full, fallback, dropped = await mgr.broadcast_files(data)
-        assert full == 1 and fallback == 1 and dropped == 2
-        assert new_peer.sent == [("files", data)]
-        assert old_peer.sent == [("file", ("a.txt", b"one"))]
+        full, fallback, dropped, skipped = await mgr.broadcast_files(data)
+        assert full == 1 and fallback == 1 and dropped == 2 and skipped == []
+        kind, payload = new_peer.sent[0]
+        assert kind == "files"
+        assert [(e["name"], base64.b64decode(e["content"]))
+                for e in payload["files"]] == data
+        kind, payload = old_peer.sent[0]
+        assert kind == "file"
+        assert payload["name"] == "a.txt"
+        assert base64.b64decode(payload["content"]) == b"one"
     asyncio.run(go())
 
 

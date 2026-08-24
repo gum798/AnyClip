@@ -26,8 +26,10 @@ def _capture_link():
     return link, sent
 
 
-def test_protocol_minor_bumped_to_one():
-    assert anyclip.PROTOCOL_MINOR == 1
+def test_protocol_minor_covers_files_and_64mib_frames():
+    # Cumulative feature level: >= 1 accepts kind:"files", >= 2 accepts
+    # frames up to 64 MiB (see tests/test_large_frames.py).
+    assert anyclip.PROTOCOL_MINOR == 2
 
 
 def test_aggregate_is_order_independent_and_known():

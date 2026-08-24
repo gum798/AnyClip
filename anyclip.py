@@ -63,29 +63,36 @@ SERVICE_TYPE = "_anyclip._tcp.local."
 # Single source of truth for the app build. Injected into handshake JSON
 # and mDNS TXT so peers can show "peer needs update" hints. Bump in lockstep
 # with releases. PROTOCOL_MAJOR/MINOR are independent: PROTOCOL_MAJOR is the
-# wire-compat key (mismatch = refuse link), PROTOCOL_MINOR is informational.
+# wire-compat key (mismatch = refuse link), PROTOCOL_MINOR is a cumulative
+# feature level: minor >= 1 accepts kind:"files", minor >= 2 accepts frames
+# up to MAX_PAYLOAD (64 MiB) instead of the legacy 16 MiB.
 # CI exports ANYCLIP_BUILD_VERSION from the git tag (without leading "v");
 # local source runs default to a dev marker so handshake logs stay readable.
 APP_VERSION = os.environ.get("ANYCLIP_BUILD_VERSION", "0.0.0-dev")
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 1
+PROTOCOL_MINOR = 2
 # Legacy alias: pre-1.0 peers send a single `version` int. New code treats
 # it as equivalent to protocol_major so old<->new handshakes still link.
 PROTOCOL_VERSION = PROTOCOL_MAJOR
-MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB hard cap per frame (enough for typical PNGs)
+MAX_PAYLOAD = 64 * 1024 * 1024  # 64 MiB hard cap per frame (fits a ~16 MB pptx)
+# The receive cap enforced by peers on protocol minor < 2: they CLOSE the
+# session on a bigger frame, so the broadcast fan-out gates per link on this
+# value rather than letting an oversize clip tear an old peer's link down.
+LEGACY_MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB
 # Greedy multi-file send budget, applied to the SUM of raw file sizes in one
 # "files" clip (reserves ~256 KB for the JSON envelope + base64 1.34x). Same
 # value the single-file path used inline. Keep in lockstep with Swift/C#.
-FILE_BUDGET = int((MAX_PAYLOAD - 256 * 1024) * 0.74)  # ~12,221,153
+FILE_BUDGET = int((MAX_PAYLOAD - 256 * 1024) * 0.74)  # 49,466,572
 # Sender-side cap on files per clip; the receiver stays lenient.
 MAX_FILES_PER_CLIP = 100
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
-# Upper bound on a single app-initiated send. A write that parks past this
-# (full TCP buffer of a half-open/wedged peer, or a lost send completion)
-# would otherwise freeze the caller's loop -- the clipboard poll loop and the
-# heartbeat self-heal both await sends inline. On timeout we drop the link.
+# Base upper bound on a single app-initiated send. A write that parks past
+# the budget (full TCP buffer of a half-open/wedged peer, or a lost send
+# completion) would otherwise freeze the caller's loop -- the clipboard poll
+# loop and the heartbeat self-heal both await sends inline. On timeout we drop
+# the link. The effective budget scales with the frame (see send_timeout_for).
 SEND_TIMEOUT = 10.0
 # After a link is registered, only late-arriving handshakes within this
 # window are eligible to *replace* the existing link via the node_id
@@ -1338,18 +1345,69 @@ def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
         log.debug(f"keepalive setup failed: {exc}")
 
 
+def send_timeout_for(nbytes: int, base: float = SEND_TIMEOUT) -> float:
+    """Drain budget for a frame of ``nbytes``: the base timeout plus one
+    second per MiB (a 1 MiB/s floor). A fixed 10 s could not carry a 64 MiB
+    frame over a slow LAN, and a timeout closes the writer.
+
+    Invariant: worst case 64 MiB -> 10 + 64 = 74 s, which stays below the
+    90 s per-link staleness deadline (link_ping_loop: 30 s ping x dead
+    factor 3), so a legitimately slow big send can never be mistaken for a
+    half-open link. Keep in lockstep with Swift/C#.
+    """
+    return base + nbytes / (1024 * 1024)
+
+
+def encode_frame(payload: dict) -> bytes:
+    """Canonical JSON body bytes for one wire frame (no length prefix).
+
+    The single encoding point for clip frames: the broadcast fan-out encodes
+    each distinct payload variant once and reuses the bytes for both the
+    per-link size gate and the send.
+    """
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def link_accepts_frame(link, nbytes: int) -> bool:
+    """False when a frame of ``nbytes`` would breach the legacy 16 MiB
+    receive cap that this peer still enforces (protocol minor < 2). Such a
+    peer closes the session on an over-cap frame, so we skip the send and
+    keep the link instead."""
+    if nbytes <= LEGACY_MAX_PAYLOAD:
+        return True
+    return (link.peer_protocol_minor or 0) >= 2
+
+
+def files_variant_for_link(link) -> str:
+    """Which payload variant a multi-file clip takes on this link:
+    "files" for a protocol >= 1.1 peer, else the first-file "file" fallback."""
+    return "files" if (link.peer_protocol_minor or 0) >= 1 else "file"
+
+
+def size_skip_message(names: list) -> Optional[str]:
+    """One aggregated toast for the peers a clip was too large for, or None
+    when nothing was skipped. At most one per clip."""
+    if not names:
+        return None
+    if len(names) == 1:
+        return f"clip not sent to {names[0]} (too large for its AnyClip version)"
+    return (f"clip not sent to {len(names)} peer(s) "
+            "(too large for their AnyClip version)")
+
+
 async def _write_frame(writer: asyncio.StreamWriter, obj: dict, timeout: float) -> bool:
     """Length-prefixed JSON frame write for the LinkManager handshake.
     Returns True on success; closes the writer and returns False on a wedged
     drain or over-cap payload (mirrors PeerLink._send)."""
-    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    data = encode_frame(obj)
     if len(data) > MAX_PAYLOAD:
         log.warning(f"payload too large ({len(data)} bytes), dropping")
         return False
     try:
         writer.write(len(data).to_bytes(4, "big"))
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        await asyncio.wait_for(
+            writer.drain(), timeout=send_timeout_for(len(data), timeout))
         return True
     except asyncio.TimeoutError:
         log.info("handshake send timed out; dropping connection")
@@ -1482,14 +1540,19 @@ class PeerLink:
             self._writer = None
 
     async def _send(self, writer: asyncio.StreamWriter, obj: dict) -> None:
-        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        await self._send_bytes(writer, encode_frame(obj))
+
+    async def _send_bytes(self, writer: asyncio.StreamWriter, data: bytes) -> None:
         if len(data) > MAX_PAYLOAD:
             log.warning(f"payload too large ({len(data)} bytes), dropping")
             return
         try:
             writer.write(len(data).to_bytes(4, "big"))
             writer.write(data)
-            await asyncio.wait_for(writer.drain(), timeout=self._send_timeout)
+            await asyncio.wait_for(
+                writer.drain(),
+                timeout=send_timeout_for(len(data), self._send_timeout),
+            )
         except asyncio.TimeoutError:
             # The write parked past the budget -- half-open/wedged socket.
             # Close the writer so the next _recv returns EOF and the session
@@ -1556,85 +1619,104 @@ class PeerLink:
         )
         _safe_close(writer)
 
+    async def send_frame(self, data: bytes) -> None:
+        """Send an already-encoded frame body on THIS link. Used by the mesh
+        broadcast so one payload variant is encoded once and reused for the
+        per-link size gate and every send of that variant."""
+        writer = self._writer
+        if writer is None or writer.is_closing():
+            return
+        await self._send_bytes(writer, data)
+
     async def send_clip(self, kind: str, content) -> None:
         """Send one clipboard payload to THIS peer. kind=='text' expects str,
         'image' raw PNG bytes, 'file' (name, raw), 'files' [(name, raw), ...]."""
         writer = self._writer
         if writer is None or writer.is_closing():
             return
-        if kind == "text":
-            if not isinstance(content, str):
+        payload = build_clip_payload(kind, content)
+        if payload is None:
+            return
+        await self._send(writer, payload)
+
+
+def build_clip_payload(kind: str, content) -> Optional[dict]:
+    """Build the wire payload dict for one clipboard item, or None when the
+    content does not match the kind. Field order is part of the wire contract
+    (golden vectors); keep in lockstep with Swift/C#."""
+    if kind == "text":
+        if not isinstance(content, str):
+            return
+        payload = {
+            "type": "clip",
+            "kind": "text",
+            "content": content,
+            "hash": sha256_hex(content),
+            "ts": time.time(),
+        }
+    elif kind == "image":
+        if not isinstance(content, (bytes, bytearray)):
+            return
+        encoded = base64.b64encode(bytes(content)).decode("ascii")
+        payload = {
+            "type": "clip",
+            "kind": "image",
+            "content": encoded,
+            "hash": sha256_bytes(bytes(content)),
+            "ts": time.time(),
+            "bytes": len(content),
+        }
+    elif kind == "file":
+        if not isinstance(content, tuple) or len(content) != 2:
+            return
+        name, raw = content
+        if not isinstance(name, str) or not isinstance(raw, (bytes, bytearray)):
+            return
+        raw_b = bytes(raw)
+        encoded = base64.b64encode(raw_b).decode("ascii")
+        payload = {
+            "type": "clip",
+            "kind": "file",
+            "name": name,
+            "content": encoded,
+            "hash": sha256_bytes(raw_b),
+            "ts": time.time(),
+            "bytes": len(raw_b),
+        }
+    elif kind == "files":
+        if not isinstance(content, list) or not content:
+            return
+        files_arr = []
+        hashes = []
+        total = 0
+        for ent in content:
+            if not isinstance(ent, tuple) or len(ent) != 2:
                 return
-            payload = {
-                "type": "clip",
-                "kind": "text",
-                "content": content,
-                "hash": sha256_hex(content),
-                "ts": time.time(),
-            }
-        elif kind == "image":
-            if not isinstance(content, (bytes, bytearray)):
-                return
-            encoded = base64.b64encode(bytes(content)).decode("ascii")
-            payload = {
-                "type": "clip",
-                "kind": "image",
-                "content": encoded,
-                "hash": sha256_bytes(bytes(content)),
-                "ts": time.time(),
-                "bytes": len(content),
-            }
-        elif kind == "file":
-            if not isinstance(content, tuple) or len(content) != 2:
-                return
-            name, raw = content
+            name, raw = ent
             if not isinstance(name, str) or not isinstance(raw, (bytes, bytearray)):
                 return
             raw_b = bytes(raw)
-            encoded = base64.b64encode(raw_b).decode("ascii")
-            payload = {
-                "type": "clip",
-                "kind": "file",
+            h = sha256_bytes(raw_b)
+            files_arr.append({
                 "name": name,
-                "content": encoded,
-                "hash": sha256_bytes(raw_b),
-                "ts": time.time(),
+                "content": base64.b64encode(raw_b).decode("ascii"),
+                "hash": h,
                 "bytes": len(raw_b),
-            }
-        elif kind == "files":
-            if not isinstance(content, list) or not content:
-                return
-            files_arr = []
-            hashes = []
-            total = 0
-            for ent in content:
-                if not isinstance(ent, tuple) or len(ent) != 2:
-                    return
-                name, raw = ent
-                if not isinstance(name, str) or not isinstance(raw, (bytes, bytearray)):
-                    return
-                raw_b = bytes(raw)
-                h = sha256_bytes(raw_b)
-                files_arr.append({
-                    "name": name,
-                    "content": base64.b64encode(raw_b).decode("ascii"),
-                    "hash": h,
-                    "bytes": len(raw_b),
-                })
-                hashes.append(h)
-                total += len(raw_b)
-            payload = {
-                "type": "clip",
-                "kind": "files",
-                "files": files_arr,
-                "hash": aggregate_files_hash(hashes),
-                "ts": time.time(),
-                "bytes": total,
-            }
-        else:
-            log.debug(f"send_clip: unknown kind {kind!r}, dropping")
-            return
-        await self._send(writer, payload)
+            })
+            hashes.append(h)
+            total += len(raw_b)
+        payload = {
+            "type": "clip",
+            "kind": "files",
+            "files": files_arr,
+            "hash": aggregate_files_hash(hashes),
+            "ts": time.time(),
+            "bytes": total,
+        }
+    else:
+        log.debug(f"build_clip_payload: unknown kind {kind!r}, dropping")
+        return None
+    return payload
 
 
 class LinkManager:
@@ -1963,38 +2045,88 @@ class LinkManager:
         await link.close()
 
     # ---- broadcast -----------------------------------------------------
-    async def broadcast_clip(self, kind, content) -> None:
+    def _gate(self, link, frame: bytes, skipped: list) -> bool:
+        """Per-link legacy size gate. Records the peer name and returns False
+        when this frame would breach the 16 MiB cap a pre-1.2 peer enforces --
+        that peer would close the session, so we skip the send and KEEP the
+        link. The caller emits one aggregated toast for `skipped`."""
+        if link_accepts_frame(link, len(frame)):
+            return True
+        log.info(
+            f"clip too large for {link.peer_name!r} "
+            "(peer protocol < 1.2); skipping"
+        )
+        skipped.append(link.peer_name)
+        return False
+
+    async def broadcast_clip(self, kind, content) -> tuple:
         """Fan out a simple (text/image/file) clip to all active links; a
-        per-link failure drops only that link."""
+        per-link failure drops only that link. The frame is encoded ONCE and
+        the same bytes are reused for the size gate and every send. Returns
+        (sent, skipped_names) so the caller can log/toast once."""
+        skipped: list = []
+        payload = build_clip_payload(kind, content)
+        if payload is None:
+            return 0, skipped
+        frame = encode_frame(payload)
+        sent = 0
         for link in list(self._links.values()):
             if not link.active:
                 continue
+            if not self._gate(link, frame, skipped):
+                continue
             try:
-                await link.send_clip(kind, content)
+                await link.send_frame(frame)
             except Exception as exc:
                 log.info(f"send to {link.peer_name!r} failed: {exc}; dropping link")
                 await self._drop_link(link)
+                continue
+            sent += 1
+        return sent, skipped
 
     async def broadcast_files(self, data) -> tuple:
         """Fan out a multi-file selection with per-link minor gating. Returns
-        (sent_full, sent_fallback, max_dropped) aggregated across links for a
-        single toast. The global echo check is done by the caller."""
+        (sent_full, sent_fallback, max_dropped, skipped_names) aggregated
+        across links for a single toast each. The global echo check is done by
+        the caller. Each distinct payload variant ("files" for a protocol >=
+        1.1 peer, the first-file "file" fallback otherwise) is encoded at most
+        once per broadcast and reused for both the size gate and the send."""
         sent_full = sent_fallback = max_dropped = 0
+        skipped: list = []
+        frames: dict = {}
+
+        def frame_for(variant: str) -> Optional[bytes]:
+            if variant not in frames:
+                if variant == "files":
+                    payload = build_clip_payload("files", data)
+                else:
+                    first_name, first_raw = data[0]
+                    payload = build_clip_payload(
+                        "file", (first_name, bytes(first_raw)))
+                frames[variant] = None if payload is None else encode_frame(payload)
+            return frames[variant]
+
         for link in list(self._links.values()):
             if not link.active:
                 continue
+            variant = files_variant_for_link(link)
+            frame = frame_for(variant)
+            if frame is None:
+                continue
+            if not self._gate(link, frame, skipped):
+                continue
             try:
-                decision, n = await send_files_to_link(link, data)
+                await link.send_frame(frame)
             except Exception as exc:
                 log.info(f"send to {link.peer_name!r} failed: {exc}; dropping link")
                 await self._drop_link(link)
                 continue
-            if decision == "files":
+            if variant == "files":
                 sent_full += 1
-            else:  # "file" legacy fallback for a minor-0 peer
+            else:  # legacy first-file fallback for a minor-0 peer
                 sent_fallback += 1
-                max_dropped = max(max_dropped, n)
-        return sent_full, sent_fallback, max_dropped
+                max_dropped = max(max_dropped, len(data) - 1)
+        return sent_full, sent_fallback, max_dropped, skipped
 
     # ---- re-admission --------------------------------------------------
     async def redial_discovered(self, beacon) -> None:
@@ -2415,13 +2547,17 @@ async def _run_permission_probe(beacon: "MdnsBeacon") -> None:
 
 
 async def send_files_to_link(link, data) -> tuple:
-    """Per-link minor gating for a multi-file clip (NO echo check). Reused by
-    the mesh broadcast loop so gating is evaluated per link:
+    """Per-link minor gating for a multi-file clip (NO echo check), on ONE
+    link:
       minor >= 1 -> one kind:"files" clip, returns ("files", len(data)).
       minor 0    -> first file as legacy kind:"file", returns ("file", dropped).
+
+    The mesh fan-out does not call this -- LinkManager.broadcast_files picks
+    the same variant via files_variant_for_link() but encodes each variant
+    once and applies the legacy size gate before sending. Keep the variant
+    choice here in lockstep with that.
     """
-    minor = link.peer_protocol_minor or 0
-    if minor >= 1:
+    if files_variant_for_link(link) == "files":
         await link.send_clip("files", data)
         return ("files", len(data))
     first_name, first_raw = data[0]
@@ -2537,20 +2673,25 @@ async def run(config: Config) -> None:
             if not suppressor.should_send("text", sha256_hex(data)):
                 log.debug("skip echo of just-received text")
                 return
-            await manager.broadcast_clip("text", data)
-            log.info(f"-> sent text {len(data)} chars to {manager.active_count()} peer(s)")
-            if notify_enabled:
-                await notify_async(title="AnyClip →", message=preview(data))
+            sent, skipped = await manager.broadcast_clip("text", data)
+            if sent:
+                log.info(f"-> sent text {len(data)} chars to {sent} peer(s)")
+                if notify_enabled:
+                    await notify_async(title="AnyClip →", message=preview(data))
+            await notify_size_skips(skipped)
         elif kind == "image":
             assert isinstance(data, (bytes, bytearray))
             png = bytes(data)
             if not suppressor.should_send("image", sha256_bytes(png)):
                 log.debug("skip echo of just-received image")
                 return
-            await manager.broadcast_clip("image", png)
-            log.info(f"-> sent image {len(png)} bytes to {manager.active_count()} peer(s)")
-            if notify_enabled:
-                await notify_async(title="AnyClip →", message=f"image ({len(png)//1024} KB)")
+            sent, skipped = await manager.broadcast_clip("image", png)
+            if sent:
+                log.info(f"-> sent image {len(png)} bytes to {sent} peer(s)")
+                if notify_enabled:
+                    await notify_async(
+                        title="AnyClip →", message=f"image ({len(png)//1024} KB)")
+            await notify_size_skips(skipped)
         elif kind == "file":
             assert isinstance(data, tuple) and len(data) == 2
             name, raw = data
@@ -2558,12 +2699,16 @@ async def run(config: Config) -> None:
             if not suppressor.should_send("file", sha256_bytes(raw_b)):
                 log.debug("skip echo of just-received file")
                 return
-            await manager.broadcast_clip("file", (name, raw_b))
-            log.info(f"-> sent file {name!r} {len(raw_b)} bytes to {manager.active_count()} peer(s)")
-            if notify_enabled:
-                await notify_async(
-                    title="AnyClip →", message=f"file: {name} ({len(raw_b)//1024} KB)",
-                )
+            sent, skipped = await manager.broadcast_clip("file", (name, raw_b))
+            if sent:
+                log.info(
+                    f"-> sent file {name!r} {len(raw_b)} bytes to {sent} peer(s)")
+                if notify_enabled:
+                    await notify_async(
+                        title="AnyClip →",
+                        message=f"file: {name} ({len(raw_b)//1024} KB)",
+                    )
+            await notify_size_skips(skipped)
         elif kind == "files":
             assert isinstance(data, list)
             # Global echo check once; per-link minor gating inside the loop.
@@ -2572,16 +2717,17 @@ async def run(config: Config) -> None:
             if not suppressor.should_send("files", aggregate):
                 log.debug("skip echo of just-received files")
                 return
-            sent_full, sent_fallback, max_dropped = await manager.broadcast_files(data)
-            total = sent_full + sent_fallback
-            if total == 0:
-                return
-            log.info(
-                f"-> sent files to {total} peer(s) "
-                f"({sent_full} full, {sent_fallback} first-file fallback)"
+            sent_full, sent_fallback, max_dropped, skipped = (
+                await manager.broadcast_files(data)
             )
-            if notify_enabled:
-                await notify_async(title="AnyClip →", message=f"{len(data)} files")
+            total = sent_full + sent_fallback
+            if total:
+                log.info(
+                    f"-> sent files to {total} peer(s) "
+                    f"({sent_full} full, {sent_fallback} first-file fallback)"
+                )
+                if notify_enabled:
+                    await notify_async(title="AnyClip →", message=f"{len(data)} files")
             # One aggregated skip toast across ALL peers that could only take
             # the first file (protocol_minor 0). Same principle as the
             # folder-skip aggregation in d8894a0.
@@ -2590,6 +2736,14 @@ async def run(config: Config) -> None:
                     f"{max_dropped} file(s) not sent to {sent_fallback} peer(s) — "
                     "they need an update for multi-file sync"
                 )
+            await notify_size_skips(skipped)
+
+    async def notify_size_skips(names: list) -> None:
+        """At most ONE toast per clip for peers whose 16 MiB receive cap the
+        frame would have breached (protocol < 1.2)."""
+        message = size_skip_message(names)
+        if message is not None:
+            await on_file_skipped(message)
 
     async def on_file_skipped(message: str) -> None:
         if notify_enabled:
