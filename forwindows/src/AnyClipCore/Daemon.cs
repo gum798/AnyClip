@@ -177,7 +177,14 @@ public sealed class Daemon(
             if (result.OldPeerDrops > 0)
                 _ = clipboard.OnFileSkipped?.Invoke(
                     $"{result.OldPeerDrops} file(s) not synced — update the peer's AnyClip for multi-file sync");
-            string peers = string.Join(", ", manager.LinkedPeerNames);
+            // Name ONLY the peers that actually took this clip — never the whole
+            // link table. The per-link size gate above can skip an active link,
+            // and naming it here would both contradict the skip toast just
+            // emitted ("clip not sent to old-pc") and put a peer that received
+            // nothing into the `-> sent ...` log line. Ordinal-sorted for a
+            // stable title. Parity with Swift (result.delivered.map { $0.peerName }).
+            string peers = string.Join(", ",
+                result.Delivered.OrderBy(n => n, StringComparer.Ordinal));
             if (string.IsNullOrEmpty(peers)) peers = "peer";
             switch (payload)
             {

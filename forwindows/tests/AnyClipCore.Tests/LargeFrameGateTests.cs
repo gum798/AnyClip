@@ -10,8 +10,55 @@ namespace AnyClip.Core.Tests;
 /// encode the payload variant chosen for that link once, and skip (never drop)
 /// any link whose peer minor is < 2 when that frame exceeds Wire.LegacyMaxPayload.
 /// Mirrors tests/test_large_frames.py and LargeFrameGateTests.swift.
-public class LargeFrameGateTests
+///
+/// The exact gate log line is contract-pinned, so these tests need to read what
+/// the manager wrote — and the manager logs through the process-wide
+/// RotatingLog.Shared, like the live app. GateLog is the save/restore seam for
+/// that global: it swaps in a throwaway file for the lifetime of this class and
+/// puts the previous logger back afterwards.
+public sealed class GateLog : IDisposable
 {
+    private readonly string _dir;
+    private readonly RotatingLog _previous;
+    public string Path { get; }
+
+    public GateLog()
+    {
+        _dir = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "anyclip-gatelog-" + Guid.NewGuid());
+        Directory.CreateDirectory(_dir);
+        Path = System.IO.Path.Combine(_dir, "anyclip.log");
+        _previous = RotatingLog.Shared;
+        // maxBytes large enough that rotation can never roll an asserted line
+        // out of the file, however chatty the rest of the suite gets.
+        RotatingLog.Shared = new RotatingLog(Path, maxBytes: int.MaxValue);
+    }
+
+    /// FileShare.ReadWrite: RotatingLog keeps appending while we read.
+    public string Text()
+    {
+        if (!File.Exists(Path)) return "";
+        using var fs = new FileStream(Path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var r = new StreamReader(fs);
+        return r.ReadToEnd();
+    }
+
+    public void Dispose()
+    {
+        RotatingLog.Shared = _previous;
+        try { Directory.Delete(_dir, recursive: true); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+}
+
+public class LargeFrameGateTests(GateLog log) : IClassFixture<GateLog>
+{
+    // Every test in the class reads the SAME log file (xUnit runs a class's
+    // tests serially but shares one fixture), so peer names are distinct per
+    // test to keep the "contains" assertions unambiguous.
+    private readonly GateLog _log = log;
+
     private static LinkManager MakeManager(string token, int port, string name)
     {
         var m = new LinkManager(
@@ -64,32 +111,6 @@ public class LargeFrameGateTests
         return (result, got);
     }
 
-    // Point the shared logger at ONE throwaway file so the gate's exact log line
-    // can be asserted (the manager logs through RotatingLog.Shared, like the live
-    // app). Initialized exactly once for the whole class, so parallel tests
-    // cannot re-point the shared logger out from under each other mid-run —
-    // hence the distinct peer names below, since every test reads the same file.
-    private static readonly string GateLogPath = InitSharedLog();
-
-    private static string InitSharedLog()
-    {
-        var dir = Path.Combine(Path.GetTempPath(), "anyclip-gatelog-" + Guid.NewGuid());
-        Directory.CreateDirectory(dir);
-        var path = Path.Combine(dir, "anyclip.log");
-        RotatingLog.Shared = new RotatingLog(path);
-        return path;
-    }
-
-    /// FileShare.ReadWrite: RotatingLog keeps appending while we read.
-    private static string SharedLogText()
-    {
-        if (!File.Exists(GateLogPath)) return "";
-        using var fs = new FileStream(GateLogPath, FileMode.Open, FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete);
-        using var r = new StreamReader(fs);
-        return r.ReadToEnd();
-    }
-
     /// A text payload whose encoded frame is guaranteed to exceed the legacy cap.
     private static string OverLegacyCapText() =>
         new('x', Wire.LegacyMaxPayload + 1024);
@@ -108,7 +129,6 @@ public class LargeFrameGateTests
     [Fact]
     public async Task OversizeTextReachesOnlyTheProtocol12Peer()
     {
-        _ = GateLogPath;
         var m = MakeManager("tok", 28741, "a");
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         var serve = m.ServeAsync(cts.Token);
@@ -123,11 +143,14 @@ public class LargeFrameGateTests
             modern, () => m.BroadcastAsync(new TextClip(big)), cts.Token);
 
         Assert.Equal(1, result.Sent);
+        // Delivered names ONLY the peer that took the clip — the caller uses it
+        // for the "-> sent" log/toast, which must not name a gate-skipped peer.
+        Assert.Equal(new[] { "new-text" }, result.Delivered);
         Assert.Equal(new[] { "old-text" }, result.SizeSkipped);
         // Exact log line — the wording is part of the cross-implementation contract.
         Assert.Contains(
             "clip too large for 'old-text' (peer protocol < 1.2); skipping",
-            SharedLogText());
+            _log.Text());
         // The skipped link is NOT dropped and NOT closed.
         Assert.Equal(2, m.ActiveLinkCount);
         // The 1.2 peer really receives the over-legacy-cap frame.
@@ -151,6 +174,7 @@ public class LargeFrameGateTests
 
         var result = await m.BroadcastAsync(new TextClip(OverLegacyCapText()));
         Assert.Equal(0, result.Sent);
+        Assert.Empty(result.Delivered);
         Assert.Equal(new[] { "ancient" }, result.SizeSkipped);
         Assert.Equal(1, m.ActiveLinkCount);   // link kept
 
@@ -172,6 +196,8 @@ public class LargeFrameGateTests
 
         var result = await m.BroadcastAsync(new TextClip("hello"));
         Assert.Equal(2, result.Sent);
+        Assert.Equal(new[] { "new-small", "old-small" },
+            result.Delivered.OrderBy(n => n, StringComparer.Ordinal));
         Assert.Empty(result.SizeSkipped);
 
         cts.Cancel(); m.Shutdown();
@@ -203,13 +229,16 @@ public class LargeFrameGateTests
         try { await serve; } catch (OperationCanceledException) { }
     }
 
-    // ---- encode-once per broadcast --------------------------------------
+    // ---- one frame per variant per broadcast ----------------------------
 
-    // A single encode per payload variant means a single `ts` for the whole
-    // fan-out; the pre-fix code built one WireMessage (and one clock read) PER
-    // LINK, so two peers could never be guaranteed the identical timestamp.
+    // NECESSARY-but-not-sufficient proxy for the encode-once rule: every link
+    // taking the same variant must see byte-identical frame content. The pre-fix
+    // code built one WireMessage (and one clock read) PER LINK, so its `ts`
+    // values differed and this fails; a hypothetical double encode off the ONE
+    // hoisted `ts` would still pass. Proving the encode count itself would need
+    // production instrumentation, which is not worth a counter on the hot path.
     [Fact]
-    public async Task OnePayloadVariantIsEncodedOncePerBroadcast()
+    public async Task EveryLinkGetsTheSameFrameContentForOneVariant()
     {
         var m = MakeManager("tok", 28745, "a");
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
@@ -240,7 +269,6 @@ public class LargeFrameGateTests
     [Fact]
     public async Task FirstFileFallbackVariantIsGatedForAMinorZeroPeer()
     {
-        _ = GateLogPath;
         var m = MakeManager("tok", 28746, "a");
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         var serve = m.ServeAsync(cts.Token);
@@ -260,7 +288,7 @@ public class LargeFrameGateTests
         Assert.Equal(2, m.ActiveLinkCount);
         Assert.Contains(
             "clip too large for 'old-files' (peer protocol < 1.2); skipping",
-            SharedLogText());
+            _log.Text());
         Assert.Equal("files", got!.Kind);
         Assert.Equal(2, got.Files!.Count);
 
@@ -314,6 +342,13 @@ public class LargeFrameGateTests
         Assert.Equal(2, result.Sent);
         Assert.Empty(result.SizeSkipped);
         Assert.Equal(2, result.OldPeerDrops);   // the minor-0 peer took only the first file
+
+        // C#-only downgrade breadcrumb. Past tense and logged AFTER the send,
+        // because the size gate can skip the link and "sending" would then be a
+        // lie. Python/Swift have no counterpart line; pinning the shape here so
+        // the wording is not changed again silently.
+        Assert.Contains(
+            "peer old-3 protocol minor 0 < 1: sent 1 of 3 files", _log.Text());
 
         var gOld = await old.ReceiveMessageAsync(cts.Token);
         Assert.Equal("file", gOld!.Kind);

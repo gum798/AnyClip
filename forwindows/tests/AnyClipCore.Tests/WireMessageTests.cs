@@ -78,8 +78,8 @@ public class WireMessageTests
         // NTFS permits unpaired UTF-16 surrogates in filenames, so a name read
         // from the clipboard file-drop can be ill-formed. NFC normalization
         // must NOT throw (String.Normalize throws ArgumentException on invalid
-        // Unicode) — that would let SendClipAsync's catch silently drop the
-        // file. Fall back to the raw name instead of crashing.
+        // Unicode) — that would take the whole broadcast down while building the
+        // frame. Fall back to the raw name instead of crashing.
         var lone = "bad\uD800name.txt"; // unpaired high surrogate
         var ex = Record.Exception(() => WireMessage.ClipFile(lone, new byte[] { 1 }, 0));
         Assert.Null(ex);

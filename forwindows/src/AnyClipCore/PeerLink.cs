@@ -145,26 +145,17 @@ public sealed class PeerLink
         }
     }
 
-    /// Per-link send of one clip. Returns false and DROPS the link on a hard
-    /// send error (disposing the connection wakes the receive loop -> session
-    /// tears down -> LinkManager removes it), so a broadcast failure isolates to
-    /// this link. A payload over the 64 MiB cap is dropped but the link is kept
-    /// — as is a frame the per-link legacy gate skips (LinkManager.BroadcastAsync,
-    /// which never reaches this method for a gated link).
-    public async Task<bool> SendClipAsync(ClipPayload payload)
-    {
-        if (!_alive) return false;
-        EncodedFrame frame;
-        try { frame = WireMessage.Clip(payload, UnixNow()).Encode(); }
-        catch (PayloadTooLargeException e)
-        { RotatingLog.Shared.Warning($"payload too large, dropping: {e.Message}"); return true; }
-        return await SendEncodedAsync(frame);
-    }
-
-    /// Send an ALREADY-encoded frame on THIS link. The mesh broadcast encodes
-    /// each payload variant once and reuses the bytes for the per-link legacy
-    /// size gate and every send of that variant. Same failure contract as
-    /// SendClipAsync: false only when the link looks down.
+    /// Per-link send of one ALREADY-encoded frame — the only clip-send path.
+    /// The mesh broadcast encodes each payload variant once (guarding the 64 MiB
+    /// cap) and reuses the bytes for the per-link legacy size gate and every
+    /// send of that variant, so an N-peer fan-out never re-encodes a clip.
+    ///
+    /// Returns false when the link looks down: either it was already unlinked,
+    /// or a hard send error DROPPED it (disposing the connection wakes the
+    /// receive loop -> session tears down -> LinkManager removes it), so a
+    /// broadcast failure isolates to this link. A frame the per-link legacy gate
+    /// skips never reaches here at all — LinkManager.BroadcastAsync keeps that
+    /// link up and records the peer for the aggregated skip toast.
     public async Task<bool> SendEncodedAsync(EncodedFrame frame)
     {
         if (!_alive) return false;

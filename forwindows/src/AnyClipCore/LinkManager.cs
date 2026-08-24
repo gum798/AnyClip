@@ -26,15 +26,22 @@ public sealed class LinkManager
 {
     public const int DefaultMaxPeers = 8;
 
-    /// Per-copy broadcast result: how many links took the (possibly downgraded)
-    /// clip, the largest old-peer file-drop count for the aggregated fallback
-    /// toast, and the peers the legacy size gate skipped for the aggregated size
-    /// toast. Peers in SizeSkipped keep their links; the caller emits ONE toast.
+    /// Per-copy broadcast result: the names of the peers that actually TOOK the
+    /// (possibly downgraded) clip, the largest old-peer file-drop count for the
+    /// aggregated fallback toast, and the peers the legacy size gate skipped for
+    /// the aggregated size toast. Peers in SizeSkipped keep their links; the
+    /// caller emits ONE toast.
+    ///
+    /// Delivered — not the manager's full link table — is what the caller must
+    /// name in the "-&gt; sent ... to X" log line and the "AnyClip → X" toast: the
+    /// per-link size gate means an active link can deliberately receive nothing,
+    /// and naming it would contradict the skip toast fired for the same clip.
+    /// Parity with Swift BroadcastResult.delivered.
     public readonly record struct BroadcastResult(
-        int Sent, int OldPeerDrops, IReadOnlyList<string> SizeSkipped)
+        IReadOnlyList<string> Delivered, int OldPeerDrops, IReadOnlyList<string> SizeSkipped)
     {
-        public BroadcastResult(int sent, int oldPeerDrops)
-            : this(sent, oldPeerDrops, Array.Empty<string>()) { }
+        /// How many links took the clip.
+        public int Sent => Delivered.Count;
     }
 
     private static double UnixNow() =>
@@ -79,17 +86,10 @@ public sealed class LinkManager
     public int ActiveLinkCount { get { lock (_lock) return _links.Count; } }
     public bool AtCap { get { lock (_lock) return _links.Count >= _maxPeers; } }
 
-    /// Linked peer display names, ordinal-sorted — for the "sent" toast target
-    /// and the tray status line.
-    public IReadOnlyList<string> LinkedPeerNames
-    {
-        get
-        {
-            lock (_lock)
-                return _links.Values.Select(l => l.PeerName)
-                    .OrderBy(n => n, StringComparer.Ordinal).ToList();
-        }
-    }
+    // No LinkedPeerNames accessor: the "sent" log/toast must name only the peers
+    // a clip was actually DELIVERED to (BroadcastResult.Delivered) — the
+    // per-link size gate can leave an active link with nothing — and the tray
+    // tracks names off the LinkUp/LinkDown events instead.
 
     /// True if any active link's remote IP is `host`. On a LAN a peer == one IP,
     /// so the reconnect loop uses this to avoid dialing a peer we already mesh
@@ -372,7 +372,9 @@ public sealed class LinkManager
     ///    name lands in SizeSkipped for one aggregated toast.
     ///
     /// Both aggregates (OldPeerDrops, SizeSkipped) are per-copy so the caller
-    /// emits at most ONE toast of each kind across all peers.
+    /// emits at most ONE toast of each kind across all peers. Delivered carries
+    /// the peers that actually took the clip, so the caller never names a
+    /// gate-skipped peer in the "sent" log/toast.
     ///
     /// Each distinct payload variant is encoded at most ONCE per broadcast (and
     /// shares one timestamp): the same bytes back the size gate and every send of
@@ -381,7 +383,8 @@ public sealed class LinkManager
     {
         List<PeerLink> targets;
         lock (_lock) targets = _links.Values.ToList();
-        int sent = 0, oldPeerDrops = 0;
+        int oldPeerDrops = 0;
+        var delivered = new List<string>();
         var sizeSkipped = new List<string>();
         double ts = UnixNow();
         // Variant kind ("text"/"image"/"file"/"files") -> its encoded frame, or
@@ -424,9 +427,9 @@ public sealed class LinkManager
             // Only a DELIVERED downgrade counts toward the fallback toast: a
             // gated or failed link received nothing to leave files behind on.
             oldPeerDrops = Math.Max(oldPeerDrops, dropped);
-            sent++;
+            delivered.Add(link.PeerName);
         }
-        return new BroadcastResult(sent, oldPeerDrops, sizeSkipped);
+        return new BroadcastResult(delivered, oldPeerDrops, sizeSkipped);
     }
 
     public void Shutdown()

@@ -278,6 +278,82 @@ public class DaemonTests
     }
 
     [Fact]
+    public async Task SentToastNamesOnlyTheDeliveredPeersNotSizeSkippedOnes()
+    {
+        // Mixed-version mesh + an over-legacy-cap copy: the pre-1.2 peer is
+        // size-skipped (its link stays UP), the 1.2 peer gets the clip. Naming
+        // the whole link table here produced two contradictory notifications for
+        // one copy — "clip not sent to old-mix" immediately followed by
+        // "AnyClip → new-mix, old-mix" — and a `-> sent ... to new-mix, old-mix`
+        // log line naming a peer that received nothing.
+        var stateDir = Path.Combine(Path.GetTempPath(), "anyclip-mixed-" + Guid.NewGuid());
+        var clip = new FakeClipboard();
+        var notes = new List<(string Title, string Body)>();
+        var daemon = new Daemon(
+            new DaemonConfig("mix-token", 28628, "mix", NotificationsEnabled: true),
+            appVersion: "0.0.0-test", stateDir: stateDir,
+            clipboard: clip, mdns: new FakeMdns(), pidLock: new FakePidLock(),
+            primaryIPv4: () => "127.0.0.1",
+            notify: (t, b) => { lock (notes) notes.Add((t, b)); }, onFatal: _ => { });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        var run = daemon.RunForeverAsync(cts.Token);
+
+        async Task<FramedConnection> Connect(string node, string name, int minor)
+        {
+            var raw = await ConnectWithRetry(28628, cts.Token);
+            await raw.SendFrameAsync(WireMessage.Hello(
+                Hashing.Sha256Hex("mix-token"), node, name, "1.0.0")
+                with { ProtocolMinor = minor }, cts.Token);
+            _ = await raw.ReceiveMessageAsync(cts.Token); // daemon hello
+            return raw;
+        }
+        using var oldPeer = await Connect("ffffffff-old", "old-mix", 1);
+        using var newPeer = await Connect("00000000-new", "new-mix", 2);
+
+        int linked = 0;
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline && linked < 2)
+        {
+            while (daemon.Events.TryRead(out var ev)) if (ev is LinkUp) linked++;
+            if (linked < 2) await Task.Delay(50);
+        }
+        Assert.Equal(2, linked);
+        Assert.NotNull(clip.OnLocalChange);
+
+        // The 1.2 peer must drain concurrently: an over-legacy-cap frame dwarfs
+        // the loopback socket buffer, so a peer reading only afterwards would
+        // park the send for its whole (size-scaled) budget.
+        var reader = Task.Run<WireMessage?>(async () =>
+        {
+            try { return await newPeer.ReceiveMessageAsync(cts.Token); }
+            catch { return null; }
+        }, cts.Token);
+        await clip.OnLocalChange!(new TextClip(new string('x', Wire.LegacyMaxPayload + 1024)));
+        Assert.Equal("text", (await reader)!.Kind);
+
+        async Task<bool> WaitUntil(Func<bool> cond, double seconds = 5)
+        {
+            var stop = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < stop) { if (cond()) return true; await Task.Delay(50); }
+            return cond();
+        }
+        Assert.True(await WaitUntil(() =>
+        { lock (notes) return notes.Any(n => n.Title.StartsWith("AnyClip →")); }));
+        lock (notes)
+        {
+            var sentToast = notes.Single(n => n.Title.StartsWith("AnyClip →"));
+            Assert.Equal("AnyClip → new-mix", sentToast.Title);   // NOT "new-mix, old-mix"
+            // ...and the skip toast for the same copy names the peer that missed it.
+            Assert.Contains(notes, n =>
+                n.Body == "clip not sent to old-mix (too large for its AnyClip version)");
+        }
+
+        cts.Cancel();
+        try { await run; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
     public void ClearDirectoryFilesKeepsSubdirs()
     {
         var dir = Path.Combine(Path.GetTempPath(), "anyclip-clear-" + Guid.NewGuid());

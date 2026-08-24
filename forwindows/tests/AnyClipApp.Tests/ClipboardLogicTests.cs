@@ -118,10 +118,13 @@ public class ClipboardLogicTests
         var dir = TempDir();
         var (w, clip, changes, skipped) = Make(dir);
         var file = Path.Combine(TempDir(), "big.bin");
-        // One byte past the greedy budget (never read: the size check comes
-        // first). Sized off the constant so the boundary tracks the frame cap —
-        // a hardcoded 12 MiB was over the old ~11.65 MB budget but fits the
-        // ~49.4 MB one the 64 MiB cap yields.
+        // One byte past the greedy budget. Sized off the constant so the
+        // boundary tracks the frame cap — a hardcoded 12 MiB was over the old
+        // ~11.65 MB budget but fits the ~49.4 MB one the 64 MiB cap yields.
+        // The bytes are never READ (ClipboardWatcher stats FileInfo.Length and
+        // skips before ReadAllBytesAsync), but SetLength does not make the file
+        // sparse on NTFS without FSCTL_SET_SPARSE, so this really does allocate
+        // ~47 MB of temp disk for the duration of the test.
         using (var fs = File.Create(file)) fs.SetLength((long)ClipboardWatcher.FileBudget + 1);
         clip.FilePaths = new List<string> { file };
         await w.HandleClipboardUpdateAsync();

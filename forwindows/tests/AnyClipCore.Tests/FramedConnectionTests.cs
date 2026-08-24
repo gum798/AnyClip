@@ -87,6 +87,33 @@ public class FramedConnectionTests
         Assert.True(stream.Disposed, "wedged stream must be disposed to force reconnect");
     }
 
+    [Fact]
+    public async Task SendBudgetScalesWithTheFrameNotJustTheBase()
+    {
+        // End-to-end guard for the size-scaled budget: SendFrameAsync must wait
+        // Wire.SendTimeoutFor(bodyBytes, base), not a flat `SendTimeout`. With a
+        // 50 ms base and a ~3 MiB body the budget is ~3.05 s, so a parked write
+        // is still in flight 500 ms in. A regression that passed the BASE into
+        // WaitAsync would have thrown SendTimeoutException at 50 ms and torn a
+        // healthy 64 MiB transfer's link down in the field.
+        using var stream = new HangingStream();
+        using var conn = new FramedConnection(stream)
+        {
+            SendTimeout = TimeSpan.FromMilliseconds(50),
+        };
+        var frame = WireMessage.ClipText(new string('x', 3 * 1024 * 1024), 0).Encode();
+        Assert.True(Wire.SendTimeoutFor(frame.BodyCount, 0.05) > 3.0);
+
+        var send = conn.SendFrameAsync(frame, CancellationToken.None);
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        Assert.False(send.IsCompleted,
+            "send must still be within its size-scaled budget, not cut off at the base");
+        Assert.False(stream.Disposed);
+
+        stream.Dispose();  // unblock the parked write so the test does not hang
+        await Assert.ThrowsAnyAsync<Exception>(() => send);
+    }
+
     /// Stream whose WriteAsync parks (full TCP buffer / half-open peer) until
     /// the stream is disposed — then the parked write faults.
     private sealed class HangingStream : Stream
