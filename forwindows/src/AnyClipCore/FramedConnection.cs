@@ -20,6 +20,19 @@ public sealed class FramedConnection : IDisposable
     internal TimeSpan SendTimeout { get; set; } =
         TimeSpan.FromSeconds(Wire.SendTimeoutSeconds);
 
+    /// Serializes whole frames onto the stream. The clip fan-out, the 30 s
+    /// ping loop, and pong replies all send on this connection concurrently,
+    /// and NetworkStream gives concurrent writers NO ordering guarantee: two
+    /// in-flight WriteAsyncs can interleave bytes and corrupt the framing —
+    /// with 64 MiB frames, a clip send occupies the socket long enough that a
+    /// ping reliably lands mid-frame. Python is immune (whole frames appended
+    /// to one StreamWriter buffer) and so is Swift (NWConnection queues sends
+    /// in order); here a frame waits its turn, so a ping queues behind a big
+    /// clip send — the same semantics as the other ports. Not disposed: a
+    /// plain SemaphoreSlim holds no OS handle, and waiters may still race in
+    /// after Dispose().
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+
     public FramedConnection(Socket socket)
     {
         _socket = socket;
@@ -79,31 +92,44 @@ public sealed class FramedConnection : IDisposable
     /// N-peer fan-out never re-encodes (or re-measures) the same clip.
     public async Task SendFrameAsync(EncodedFrame frame, CancellationToken ct)
     {
-        var write = _stream.WriteAsync(frame.Bytes, ct).AsTask();
-        // The budget SCALES with the frame (1 MiB/s floor on top of the base):
-        // a flat 10 s could not carry a 64 MiB frame over a slow LAN, and a
-        // timeout tears the link down. `SendTimeout` stays the base so tests can
-        // still shrink it.
-        var budget = TimeSpan.FromSeconds(
-            Wire.SendTimeoutFor(frame.BodyCount, SendTimeout.TotalSeconds));
+        // The lock wait is deliberately OUTSIDE the timed budget: a frame's
+        // budget covers ITS bytes, not the (already-bounded) frame ahead of it.
+        // The queue can't pile up unboundedly — a wedged predecessor hits its
+        // own budget, Disposes the connection, and every queued sender then
+        // fails fast on the dead stream.
+        await _sendLock.WaitAsync(ct);
         try
         {
-            await write.WaitAsync(budget, ct);
+            var write = _stream.WriteAsync(frame.Bytes, ct).AsTask();
+            // The budget SCALES with the frame (1 MiB/s floor on top of the base):
+            // a flat 10 s could not carry a 64 MiB frame over a slow LAN, and a
+            // timeout tears the link down. `SendTimeout` stays the base so tests can
+            // still shrink it.
+            var budget = TimeSpan.FromSeconds(
+                Wire.SendTimeoutFor(frame.BodyCount, SendTimeout.TotalSeconds));
+            try
+            {
+                await write.WaitAsync(budget, ct);
+            }
+            catch (TimeoutException)
+            {
+                // The write parked past the budget -- half-open/wedged socket, or a
+                // lost send completion. Abort the connection so the next recv throws
+                // and the reconnect loop runs; never let a stuck send freeze the
+                // caller's loop (clipboard poll loop / heartbeat self-heal).
+                RotatingLog.Shared.Info(
+                    "send timed out (link wedged); dropping link to force reconnect");
+                Dispose();
+                // Observe the abandoned write's eventual fault so it doesn't surface
+                // as an UnobservedTaskException.
+                _ = write.ContinueWith(static t => { _ = t.Exception; },
+                    TaskScheduler.Default);
+                throw new SendTimeoutException();
+            }
         }
-        catch (TimeoutException)
+        finally
         {
-            // The write parked past the budget -- half-open/wedged socket, or a
-            // lost send completion. Abort the connection so the next recv throws
-            // and the reconnect loop runs; never let a stuck send freeze the
-            // caller's loop (clipboard poll loop / heartbeat self-heal).
-            RotatingLog.Shared.Info(
-                "send timed out (link wedged); dropping link to force reconnect");
-            Dispose();
-            // Observe the abandoned write's eventual fault so it doesn't surface
-            // as an UnobservedTaskException.
-            _ = write.ContinueWith(static t => { _ = t.Exception; },
-                TaskScheduler.Default);
-            throw new SendTimeoutException();
+            _sendLock.Release();
         }
     }
 

@@ -166,4 +166,85 @@ public class FramedConnectionTests
             // Expected path: timeout/unreachable throws.
         }
     }
+
+    /// The clip fan-out, the 30 s ping loop, and pong replies all send on the
+    /// SAME connection concurrently, and NetworkStream gives concurrent
+    /// writers no ordering guarantee — with 64 MiB frames a clip send occupies
+    /// the socket long enough that a ping reliably lands mid-frame. Frames
+    /// must come out whole, in some order. The stream below splits every
+    /// write in half around an await, so unserialized senders interleave.
+    [Fact]
+    public async Task ConcurrentSendsNeverInterleaveFrames()
+    {
+        var sink = new HalfYieldingStream();
+        using var conn = new FramedConnection(sink);
+        var frames = Enumerable.Range(0, 16)
+            .Select(i => WireMessage.ClipText(
+                $"frame-{i}-{new string('x', 2048)}", 1.0).Encode())
+            .ToArray();
+
+        await Task.WhenAll(frames.Select(
+            f => conn.SendFrameAsync(f, CancellationToken.None)));
+
+        // Walk the sink byte-for-byte: every frame must parse back whole.
+        var data = sink.Written;
+        int pos = 0, parsed = 0;
+        while (pos < data.Length)
+        {
+            Assert.True(pos + 4 <= data.Length,
+                "truncated header — frames interleaved");
+            int n = WireMessage.FrameLength(data[pos..(pos + 4)]);
+            Assert.True(n > 0 && pos + 4 + n <= data.Length,
+                $"corrupt frame length {n} at offset {pos} — frames interleaved");
+            var msg = WireMessage.DecodeBody(data[(pos + 4)..(pos + 4 + n)]);
+            Assert.NotNull(msg);
+            Assert.StartsWith("frame-", msg!.Content);
+            parsed++;
+            pos += 4 + n;
+        }
+        Assert.Equal(frames.Length, parsed);
+    }
+
+    /// Write-only stream that appends each write in two halves with an await
+    /// in between — a deterministic stand-in for the partial writes a real
+    /// socket produces under concurrent senders.
+    private sealed class HalfYieldingStream : Stream
+    {
+        private readonly MemoryStream _sink = new();
+        public byte[] Written { get { lock (_sink) return _sink.ToArray(); } }
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            int half = buffer.Length / 2;
+            Append(buffer[..half]);
+            await Task.Yield();
+            Append(buffer[half..]);
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+            => Append(buffer.AsMemory(offset, count));
+
+        private void Append(ReadOnlyMemory<byte> part)
+        {
+            lock (_sink) _sink.Write(part.Span);
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count)
+            => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin)
+            => throw new NotSupportedException();
+        public override void SetLength(long value)
+            => throw new NotSupportedException();
+    }
 }
