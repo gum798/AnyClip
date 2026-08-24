@@ -97,6 +97,11 @@ public sealed class ClipboardWatcher : IClipboardSync
 {
     public const double ImageCooldownSeconds = 1.0;
     public const int ReadFailWarnAt = 5; // READ_FAIL_WARN_AT in anyclip.py
+    /// Greedy send budget, applied to the SUM of raw file sizes in one clip.
+    /// Reserves ~256 KB for the JSON envelope and the b64 1.34x inflation.
+    /// Formula unchanged since the 16 MiB days; against the 64 MiB cap it lands
+    /// at 49,466,572 (was ~12,221,153).
+    /// Mirrors Python: FILE_BUDGET = int((MAX_PAYLOAD - 256*1024) * 0.74)
     public static readonly int FileBudget =
         (int)((Wire.MaxPayload - 256 * 1024) * 0.74);
     public const int MaxFilesPerClip = 100; // sender-side cap; receiver stays lenient

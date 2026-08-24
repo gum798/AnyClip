@@ -106,15 +106,27 @@ public class ClipboardLogicTests
     }
 
     [Fact]
+    public void FileBudgetKeepsItsFormulaAgainstTheNewCap()
+    {
+        Assert.Equal((int)((Wire.MaxPayload - 256 * 1024) * 0.74), ClipboardWatcher.FileBudget);
+        Assert.Equal(49466572, ClipboardWatcher.FileBudget); // in lockstep with Python
+    }
+
+    [Fact]
     public async Task OversizedFileSkipped()
     {
         var dir = TempDir();
-        var (w, clip, changes, _) = Make(dir);
+        var (w, clip, changes, skipped) = Make(dir);
         var file = Path.Combine(TempDir(), "big.bin");
-        using (var fs = File.Create(file)) fs.SetLength(12L * 1024 * 1024);
+        // One byte past the greedy budget (never read: the size check comes
+        // first). Sized off the constant so the boundary tracks the frame cap —
+        // a hardcoded 12 MiB was over the old ~11.65 MB budget but fits the
+        // ~49.4 MB one the 64 MiB cap yields.
+        using (var fs = File.Create(file)) fs.SetLength((long)ClipboardWatcher.FileBudget + 1);
         clip.FilePaths = new List<string> { file };
         await w.HandleClipboardUpdateAsync();
         Assert.Empty(changes);
+        Assert.Contains(skipped, s => s.Contains("1 file(s) skipped"));
     }
 
     [Fact]
