@@ -219,6 +219,65 @@ public class DaemonTests
     }
 
     [Fact]
+    public async Task SizeSkipToastFiresOncePerClipEvenWhenNothingWasSent()
+    {
+        // A clip over the legacy 16 MiB cap is skipped on every pre-1.2 link, so
+        // NOTHING is sent — the aggregated size toast must still fire (exactly
+        // once), which an early "nothing sent, bail out" return would swallow.
+        var stateDir = Path.Combine(Path.GetTempPath(), "anyclip-sizeskip-" + Guid.NewGuid());
+        var clip = new FakeClipboard();
+        var notes = new List<string>();
+        var daemon = new Daemon(
+            new DaemonConfig("size-token", 28627, "size", NotificationsEnabled: true),
+            appVersion: "0.0.0-test", stateDir: stateDir,
+            clipboard: clip, mdns: new FakeMdns(), pidLock: new FakePidLock(),
+            primaryIPv4: () => "127.0.0.1",
+            notify: (_, body) => { lock (notes) notes.Add(body); }, onFatal: _ => { });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var run = daemon.RunForeverAsync(cts.Token);
+
+        using var raw = await ConnectWithRetry(28627, cts.Token);
+        await raw.SendFrameAsync(WireMessage.Hello(
+            Hashing.Sha256Hex("size-token"), "ffffffff-old", "old-peer", "1.0.0")
+            with { ProtocolMinor = 0 }, cts.Token);
+        _ = await raw.ReceiveMessageAsync(cts.Token); // daemon hello
+
+        async Task<bool> WaitLinkUp(double seconds = 12)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < deadline)
+            {
+                while (daemon.Events.TryRead(out var ev)) if (ev is LinkUp) return true;
+                await Task.Delay(50);
+            }
+            return false;
+        }
+        Assert.True(await WaitLinkUp());
+        Assert.NotNull(clip.OnLocalChange);
+
+        await clip.OnLocalChange!(new TextClip(new string('x', Wire.LegacyMaxPayload + 1024)));
+
+        async Task<bool> WaitUntil(Func<bool> cond, double seconds = 5)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < deadline) { if (cond()) return true; await Task.Delay(50); }
+            return cond();
+        }
+        Assert.True(await WaitUntil(() =>
+        { lock (notes) return notes.Any(n => n.Contains("clip not sent to")); }));
+        lock (notes)
+        {
+            Assert.Equal(1, notes.Count(n => n.Contains("clip not sent to")));
+            Assert.Contains(
+                "clip not sent to old-peer (too large for its AnyClip version)", notes);
+        }
+
+        cts.Cancel();
+        try { await run; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
     public void ClearDirectoryFilesKeepsSubdirs()
     {
         var dir = Path.Combine(Path.GetTempPath(), "anyclip-clear-" + Guid.NewGuid());

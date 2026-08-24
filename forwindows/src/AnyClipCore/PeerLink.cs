@@ -145,20 +145,34 @@ public sealed class PeerLink
         }
     }
 
-    /// Per-link send. Returns false and DROPS the link on a hard send error
-    /// (disposing the connection wakes the receive loop -> session tears down ->
-    /// LinkManager removes it), so a broadcast failure isolates to this link.
-    /// A too-large payload is dropped but the link is kept.
+    /// Per-link send of one clip. Returns false and DROPS the link on a hard
+    /// send error (disposing the connection wakes the receive loop -> session
+    /// tears down -> LinkManager removes it), so a broadcast failure isolates to
+    /// this link. A payload over the 64 MiB cap is dropped but the link is kept
+    /// — as is a frame the per-link legacy gate skips (LinkManager.BroadcastAsync,
+    /// which never reaches this method for a gated link).
     public async Task<bool> SendClipAsync(ClipPayload payload)
+    {
+        if (!_alive) return false;
+        EncodedFrame frame;
+        try { frame = WireMessage.Clip(payload, UnixNow()).Encode(); }
+        catch (PayloadTooLargeException e)
+        { RotatingLog.Shared.Warning($"payload too large, dropping: {e.Message}"); return true; }
+        return await SendEncodedAsync(frame);
+    }
+
+    /// Send an ALREADY-encoded frame on THIS link. The mesh broadcast encodes
+    /// each payload variant once and reuses the bytes for the per-link legacy
+    /// size gate and every send of that variant. Same failure contract as
+    /// SendClipAsync: false only when the link looks down.
+    public async Task<bool> SendEncodedAsync(EncodedFrame frame)
     {
         if (!_alive) return false;
         try
         {
-            await _conn.SendFrameAsync(WireMessage.Clip(payload, UnixNow()), CancellationToken.None);
+            await _conn.SendFrameAsync(frame, CancellationToken.None);
             return true;
         }
-        catch (PayloadTooLargeException e)
-        { RotatingLog.Shared.Warning($"payload too large, dropping: {e.Message}"); return true; }
         catch (Exception e)
         {
             RotatingLog.Shared.Info($"send to {PeerName} failed; dropping link: {e.Message}");

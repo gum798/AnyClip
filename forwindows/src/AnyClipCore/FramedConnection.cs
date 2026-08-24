@@ -15,7 +15,8 @@ public sealed class FramedConnection : IDisposable
     private readonly Stream _stream;
     public string? RemoteIp { get; }
 
-    /// Per-connection send budget; an instance hook so tests can shrink it.
+    /// Per-connection send budget BASE; an instance hook so tests can shrink it.
+    /// The effective budget scales with the frame (Wire.SendTimeoutFor).
     internal TimeSpan SendTimeout { get; set; } =
         TimeSpan.FromSeconds(Wire.SendTimeoutSeconds);
 
@@ -71,12 +72,23 @@ public sealed class FramedConnection : IDisposable
     }
 
     public async Task SendFrameAsync(WireMessage message, CancellationToken ct)
+        => await SendFrameAsync(message.Encode(), ct); // PayloadTooLargeException propagates
+
+    /// Send an ALREADY-encoded frame. The mesh broadcast encodes each payload
+    /// variant once and hands the same bytes to every link that takes it, so an
+    /// N-peer fan-out never re-encodes (or re-measures) the same clip.
+    public async Task SendFrameAsync(EncodedFrame frame, CancellationToken ct)
     {
-        byte[] frame = message.EncodeFrame(); // PayloadTooLargeException propagates
-        var write = _stream.WriteAsync(frame, ct).AsTask();
+        var write = _stream.WriteAsync(frame.Bytes, ct).AsTask();
+        // The budget SCALES with the frame (1 MiB/s floor on top of the base):
+        // a flat 10 s could not carry a 64 MiB frame over a slow LAN, and a
+        // timeout tears the link down. `SendTimeout` stays the base so tests can
+        // still shrink it.
+        var budget = TimeSpan.FromSeconds(
+            Wire.SendTimeoutFor(frame.BodyCount, SendTimeout.TotalSeconds));
         try
         {
-            await write.WaitAsync(SendTimeout, ct);
+            await write.WaitAsync(budget, ct);
         }
         catch (TimeoutException)
         {
@@ -100,7 +112,11 @@ public sealed class FramedConnection : IDisposable
         var header = new byte[4];
         await _stream.ReadExactlyAsync(header, ct); // EndOfStreamException on EOF
         int n = WireMessage.FrameLength(header);
-        if (n <= 0 || n > Wire.MaxPayload)
+        // Frames up to 64 MiB are accepted; anything larger is rejected without
+        // reading the body. Peers on protocol < 1.2 apply the same rule against
+        // the 16 MiB legacy cap — LinkManager's send gate keeps us from ever
+        // handing them a frame they would close the session over.
+        if (!Wire.AcceptsFrameLength(n))
         {
             RotatingLog.Shared.Warning($"invalid frame length: {n}");
             return null;

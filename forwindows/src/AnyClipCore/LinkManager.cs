@@ -26,7 +26,19 @@ public sealed class LinkManager
 {
     public const int DefaultMaxPeers = 8;
 
-    public readonly record struct BroadcastResult(int Sent, int OldPeerDrops);
+    /// Per-copy broadcast result: how many links took the (possibly downgraded)
+    /// clip, the largest old-peer file-drop count for the aggregated fallback
+    /// toast, and the peers the legacy size gate skipped for the aggregated size
+    /// toast. Peers in SizeSkipped keep their links; the caller emits ONE toast.
+    public readonly record struct BroadcastResult(
+        int Sent, int OldPeerDrops, IReadOnlyList<string> SizeSkipped)
+    {
+        public BroadcastResult(int sent, int oldPeerDrops)
+            : this(sent, oldPeerDrops, Array.Empty<string>()) { }
+    }
+
+    private static double UnixNow() =>
+        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
 
     // Process-wide monotonic seconds sharing ONE epoch with PeerLink.MonotonicNow
     // (both call Stopwatch.GetTimestamp), so `MonotonicNow() - existing.LinkedAt`
@@ -350,31 +362,71 @@ public sealed class LinkManager
         finally { _applyLock.Release(); }
     }
 
-    /// Fan out one local clip to every active link. Per-link protocol-minor
-    /// gating: a minor-0 link gets the first-file legacy "file" fallback instead
-    /// of "files". A per-link send failure drops only that link. OldPeerDrops is
-    /// aggregated (max dropped count over old peers) so the caller emits ONE skip
-    /// toast across all peers.
+    /// Fan out one local clip to every active link. A per-link send failure drops
+    /// only that link.
+    ///
+    /// Two per-link gates run here, both keyed on the peer's advertised minor:
+    ///  - minor &lt; 1: a kind:"files" clip degrades to its first file.
+    ///  - minor &lt; 2: a frame over the legacy 16 MiB receive cap is SKIPPED (the
+    ///    peer would close the session on it). The link stays UP and the peer
+    ///    name lands in SizeSkipped for one aggregated toast.
+    ///
+    /// Both aggregates (OldPeerDrops, SizeSkipped) are per-copy so the caller
+    /// emits at most ONE toast of each kind across all peers.
+    ///
+    /// Each distinct payload variant is encoded at most ONCE per broadcast (and
+    /// shares one timestamp): the same bytes back the size gate and every send of
+    /// that variant, so an 8-peer mesh never re-encodes the same clip.
     public async Task<BroadcastResult> BroadcastAsync(ClipPayload payload)
     {
         List<PeerLink> targets;
         lock (_lock) targets = _links.Values.ToList();
         int sent = 0, oldPeerDrops = 0;
+        var sizeSkipped = new List<string>();
+        double ts = UnixNow();
+        // Variant kind ("text"/"image"/"file"/"files") -> its encoded frame, or
+        // null when the payload does not fit even the 64 MiB cap.
+        var frames = new Dictionary<string, EncodedFrame?>();
+
         foreach (var link in targets)
         {
             var toSend = payload;
+            int dropped = 0;
             if (payload is FilesClip fc && link.PeerProtocolMinor < 1)
             {
-                oldPeerDrops = Math.Max(oldPeerDrops, fc.Files.Count - 1);
+                dropped = fc.Files.Count - 1;
                 var (name, data) = fc.Files[0];
                 toSend = new FileClip(name, data);
+            }
+            if (!frames.TryGetValue(toSend.Kind, out var cached))
+            {
+                try { cached = WireMessage.Clip(toSend, ts).Encode(); }
+                catch (PayloadTooLargeException e)
+                {
+                    RotatingLog.Shared.Warning($"payload too large, dropping: {e.Message}");
+                    cached = null;
+                }
+                frames[toSend.Kind] = cached;
+            }
+            if (cached is not { } frame) continue;
+            if (!Wire.LinkAcceptsFrame(frame.BodyCount, link.PeerProtocolMinor))
+            {
+                RotatingLog.Shared.Info(
+                    $"clip too large for '{link.PeerName}' (peer protocol < 1.2); skipping");
+                sizeSkipped.Add(link.PeerName);
+                continue;
+            }
+            if (!await link.SendEncodedAsync(frame)) continue;
+            if (dropped > 0)
                 RotatingLog.Shared.Info(
                     $"peer {link.PeerName} protocol minor {link.PeerProtocolMinor} < 1: "
-                    + $"sending 1 of {fc.Files.Count} files");
-            }
-            if (await link.SendClipAsync(toSend)) sent++;
+                    + $"sent 1 of {dropped + 1} files");
+            // Only a DELIVERED downgrade counts toward the fallback toast: a
+            // gated or failed link received nothing to leave files behind on.
+            oldPeerDrops = Math.Max(oldPeerDrops, dropped);
+            sent++;
         }
-        return new BroadcastResult(sent, oldPeerDrops);
+        return new BroadcastResult(sent, oldPeerDrops, sizeSkipped);
     }
 
     public void Shutdown()

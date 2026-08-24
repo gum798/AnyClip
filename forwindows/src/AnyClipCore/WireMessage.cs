@@ -13,6 +13,14 @@ public sealed class PayloadTooLargeException(int size)
 public readonly record struct VersionInfo(
     string AppVersion, int ProtocolMajor, int ProtocolMinor);
 
+/// One encoded wire frame: the bytes to write, plus the BODY length separately.
+/// Every cap in the protocol (Wire.MaxPayload on receive, Wire.LegacyMaxPayload
+/// in the per-link send gate) is expressed on the body, not on the 4-byte length
+/// prefix, so carrying `BodyCount` alongside keeps the boundary exact and lets
+/// the mesh fan-out encode a payload variant ONCE and reuse the same bytes for
+/// both the size gate and every send of that variant.
+public readonly record struct EncodedFrame(byte[] Bytes, int BodyCount);
+
 /// One entry of a kind:"files" clip. Field order name, content, hash, bytes
 /// is golden-vector material. Nullable so a malformed inbound entry decodes
 /// (then gets rejected in PeerLink) rather than failing the whole frame parse.
@@ -122,8 +130,9 @@ public sealed record WireMessage
     public static WireMessage Ping(double ts) => new() { Type = "ping", Ts = ts };
     public static WireMessage Pong(double ts) => new() { Type = "pong", Ts = ts };
 
-    /// 4-byte big-endian length prefix + UTF-8 JSON body.
-    public byte[] EncodeFrame()
+    /// 4-byte big-endian length prefix + UTF-8 JSON body, with the body length
+    /// carried alongside for the size gates (see EncodedFrame).
+    public EncodedFrame Encode()
     {
         byte[] body = JsonSerializer.SerializeToUtf8Bytes(this, Options);
         if (body.Length > Wire.MaxPayload) throw new PayloadTooLargeException(body.Length);
@@ -133,8 +142,11 @@ public sealed record WireMessage
         frame[2] = (byte)(body.Length >> 8);
         frame[3] = (byte)body.Length;
         body.CopyTo(frame, 4);
-        return frame;
+        return new EncodedFrame(frame, body.Length);
     }
+
+    /// Frame bytes only, for callers that do not need the body length.
+    public byte[] EncodeFrame() => Encode().Bytes;
 
     /// Big-endian length from a 4-byte header; 0 (= invalid) on short input.
     public static int FrameLength(byte[] header)

@@ -54,6 +54,19 @@ public sealed class Daemon(
         Channel.CreateUnbounded<DaemonEvent>();
     public ChannelReader<DaemonEvent> Events => _events.Reader;
 
+    /// One aggregated toast for the peers a clip was too large for — their
+    /// protocol is &lt; 1.2, so they still enforce the legacy 16 MiB receive cap
+    /// and the fan-out skipped them (their links stayed up). null when nothing
+    /// was skipped; at most ONE per clip. Keep in lockstep with
+    /// anyclip.size_skip_message / Swift sizeSkipMessage.
+    public static string? SizeSkipMessage(IReadOnlyList<string> names)
+    {
+        if (names.Count == 0) return null;
+        if (names.Count == 1)
+            return $"clip not sent to {names[0]} (too large for its AnyClip version)";
+        return $"clip not sent to {names.Count} peer(s) (too large for their AnyClip version)";
+    }
+
     public static void ClearDirectoryFiles(string dir)
     {
         if (!Directory.Exists(dir)) return;
@@ -154,6 +167,12 @@ public sealed class Daemon(
             // fallback) happens inside BroadcastAsync. OldPeerDrops is aggregated
             // so at most ONE skip toast fires for this local copy across all peers.
             var result = await manager.BroadcastAsync(payload);
+            // Same aggregation for the peers the legacy 16 MiB size gate skipped:
+            // ONE toast per local copy, never one per peer. Emitted BEFORE the
+            // nothing-sent bail-out — when every link is pre-1.2 the clip reaches
+            // no one, and that is exactly when the user needs to be told.
+            if (SizeSkipMessage(result.SizeSkipped) is { } sizeSkipMessage)
+                _ = clipboard.OnFileSkipped?.Invoke(sizeSkipMessage);
             if (result.Sent == 0) return;
             if (result.OldPeerDrops > 0)
                 _ = clipboard.OnFileSkipped?.Invoke(
