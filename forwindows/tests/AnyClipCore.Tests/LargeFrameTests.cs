@@ -20,7 +20,7 @@ public class LargeFrameTests
         Assert.Equal(67108864, Wire.MaxPayload);
         Assert.Equal(16 * 1024 * 1024, Wire.LegacyMaxPayload);
         Assert.Equal(16777216, Wire.LegacyMaxPayload);
-        Assert.Equal(2, Wire.ProtocolMinor);
+        Assert.Equal(3, Wire.ProtocolMinor);
     }
 
     // ---- send timeout scales with payload -------------------------------

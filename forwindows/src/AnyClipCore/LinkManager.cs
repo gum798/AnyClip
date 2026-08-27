@@ -398,8 +398,8 @@ public sealed class LinkManager
             if (payload is FilesClip fc && link.PeerProtocolMinor < 1)
             {
                 dropped = fc.Files.Count - 1;
-                var (name, data) = fc.Files[0];
-                toSend = new FileClip(name, data);
+                var first = fc.Files[0];
+                toSend = new FileClip(first.Name, first.Data);
             }
             if (!frames.TryGetValue(toSend.Kind, out var cached))
             {

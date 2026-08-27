@@ -122,7 +122,7 @@ public sealed class PeerLink
                     RotatingLog.Shared.Warning("ignoring files clip with no entries");
                     break;
                 }
-                var decoded = new List<(string Name, byte[] Data)>(msg.Files.Count);
+                var decoded = new List<FileEntry>(msg.Files.Count);
                 bool bad = false;
                 foreach (var entry in msg.Files)
                 {
@@ -134,7 +134,11 @@ public sealed class PeerLink
                         break;
                     }
                     var fname = string.IsNullOrEmpty(entry.Name) ? "received.bin" : entry.Name!;
-                    decoded.Add((fname, fbytes)); // hash NOT trusted from wire; recomputed downstream
+                    // The wire "path" rides through UNVALIDATED: validation belongs
+                    // to the placement step, which falls back to flat for a bad
+                    // path. Rejecting here would drop the whole frame.
+                    decoded.Add(new FileEntry(fname, fbytes, entry.Path));
+                    // hash NOT trusted from wire; recomputed downstream
                 }
                 if (!bad)
                     await (OnClip?.Invoke(new FilesClip(decoded)) ?? Task.CompletedTask);

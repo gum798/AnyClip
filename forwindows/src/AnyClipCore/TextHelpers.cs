@@ -56,6 +56,26 @@ public static class TextHelpers
         return cleaned;
     }
 
+    /// Split a wire "path" on '/' and run every segment through
+    /// SanitizeFilename (NFC + denylist + trailing dot/space trim + Windows
+    /// reserved-name guard). The caller joins the result under received/ with
+    /// the platform separator. Empty/'.'/'..' segments never reach here —
+    /// Wire.IsValidRelPath rejects them first — and SanitizeFilename maps them
+    /// to "received.bin" anyway, so no segment can ever become a traversal.
+    ///
+    /// The split runs on chars, which for the ASCII '/' is exactly a code-point
+    /// split (no ASCII char is half of a surrogate pair): identical to Python's
+    /// path.split("/") and Swift's scalar-level split, so a combining mark
+    /// right after a separator can never hide it. Keep in lockstep with Swift
+    /// sanitizeWirePath and anyclip.sanitize_relpath.
+    public static IReadOnlyList<string> SanitizePathSegments(string path)
+    {
+        var parts = path.Split('/');
+        var result = new List<string>(parts.Length);
+        foreach (var p in parts) result.Add(SanitizeFilename(p));
+        return result;
+    }
+
     /// De-duplicate already-sanitized names within one received batch:
     /// first wins, later dupes get " (2)", " (3)" before the LAST extension
     /// (no extension -> appended). Keep in lockstep with Swift/Python.

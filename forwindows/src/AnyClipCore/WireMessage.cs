@@ -21,15 +21,18 @@ public readonly record struct VersionInfo(
 /// both the size gate and every send of that variant.
 public readonly record struct EncodedFrame(byte[] Bytes, int BodyCount);
 
-/// One entry of a kind:"files" clip. Field order name, content, hash, bytes
-/// is golden-vector material. Nullable so a malformed inbound entry decodes
-/// (then gets rejected in PeerLink) rather than failing the whole frame parse.
+/// One entry of a kind:"files" clip. Field order name, content, hash, bytes,
+/// path is golden-vector material — "path" is appended LAST and omitted when
+/// null, so every pre-1.3 frame stays byte-identical. Nullable so a malformed
+/// inbound entry decodes (then gets rejected in PeerLink, or falls back to
+/// flat placement for a bad path) rather than failing the whole frame parse.
 public sealed record WireFileEntry
 {
     [JsonPropertyName("name")] public string? Name { get; init; }
     [JsonPropertyName("content")] public string? Content { get; init; }
     [JsonPropertyName("hash")] public string? Hash { get; init; }
     [JsonPropertyName("bytes")] public int? Bytes { get; init; }
+    [JsonPropertyName("path")] public string? Path { get; init; }
 }
 
 /// One wire message. Optional-field class covers hello/clip/ping/pong —
@@ -91,25 +94,39 @@ public sealed record WireMessage
         Hash = Hashing.Sha256Hex(data), Ts = ts, Bytes = data.Length,
     };
 
-    public static WireMessage ClipFiles(
-        IReadOnlyList<(string Name, byte[] Data)> files, double ts)
+    public static WireMessage ClipFiles(IReadOnlyList<FileEntry> files, double ts)
     {
         var entries = new List<WireFileEntry>(files.Count);
         var hashes = new List<string>(files.Count);
         int total = 0;
-        foreach (var (name, data) in files)
+        foreach (var f in files)
         {
-            var h = Hashing.Sha256Hex(data);
+            var h = Hashing.Sha256Hex(f.Data);
             hashes.Add(h);
-            // NFC per name, same rule as ClipFile. Keep in lockstep with
+            // NFC per name AND per path, same rule as ClipFile: the peer renders
+            // and WRITES both, so both must leave composed. Keep in lockstep with
             // Swift WireMessage.clipFiles and anyclip.send_clip.
+            var name = TextHelpers.ToNfc(f.Name);
+            string? path = null;
+            if (f.RelPath is { } rel)
+            {
+                var nfc = TextHelpers.ToNfc(rel);
+                // Emitted only when it obeys EVERY wire rule, exactly like
+                // anyclip.send_clip and Swift clipFiles: a malformed local path
+                // degrades to flat placement instead of poisoning the frame
+                // (the peer would reject it and flat-place it anyway).
+                if (Wire.IsValidRelPath(nfc, name)) path = nfc;
+                else RotatingLog.Shared.Warning(
+                    $"dropping invalid folder path '{rel}' for '{name}'; sending it flat");
+            }
             entries.Add(new WireFileEntry
             {
-                Name = TextHelpers.ToNfc(name),
-                Content = Convert.ToBase64String(data),
-                Hash = h, Bytes = data.Length,
+                Name = name,
+                Content = Convert.ToBase64String(f.Data),
+                Hash = h, Bytes = f.Data.Length,
+                Path = path,
             });
-            total += data.Length;
+            total += f.Data.Length;
         }
         return new WireMessage
         {
@@ -117,6 +134,11 @@ public sealed record WireMessage
             Hash = Hashing.AggregateFilesHash(hashes), Ts = ts, Bytes = total,
         };
     }
+
+    /// Loose-file overload: no entry carries a path.
+    public static WireMessage ClipFiles(
+        IReadOnlyList<(string Name, byte[] Data)> files, double ts) =>
+        ClipFiles(files.Select(f => new FileEntry(f.Name, f.Data)).ToList(), ts);
 
     public static WireMessage Clip(ClipPayload payload, double ts) => payload switch
     {
