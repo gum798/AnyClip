@@ -469,3 +469,37 @@ async def test_folder_over_the_file_count_cap_is_skipped_whole(
     await watcher._check_file_clipboard()
     assert changes == []
     assert skipped == ["folder too large to sync: docs"]
+
+
+@pytest.mark.asyncio
+async def test_folder_far_over_the_cap_toasts_once_despite_the_early_out(
+    monkeypatch, tmp_path,
+):
+    """expand_folder() bails out early on a folder past the absolute cap. The
+    truncated prefix must still be rejected whole with the same toast, and the
+    prefix must be stable enough that the folder is not re-toasted every poll."""
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    monkeypatch.setattr(anyclip, "MAX_FILES_PER_CLIP", 3)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    folder = tmp_path / "docs"
+    (folder / "sub").mkdir(parents=True)
+    for i in range(20):
+        (folder / f"{i:02d}.txt").write_bytes(b"x")
+        (folder / "sub" / f"{i:02d}.txt").write_bytes(b"x")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(folder)])
+
+    await watcher._check_file_clipboard()
+    assert changes == []
+    assert skipped == ["folder too large to sync: docs"]
+
+    # Stable truncation -> same fingerprint -> no second toast.
+    await watcher._check_file_clipboard()
+    assert changes == []
+    assert skipped == ["folder too large to sync: docs"]

@@ -1043,11 +1043,29 @@ def expand_folder(path: str) -> list:
     so the receiver rebuilds received/<folder>/... Symlinks are never followed
     (log only, which also makes cycles impossible), junk sidecars are skipped,
     and empty directories simply vanish -- they are not representable on the
-    wire. Keep in lockstep with Swift expandFolder and C# ExpandFolder."""
+    wire. Keep in lockstep with Swift expandFolder and C# ExpandFolder.
+
+    An unreadable subdirectory is reported and skipped, not silently dropped;
+    a partial tree is still allowed (same policy as an unreadable FILE). The
+    walk also stops as soon as the ABSOLUTE caps are blown -- see below."""
     root = str(path).rstrip("/\\")
     top = unicodedata.normalize("NFC", os.path.basename(root)) or "folder"
     entries: list = []
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    total = 0
+    truncated = False
+
+    def on_error(exc: OSError) -> None:
+        # os.walk swallows scandir failures by default, so an unreadable
+        # subtree would vanish and a PARTIAL tree would ship looking complete.
+        # We keep the partial tree (same policy as an unreadable FILE) but it
+        # is never SILENT.
+        log.warning(
+            f"folder walk error under {getattr(exc, 'filename', root)!r}: "
+            f"{exc}; subtree skipped"
+        )
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_error,
+                                                followlinks=False):
         keep_dirs = []
         for d in sorted(dirnames):
             if os.path.islink(os.path.join(dirpath, d)):
@@ -1071,6 +1089,24 @@ def expand_folder(path: str) -> list:
             rel = os.path.relpath(full, root).replace(os.sep, "/")
             entries.append((full, st.st_size, st.st_mtime_ns,
                             unicodedata.normalize("NFC", f"{top}/{rel}")))
+            total += st.st_size
+            # ABSOLUTE-cap early-out. Past MAX_FILES_PER_CLIP files or
+            # FILE_BUDGET bytes a folder can never fit ANY remaining budget, so
+            # there is nothing to gain from walking the rest -- and this walk
+            # runs on EVERY poll, so an unbounded one would re-scan a huge tree
+            # forever. The prefix we keep is deliberately one item PAST the cap,
+            # which is exactly what folder_fits() needs to reject the folder,
+            # and it is a stable prefix so the fingerprint does not churn.
+            if len(entries) > MAX_FILES_PER_CLIP or total > FILE_BUDGET:
+                truncated = True
+                break
+        if truncated:
+            break
+    if truncated:
+        log.info(
+            f"folder walk: {root!r} is past the absolute cap "
+            f"({len(entries)} files / {total} bytes); walk stopped early"
+        )
     entries.sort(key=lambda e: e[3].encode("utf-8"))
     return entries
 
@@ -1239,8 +1275,11 @@ class ClipboardWatcher:
         paths = await asyncio.to_thread(grab_clipboard_files)
         if not paths:
             return
-        # One stat pass over the selection, expanding folders as we go, so a
-        # tree is walked once per CHANGED selection, not once per poll.
+        # One stat pass over the selection, expanding folders as we go. The
+        # walk DOES run on every poll -- noticing an edit deep inside a tree
+        # requires it -- but expand_folder() bails out at the absolute caps, so
+        # its cost is bounded. What the fingerprint below saves is the re-SEND
+        # and the re-READ of every file for an unchanged selection.
         fp, items = await asyncio.to_thread(scan_selection, paths)
         if not fp:
             return

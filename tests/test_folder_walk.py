@@ -3,6 +3,7 @@ deterministic byte-wise order, and the per-folder all-or-nothing admission.
 Pure logic against a real tmp_path tree; no clipboard, no sockets."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import unicodedata
@@ -79,3 +80,88 @@ def test_folder_fits_is_all_or_nothing_on_budget_and_count(monkeypatch):
     assert folder_fits(entries, total=0, count=0)
     assert not folder_fits(entries, total=0, count=1)  # count overflow
     assert not folder_fits([], total=0, count=0)       # empty folder
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="chmod 000 is not enforceable on Windows or as root",
+)
+def test_unreadable_subdir_is_logged_not_silent(tmp_path, caplog):
+    """os.walk swallows scandir errors by default, which would ship a PARTIAL
+    tree looking complete. A partial tree is still allowed (same policy as an
+    unreadable FILE) but it must never be SILENT."""
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "keep.txt").write_bytes(b"k")
+    locked = folder / "locked"
+    locked.mkdir()
+    (locked / "hidden.txt").write_bytes(b"h")
+    locked.chmod(0o000)
+    try:
+        caplog.set_level(logging.WARNING, logger="anyclip")
+        entries = expand_folder(str(folder))
+        # The readable part still ships...
+        assert [rel for _p, _s, _m, rel in entries] == ["docs/keep.txt"]
+        # ...but the vanished subtree is reported.
+        assert "folder walk error" in caplog.text
+        assert "subtree skipped" in caplog.text
+        assert "locked" in caplog.text
+    finally:
+        locked.chmod(0o700)
+
+
+def test_walk_stops_early_once_the_absolute_file_cap_is_blown(
+    tmp_path, monkeypatch,
+):
+    """A folder past MAX_FILES_PER_CLIP can never fit ANY remaining budget, so
+    the walk bails instead of re-walking a huge tree on every poll. What it
+    keeps must still be enough for folder_fits() to reject it."""
+    folder = tmp_path / "big"
+    folder.mkdir()
+    for i in range(20):
+        (folder / f"{i:02d}.txt").write_bytes(b"x")
+    monkeypatch.setattr(anyclip, "MAX_FILES_PER_CLIP", 3)
+
+    entries = expand_folder(str(folder))
+    assert len(entries) == 4  # cap + 1, then it bails
+    assert not folder_fits(entries, total=0, count=0)
+
+
+def test_walk_stops_early_once_the_absolute_budget_is_blown(
+    tmp_path, monkeypatch,
+):
+    folder = tmp_path / "big"
+    folder.mkdir()
+    for i in range(20):
+        (folder / f"{i:02d}.txt").write_bytes(b"1234")  # 4 bytes each
+    monkeypatch.setattr(anyclip, "FILE_BUDGET", 10)
+
+    entries = expand_folder(str(folder))
+    assert len(entries) == 3  # 4 + 4 + 4 = 12 > 10 -> stop
+    assert not folder_fits(entries, total=0, count=0)
+
+
+def test_early_out_is_deterministic_across_repeated_walks(tmp_path, monkeypatch):
+    """The truncated prefix must be stable, or the fingerprint would differ on
+    every poll and re-toast an unsendable folder forever."""
+    folder = tmp_path / "big"
+    (folder / "sub").mkdir(parents=True)
+    for i in range(20):
+        (folder / f"{i:02d}.txt").write_bytes(b"x")
+        (folder / "sub" / f"{i:02d}.txt").write_bytes(b"x")
+    monkeypatch.setattr(anyclip, "MAX_FILES_PER_CLIP", 5)
+    assert expand_folder(str(folder)) == expand_folder(str(folder))
+
+
+def test_a_folder_exactly_at_the_cap_is_not_truncated(tmp_path, monkeypatch):
+    """The early-out is strictly ABOVE the cap: a folder of exactly
+    MAX_FILES_PER_CLIP files still fits and must survive intact."""
+    folder = tmp_path / "exact"
+    folder.mkdir()
+    for i in range(3):
+        (folder / f"{i}.txt").write_bytes(b"x")
+    monkeypatch.setattr(anyclip, "MAX_FILES_PER_CLIP", 3)
+
+    entries = expand_folder(str(folder))
+    assert len(entries) == 3
+    assert folder_fits(entries, total=0, count=0)
