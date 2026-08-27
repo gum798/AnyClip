@@ -509,6 +509,23 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("docs-2/b.txt").path))
 }
 
+@Test @MainActor func receivedTopDoesNotRatchetAcrossARestartCleanup() async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    let clip: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("one".utf8), relPath: "docs/a.txt"),
+    ]
+    #expect(await watcher.updateLocalFiles(clip).topLevelItems == ["docs"])
+    // What the daemon does on graceful shutdown and again on startup.
+    clearDirectoryContents(received)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: received.path).isEmpty)
+    // The same folder re-received after a restart is still "docs" — the top
+    // only ratchets to "docs-2" if the cleanup left the old tree behind.
+    #expect(await watcher.updateLocalFiles(clip).topLevelItems == ["docs"])
+}
+
 @Test @MainActor func traversalPathIsPlacedFlatInsideReceivedDir() async throws {
     let pb = privatePasteboard()
     let received = tempDir()

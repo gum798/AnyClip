@@ -367,9 +367,11 @@ private func fileContains(_ url: URL, _ needle: String) -> Bool {
     let mixedResult = await manager.broadcast(.files(mixed))
     #expect(mixedResult.delivered.count == 1)
     #expect(mixedResult.maxDropped == 1)
-    #expect(await waitUntil(5) {
-        fileContains(out, "loose.txt") && !fileContains(out, "docs/a.txt")
-    })
+    #expect(await waitUntil(5) { fileContains(out, "loose.txt") })
+    // The negative is asserted AFTER the wait settles, not inside its condition:
+    // folded in there it would only ever be evaluated at the instant loose.txt
+    // first appeared, which proves nothing about what followed it.
+    #expect(!fileContains(out, "docs/a.txt"))
     #expect(recvClipCount(out) == 1)
     await manager.shutdown()
 }

@@ -18,14 +18,41 @@ private func tempDir() -> URL {
     #expect(await c.shouldSend(kind: "image", hash: "h1"))
 }
 
-@Test func clearDirectoryFilesRemovesFilesKeepsSubdirs() throws {
+@Test func clearDirectoryContentsRemovesFilesAndWholeSubtrees() throws {
+    let fm = FileManager.default
     let dir = tempDir()
     try Data("x".utf8).write(to: dir.appendingPathComponent("a.txt"))
-    try FileManager.default.createDirectory(
-        at: dir.appendingPathComponent("sub"), withIntermediateDirectories: true)
-    clearDirectoryFiles(dir)
-    let remaining = try FileManager.default.contentsOfDirectory(atPath: dir.path)
-    #expect(remaining == ["sub"])
+    // received/ holds rebuilt TREES since protocol 1.3, so a subdirectory is
+    // inbound clipboard data like any other and goes with the rest — leaving it
+    // grew disk use without bound across restarts AND ratcheted the next
+    // colliding top to "docs-2", "docs-3", … forever.
+    let deep = dir.appendingPathComponent("docs/sub")
+    try fm.createDirectory(at: deep, withIntermediateDirectories: true)
+    try Data("y".utf8).write(to: deep.appendingPathComponent("b.txt"))
+
+    clearDirectoryContents(dir)
+
+    #expect(try fm.contentsOfDirectory(atPath: dir.path).isEmpty)
+    #expect(fm.fileExists(atPath: dir.path))   // the directory itself survives
+}
+
+@Test func clearDirectoryContentsUnlinksASymlinkToADirectoryWithoutDescending() throws {
+    let fm = FileManager.default
+    let dir = tempDir()
+    let outside = tempDir()
+    let keeper = outside.appendingPathComponent("keep.txt")
+    try Data("kept".utf8).write(to: keeper)
+    let link = dir.appendingPathComponent("link-to-dir")
+    try fm.createSymbolicLink(at: link, withDestinationURL: outside)
+
+    clearDirectoryContents(dir)
+
+    // The LINK is gone; what it pointed at is untouched. A probe that resolves
+    // the link (URLResourceKey.isDirectoryKey does) would have called this a
+    // directory and emptied the target instead.
+    #expect(try fm.contentsOfDirectory(atPath: dir.path).isEmpty)
+    #expect(fm.fileExists(atPath: outside.path))
+    #expect(try Data(contentsOf: keeper) == Data("kept".utf8))
 }
 
 @Test func daemonStartsAndShutsDownCleanly() async throws {

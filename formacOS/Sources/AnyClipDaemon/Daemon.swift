@@ -34,17 +34,36 @@ public actor SyncCoordinator {
     }
 }
 
-/// Remove regular files (not subdirectories) from a directory.
-/// Port of anyclip.clear_received_dir.
-public func clearDirectoryFiles(_ dir: URL) {
+/// Empty a directory of everything inbound: regular files, and — since
+/// protocol 1.3 rebuilds folder trees under received/ — whole subtrees. The
+/// directory itself survives. Called on startup and on graceful shutdown so
+/// disk use does not grow unbounded across restarts, and so a re-received
+/// folder lands back on its own name instead of ratcheting to "docs-2".
+///
+/// SYMLINKS ARE NEVER FOLLOWED: the type probe is lstat-based, because
+/// URLResourceKey.isDirectoryKey RESOLVES the link and would report a
+/// symlink-to-directory as a directory — emptying the target instead of the
+/// link. A real directory is removed recursively, everything else (files, and
+/// symlinks of every kind) is unlink(2)-ed, which cannot follow by
+/// construction. Port of anyclip.clear_received_dir.
+public func clearDirectoryContents(_ dir: URL) {
     let fm = FileManager.default
     guard let entries = try? fm.contentsOfDirectory(
-        at: dir, includingPropertiesForKeys: [.isDirectoryKey])
+        at: dir, includingPropertiesForKeys: nil)
     else { return }
     for entry in entries {
-        let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?
-            .isDirectory ?? false
-        if !isDir { try? fm.removeItem(at: entry) }
+        var info = stat()
+        guard lstat(entry.path, &info) == 0 else { continue }
+        if (info.st_mode & S_IFMT) == S_IFDIR {
+            do {
+                try fm.removeItem(at: entry)          // recursive, like shutil.rmtree
+            } catch {
+                AnyLog.shared.debug("could not remove \(entry.path): \(error)")
+            }
+        } else if unlink(entry.path) != 0 {
+            AnyLog.shared.debug(
+                "could not remove \(entry.path): errno \(errno)")
+        }
     }
 }
 
@@ -151,7 +170,7 @@ public final class Daemon: @unchecked Sendable {
     private func runOnce() async throws {
         try PidLock.prepare(port: config.port, dir: stateDir)
         let receivedDir = stateDir.appendingPathComponent("received")
-        clearDirectoryFiles(receivedDir)
+        clearDirectoryContents(receivedDir)
 
         let nodeID = UUID().uuidString.lowercased()
         let coordinator = SyncCoordinator()
@@ -373,6 +392,6 @@ public final class Daemon: @unchecked Sendable {
         await manager.shutdown()
         await beacon.stop()
         PidLock.release(dir: stateDir)
-        clearDirectoryFiles(receivedDir)
+        clearDirectoryContents(receivedDir)
     }
 }

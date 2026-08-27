@@ -54,13 +54,19 @@ private func entry(_ name: String, _ rel: String?) -> (name: String, data: Data,
     #expect(got[0].relativePath == "docs-4/a.txt")
 }
 
-@Test func planKeepsLooseNamesOffTheReservedTops() {
+@Test func planMovesTheTopOffALooseNameOfTheSameClip() {
+    // The LOOSE names are uniquified first and the colliding TOP is what moves
+    // — anyclip.plan_received_layout computes
+    // `uniquify_names(sorted(existing) + loose)` before it reserves any top,
+    // so a loose file always keeps the name the sender gave it.
     let got = ReceivedTree.plan([
         entry("a.txt", "docs/a.txt"),
         entry("docs", nil),          // a loose file literally named "docs"
         entry("docs", nil),
     ], exists: { _ in false })
-    #expect(got.map(\.relativePath) == ["docs/a.txt", "docs (2)", "docs (3)"])
+    #expect(got.map(\.relativePath) == ["docs-2/a.txt", "docs", "docs (2)"])
+    #expect(got.map(\.top) == ["docs-2", "docs", "docs (2)"])
+    #expect(got.map(\.inTree) == [true, false, false])
 }
 
 @Test func planKeepsLooseNamesOffWhatIsAlreadyInReceived() {
