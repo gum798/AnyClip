@@ -56,14 +56,14 @@ private func tempDir() -> URL {
 }
 
 @Test func downgradeForPeerKeepsFilesForModernPeer() {
-    let payload = ClipPayload.files([(name: "a", data: Data([1])), (name: "b", data: Data([2]))])
+    let payload = ClipPayload.files([(name: "a", data: Data([1]), relPath: nil), (name: "b", data: Data([2]), relPath: nil)])
     let (out, dropped) = downgradeForPeer(payload, peerMinor: 1)
     #expect(dropped == 0)
     if case .files(let fs)? = out { #expect(fs.count == 2) } else { Issue.record("expected .files") }
 }
 
 @Test func downgradeForPeerDropsToFirstFileForOldPeer() {
-    let payload = ClipPayload.files([(name: "a", data: Data([1])), (name: "b", data: Data([2]))])
+    let payload = ClipPayload.files([(name: "a", data: Data([1]), relPath: nil), (name: "b", data: Data([2]), relPath: nil)])
     let (out, dropped) = downgradeForPeer(payload, peerMinor: 0)
     #expect(dropped == 1)                                     // one file left behind
     if case .file(let name, let data)? = out {

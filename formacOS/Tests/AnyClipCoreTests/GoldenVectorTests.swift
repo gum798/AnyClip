@@ -34,7 +34,7 @@ private func decodeGoldenFrame(_ name: String) throws -> WireMessage {
     #expect(m.name == "golden-mac")
     #expect(m.version == 1)
     #expect(m.protocol_major == 1)
-    #expect(m.protocol_minor == 0)
+    #expect(m.protocol_minor == 3)
     // Our own hashing of the golden token must equal Python's.
     #expect(sha256Hex(man["token"] as! String) == man["token_hash"] as? String)
 }
@@ -87,6 +87,40 @@ private func decodeGoldenFrame(_ name: String) throws -> WireMessage {
     #expect(m.hash == man["files_aggregate"] as? String)
     #expect(aggregateFilesHash(hashes) == man["files_aggregate"] as? String)
     #expect(m.bytes == man["files_total_bytes"] as? Int)
+}
+
+@Test func goldenClipFilesTreeDecodes() throws {
+    let m = try decodeGoldenFrame("clip_files_path.bin")
+    let man = try manifest()
+    #expect(m.kind == "files")
+    let entries = try #require(m.files)
+    let names = man["files_path_names"] as! [String]
+    // The canonical vector deliberately MIXES two folder entries with a loose
+    // one, so the manifest's path list is [String?] — JSON null for the entry
+    // whose frame carries no "path" key at all (verified: its key set is
+    // exactly name,content,hash,bytes). That mix is the point: it pins on the
+    // wire that a loose entry stays byte-identical to protocol 1.2.
+    let paths = (man["files_path_paths"] as! [Any]).map { $0 as? String }
+    let hashes = man["files_path_hashes"] as! [String]
+    #expect(entries.count == paths.count)
+    for (i, e) in entries.enumerated() {
+        #expect(e.name == names[i])
+        #expect(e.path == paths[i])                       // Python-canonical path
+        if let path = e.path {
+            #expect(isValidWirePath(path, name: e.name))  // our rules accept Python's
+        }
+        let data = try #require(strictBase64Decode(e.content))
+        #expect(sha256Hex(data) == hashes[i])
+        #expect(e.bytes == data.count)
+    }
+    // Both shapes must actually be exercised by the vector.
+    #expect(entries.contains { $0.path != nil })
+    #expect(entries.contains { $0.path == nil })
+    // Aggregate + total match the Python-canonical manifest values: adding
+    // "path" must not change how a files clip hashes.
+    #expect(m.hash == man["files_path_aggregate"] as? String)
+    #expect(aggregateFilesHash(hashes) == man["files_path_aggregate"] as? String)
+    #expect(m.bytes == man["files_path_total_bytes"] as? Int)
 }
 
 @Test func goldenPingDecodes() throws {

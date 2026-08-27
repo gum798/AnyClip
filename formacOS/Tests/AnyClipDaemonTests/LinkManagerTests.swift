@@ -287,8 +287,9 @@ private func rawHandshake(
     defer { old.cancel(); modern.cancel() }
     #expect(await waitUntil { await a.activeLinkCount() == 2 })
 
-    let files: [(name: String, data: Data)] = [
-        (name: "a.txt", data: Data("one".utf8)), (name: "b.txt", data: Data("two".utf8))]
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("one".utf8), relPath: nil),
+        (name: "b.txt", data: Data("two".utf8), relPath: nil)]
     let result = await a.broadcast(.files(files))
     #expect(result.maxDropped == 1)   // the minor-0 peer left one file behind
 

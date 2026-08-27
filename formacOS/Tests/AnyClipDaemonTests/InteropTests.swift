@@ -108,8 +108,8 @@ private func scriptsDir() -> URL {
     // Swift -> a legacy (minor-0) Python peer: a two-file kind:"files" copy is
     // downgraded per-link to its first file on the wire (dropped == 1). The
     // second file never reaches the peer; the first does.
-    let mf1 = (name: "노트-multi.txt", data: Data("files body one".utf8))
-    let mf2 = (name: "(E&S) plan.txt", data: Data("files body two".utf8))
+    let mf1 = (name: "노트-multi.txt", data: Data("files body one".utf8), relPath: String?.none)
+    let mf2 = (name: "(E&S) plan.txt", data: Data("files body two".utf8), relPath: String?.none)
     let filesResult = await manager.broadcast(.files([mf1, mf2]))
     #expect(filesResult.maxDropped == 1)
     #expect(await waitUntil(5) {

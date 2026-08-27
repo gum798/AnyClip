@@ -205,9 +205,9 @@ private func readingConcurrently(
     #expect(await waitUntil { await a.activeLinkCount() == 2 })
 
     // The FIRST file alone exceeds the legacy cap once base64'd (13 MB -> ~17.3 MB).
-    let files: [(name: String, data: Data)] = [
-        (name: "big.bin", data: Data(count: 13_000_000)),
-        (name: "small.txt", data: Data("hi".utf8)),
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "big.bin", data: Data(count: 13_000_000), relPath: nil),
+        (name: "small.txt", data: Data("hi".utf8), relPath: nil),
     ]
     let (result, got) = await readingConcurrently(modern) { await a.broadcast(.files(files)) }
 
@@ -236,9 +236,9 @@ private func readingConcurrently(
     defer { mid.cancel(); modern.cancel() }
     #expect(await waitUntil { await a.activeLinkCount() == 2 })
 
-    let files: [(name: String, data: Data)] = [
-        (name: "big.bin", data: Data(count: 13_000_000)),
-        (name: "small.txt", data: Data("hi".utf8)),
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "big.bin", data: Data(count: 13_000_000), relPath: nil),
+        (name: "small.txt", data: Data("hi".utf8), relPath: nil),
     ]
     let (result, got) = await readingConcurrently(modern) { await a.broadcast(.files(files)) }
     #expect(result.delivered.count == 1)
@@ -260,10 +260,10 @@ private func readingConcurrently(
     defer { old.cancel(); modern.cancel() }
     #expect(await waitUntil { await a.activeLinkCount() == 2 })
 
-    let files: [(name: String, data: Data)] = [
-        (name: "a.txt", data: Data("one".utf8)),
-        (name: "b.txt", data: Data("two".utf8)),
-        (name: "c.txt", data: Data("three".utf8)),
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("one".utf8), relPath: nil),
+        (name: "b.txt", data: Data("two".utf8), relPath: nil),
+        (name: "c.txt", data: Data("three".utf8), relPath: nil),
     ]
     let result = await a.broadcast(.files(files))
     #expect(result.delivered.count == 2)

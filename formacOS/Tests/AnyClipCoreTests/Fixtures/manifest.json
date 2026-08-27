@@ -19,5 +19,22 @@
   ],
   "files_aggregate": "7d04c7a5d04332ff7e657a1046d2e3c22e808f5fccba7dbf321d9738dcb2979c",
   "files_total_bytes": 38,
+  "files_path_names": [
+    "메모.txt",
+    "réport (v2).bin",
+    "loose.txt"
+  ],
+  "files_path_paths": [
+    "보고서/메모.txt",
+    "보고서/sub dir/réport (v2).bin",
+    null
+  ],
+  "files_path_hashes": [
+    "c887ae97e2cf8ceb2735d7a98df7508f2a2377df957c81881dc6caddb630ce53",
+    "5f3c76b5a854289866e6cd08eb08fff7b0e6a84844ede301069d339b08884aea",
+    "a868338651b57e1e2b4c66e453dec788ac7bb05b2db8d21d4d56a0e0ff352595"
+  ],
+  "files_path_aggregate": "0b6e94611e72265898d4bba25ba402db192d13423970685ccf90696a45786f8f",
+  "files_path_total_bytes": 48,
   "ts": 1718000000.5
 }

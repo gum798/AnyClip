@@ -11,8 +11,15 @@ public enum Wire {
     public static let legacyMaxPayload = 16 * 1024 * 1024
     public static let protocolMajor = 1
     /// Cumulative feature level: minor >= 1 accepts kind:"files", minor >= 2
-    /// accepts frames up to maxPayload (64 MiB) instead of legacyMaxPayload.
-    public static let protocolMinor = 2
+    /// accepts frames up to maxPayload (64 MiB) instead of legacyMaxPayload,
+    /// minor >= 3 rebuilds folder trees from each entry's optional "path".
+    /// Minor 3 is a capability MARKER only: it gates nothing on the send path.
+    public static let protocolMinor = 3
+    /// Wire-path caps for a kind:"files" entry's optional "path" field.
+    /// Keep in lockstep with anyclip.MAX_PATH_SEGMENTS / MAX_PATH_LENGTH and
+    /// C# Wire.MaxPathSegments / Wire.MaxPathLength.
+    public static let maxPathSegments = 32
+    public static let maxPathLength = 240
     /// Legacy single-int field old peers read; equals protocolMajor.
     public static let legacyVersion = 1
     public static let defaultPort: UInt16 = 24816
@@ -83,7 +90,7 @@ public enum ClipPayload: Sendable {
     case text(String)
     case image(Data)
     case file(name: String, data: Data)
-    case files([(name: String, data: Data)])
+    case files([(name: String, data: Data, relPath: String?)])
 
     public var kind: String {
         switch self {
@@ -113,11 +120,18 @@ public struct WireFileEntry: Codable, Sendable, Equatable {
     public var content: String
     public var hash: String
     public var bytes: Int
-    public init(name: String, content: String, hash: String, bytes: Int) {
+    /// Relative path INCLUDING the top folder name ("<top>/<sub>/<name>"),
+    /// present only for files that came from a copied folder. Optional, so
+    /// the synthesized encoder omits it (encodeIfPresent) and a loose file's
+    /// entry is byte-identical to protocol 1.2. Peers below minor 3 ignore it.
+    public var path: String?
+    public init(name: String, content: String, hash: String, bytes: Int,
+                path: String? = nil) {
         self.name = name
         self.content = content
         self.hash = hash
         self.bytes = bytes
+        self.path = path
     }
 }
 
@@ -193,7 +207,9 @@ extension WireMessage {
         return m
     }
 
-    public static func clipFiles(files: [(name: String, data: Data)], ts: Double) -> WireMessage {
+    public static func clipFiles(
+        files: [(name: String, data: Data, relPath: String?)], ts: Double
+    ) -> WireMessage {
         var m = WireMessage(type: "clip")
         m.kind = "files"
         var entries: [WireFileEntry] = []
@@ -201,9 +217,20 @@ extension WireMessage {
         var total = 0
         for f in files {
             let h = sha256Hex(f.data)
+            let name = f.name.precomposedStringWithCanonicalMapping  // NFC on the wire
+            var path: String?
+            if let rel = f.relPath {
+                let nfc = rel.precomposedStringWithCanonicalMapping  // NFC on the wire
+                if isValidWirePath(nfc, name: name) {
+                    path = nfc
+                } else {
+                    AnyLog.shared.warning(
+                        "invalid wire path '\(rel)' for \(name); sending it flat")
+                }
+            }
             entries.append(WireFileEntry(
-                name: f.name.precomposedStringWithCanonicalMapping,  // NFC on the wire
-                content: f.data.base64EncodedString(), hash: h, bytes: f.data.count))
+                name: name, content: f.data.base64EncodedString(),
+                hash: h, bytes: f.data.count, path: path))
             hashes.append(h)
             total += f.data.count
         }
@@ -290,16 +317,61 @@ public func strictBase64Decode(_ s: String) -> Data? {
     Data(base64Encoded: s)
 }
 
-/// Decode a kind:"files" message's entries into (name, rawBytes). Returns nil
-/// if the array is empty/nil OR ANY entry has non-strict base64 content — the
-/// caller drops the WHOLE frame (no partial apply). Names pass through raw;
-/// sanitize/uniquify happen write-side. Hashes are never trusted from the wire.
-public func decodeFileEntries(_ files: [WireFileEntry]?) -> [(name: String, data: Data)]? {
+/// Decode a kind:"files" message's entries into (name, rawBytes, relPath).
+/// Returns nil if the array is empty/nil OR ANY entry has non-strict base64
+/// content — the caller drops the WHOLE frame (no partial apply). Names AND
+/// paths pass through raw; sanitize/validate/uniquify happen write-side, so a
+/// bad path degrades that ONE entry to flat placement instead of killing the
+/// frame. Hashes are never trusted from the wire.
+public func decodeFileEntries(
+    _ files: [WireFileEntry]?
+) -> [(name: String, data: Data, relPath: String?)]? {
     guard let files, !files.isEmpty else { return nil }
-    var out: [(name: String, data: Data)] = []
+    var out: [(name: String, data: Data, relPath: String?)] = []
     for e in files {
         guard let data = strictBase64Decode(e.content) else { return nil }
-        out.append((name: e.name, data: data))
+        out.append((name: e.name, data: data, relPath: e.path))
     }
     return out
+}
+
+/// Sanitized POSIX form of a wire path: every segment through sanitizeFilename
+/// (NFC + denylist + trailing dot/space trim + Windows reserved names),
+/// rejoined with "/". Used for the length rule below and by the receiver when
+/// it rebuilds the tree, so both judge the same string.
+public func sanitizeWirePath(_ path: String) -> String {
+    path.split(separator: "/", omittingEmptySubsequences: false)
+        .map { sanitizeFilename(String($0)) }
+        .joined(separator: "/")
+}
+
+/// True when `path` satisfies EVERY wire rule for a folder entry's optional
+/// "path": POSIX "/" separators, relative (no leading "/", no drive letter),
+/// no "." / ".." / empty segments, no backslashes, last segment equals `name`,
+/// <= Wire.maxPathSegments segments, sanitized length <= Wire.maxPathLength.
+/// Senders MUST only emit paths that pass; receivers MUST verify before
+/// rebuilding a tree and fall back to FLAT placement for that ONE entry when
+/// they do not. NFC is not a rejection rule: Swift's String == is canonical
+/// (NFC == NFD) and sanitizeFilename normalizes every segment on the way to
+/// disk — Python and C# accept-and-normalize too, they do not reject NFD.
+/// LENGTH IS COUNTED IN UNICODE SCALARS (code points), matching Python's
+/// len(). String.count would count grapheme clusters and C# string.Length
+/// UTF-16 units, so those three disagree on any emoji/non-BMP path and the
+/// same clip would rebuild a tree on one receiver and flat-place on another;
+/// C# must count runes, not .Length. Keep in lockstep with
+/// anyclip.is_valid_wire_path and C# Wire.IsValidWirePath.
+public func isValidWirePath(_ path: String, name: String) -> Bool {
+    guard !path.isEmpty, !path.contains(where: { $0 == "\\" }) else { return false }
+    let segments = path.split(separator: "/", omittingEmptySubsequences: false)
+        .map(String.init)
+    guard !segments.isEmpty, segments.count <= Wire.maxPathSegments else { return false }
+    for segment in segments where segment.isEmpty || segment == "." || segment == ".." {
+        return false
+    }
+    let first = Array(segments[0])
+    if first.count >= 2, first[1] == ":", first[0].isASCII, first[0].isLetter {
+        return false   // drive letter ("C:/...")
+    }
+    guard segments[segments.count - 1] == name else { return false }
+    return sanitizeWirePath(path).unicodeScalars.count <= Wire.maxPathLength
 }

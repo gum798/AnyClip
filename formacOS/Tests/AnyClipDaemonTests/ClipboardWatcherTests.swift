@@ -329,8 +329,8 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
     let placed = watcher.updateLocalFiles([
-        (name: "dup.txt", data: Data("1".utf8)),
-        (name: "dup.txt", data: Data("2".utf8)),
+        (name: "dup.txt", data: Data("1".utf8), relPath: nil),
+        (name: "dup.txt", data: Data("2".utf8), relPath: nil),
     ])
     #expect(placed.count == 2)
     #expect(placed.map(\.name) == ["dup.txt", "dup (2).txt"])

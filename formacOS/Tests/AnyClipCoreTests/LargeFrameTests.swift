@@ -13,7 +13,7 @@ import Foundation
     #expect(Wire.maxPayload == 67_108_864)
     #expect(Wire.legacyMaxPayload == 16 * 1024 * 1024)
     #expect(Wire.legacyMaxPayload == 16_777_216)
-    #expect(Wire.protocolMinor == 2)
+    #expect(Wire.protocolMinor == 3)
 }
 
 // ---- send timeout scales with payload -----------------------------------

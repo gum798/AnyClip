@@ -38,7 +38,7 @@ import Foundation
     #expect(body?["version"] as? Int == 1)          // legacy field MUST exist
     #expect(body?["app_version"] as? String == "1.2.3")
     #expect(body?["protocol_major"] as? Int == 1)
-    #expect(body?["protocol_minor"] as? Int == 2)   // our live hello now advertises minor 2
+    #expect(body?["protocol_minor"] as? Int == 3)   // our live hello now advertises minor 3
 }
 
 @Test func clipTextRoundTrip() throws {
@@ -122,9 +122,9 @@ import Foundation
 }
 
 @Test func clipFilesRoundTripAndTopLevelFieldOrder() throws {
-    let files: [(name: String, data: Data)] = [
-        (name: "노트.txt", data: Data("one".utf8)),
-        (name: "b.bin", data: Data([0, 1, 2])),
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "노트.txt", data: Data("one".utf8), relPath: nil),
+        (name: "b.bin", data: Data([0, 1, 2]), relPath: nil),
     ]
     let msg = WireMessage.clipFiles(files: files, ts: 5.0)
     #expect(msg.kind == "files")
@@ -163,7 +163,7 @@ import Foundation
     let base = "결과보고서"
     let nfd = base.decomposedStringWithCanonicalMapping + ".pdf"
     let nfc = base.precomposedStringWithCanonicalMapping + ".pdf"
-    let msg = WireMessage.clipFiles(files: [(name: nfd, data: Data([1]))], ts: 0)
+    let msg = WireMessage.clipFiles(files: [(name: nfd, data: Data([1]), relPath: nil)], ts: 0)
     #expect(Array((msg.files?[0].name ?? "").utf8) == Array(nfc.utf8))
 }
 
@@ -179,20 +179,106 @@ import Foundation
     #expect(ok?.count == 1)
     #expect(ok?[0].name == "a.txt")
     #expect(ok?[0].data == Data("x".utf8))
+    #expect(ok?[0].relPath == nil)
 }
 
 @Test func clipPayloadFilesKindAndAggregateHash() {
     let payload = ClipPayload.files([
-        (name: "a", data: Data("one".utf8)),
-        (name: "b", data: Data("two".utf8)),
+        (name: "a", data: Data("one".utf8), relPath: nil),
+        (name: "b", data: Data("two".utf8), relPath: nil),
     ])
     #expect(payload.kind == "files")
     #expect(payload.payloadHash == aggregateFilesHash([
         sha256Hex(Data("one".utf8)), sha256Hex(Data("two".utf8))]))
 }
 
-@Test func protocolMinorCoversFilesAnd64MiBFrames() {
+@Test func protocolMinorCoversFilesFramesAndFolderTrees() {
     // Cumulative feature level: >= 1 accepts kind:"files", >= 2 accepts frames
-    // up to 64 MiB (see LargeFrameTests).
-    #expect(Wire.protocolMinor == 2)
+    // up to 64 MiB (see LargeFrameTests), >= 3 rebuilds folder trees from the
+    // optional per-entry "path". Minor 3 gates NOTHING on the send path.
+    #expect(Wire.protocolMinor == 3)
+}
+
+@Test func clipFilesCarriesPathOnlyForFolderEntries() throws {
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("one".utf8), relPath: "docs/a.txt"),
+        (name: "loose.bin", data: Data([0, 1, 2]), relPath: nil),
+    ]
+    let msg = WireMessage.clipFiles(files: files, ts: 5.0)
+    let entries = try #require(msg.files)
+    #expect(entries[0].path == "docs/a.txt")
+    #expect(entries[1].path == nil)
+    // A nil path is OMITTED from the JSON, so every frame that exists today
+    // stays byte-identical (loose files carry no path field at all).
+    let frame = try msg.encodeFrame()
+    let json = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as! [String: Any]
+    let raw = json["files"] as! [[String: Any]]
+    #expect(raw[0]["path"] as? String == "docs/a.txt")
+    #expect(raw[1]["path"] == nil)
+    #expect(raw[1].keys.sorted() == ["bytes", "content", "hash", "name"])
+}
+
+@Test func clipFilesNormalizesPathToNFCAndDropsInvalidPaths() {
+    let nfd = "결과".decomposedStringWithCanonicalMapping
+    let nfc = "결과".precomposedStringWithCanonicalMapping
+    let m1 = WireMessage.clipFiles(
+        files: [(name: nfd + ".txt", data: Data([1]), relPath: nfd + "/" + nfd + ".txt")],
+        ts: 0)
+    #expect(Array((m1.files?[0].path ?? "").utf8) == Array((nfc + "/" + nfc + ".txt").utf8))
+    // The sender MUST emit only valid paths: a traversal path degrades to a
+    // flat entry instead of a frame the receiver would have to reject.
+    let m2 = WireMessage.clipFiles(
+        files: [(name: "a.txt", data: Data([1]), relPath: "../a.txt")], ts: 0)
+    #expect(m2.files?[0].path == nil)
+    #expect(m2.files?[0].name == "a.txt")
+}
+
+@Test func wirePathValidationRules() {
+    #expect(isValidWirePath("docs/a.txt", name: "a.txt"))
+    #expect(isValidWirePath("docs/sub dir/a.txt", name: "a.txt"))
+    #expect(!isValidWirePath("/docs/a.txt", name: "a.txt"))      // absolute
+    #expect(!isValidWirePath("../a.txt", name: "a.txt"))         // traversal
+    #expect(!isValidWirePath("docs/./a.txt", name: "a.txt"))     // dot segment
+    #expect(!isValidWirePath("docs//a.txt", name: "a.txt"))      // empty segment
+    #expect(!isValidWirePath("docs\\a.txt", name: "a.txt"))      // backslash
+    #expect(!isValidWirePath("C:/docs/a.txt", name: "a.txt"))    // drive letter
+    #expect(!isValidWirePath("docs/a.txt", name: "b.txt"))       // last segment != name
+    #expect(!isValidWirePath("", name: "a.txt"))
+    #expect(!isValidWirePath(String(repeating: "d/", count: 33) + "a.txt", name: "a.txt"))
+    let deep = String(repeating: "0123456789/", count: 22) + "a.txt"   // 247 scalars
+    #expect(deep.unicodeScalars.count > Wire.maxPathLength)
+    #expect(!isValidWirePath(deep, name: "a.txt"))
+    // Length is counted in UNICODE SCALARS (== Python len()), never in
+    // graphemes or UTF-16 units. This path is 136 graphemes but 266 scalars
+    // (and 526 UTF-16 units): a grapheme count would ACCEPT it while Python
+    // rejects it, which is exactly the silent cross-implementation split the
+    // 240 cap exists to prevent. Keep this case non-ASCII.
+    let flags = String(repeating: "🇰🇷", count: 130) + "/a.txt"
+    #expect(flags.count <= Wire.maxPathLength)                 // graphemes: 136
+    #expect(flags.unicodeScalars.count > Wire.maxPathLength)   // scalars: 266
+    #expect(!isValidWirePath(flags, name: "a.txt"))
+    // NFD is normalized, never rejected (see the shared decision in
+    // Interfaces — Tasks 1 and 7 must match): Swift's String == is canonical
+    // and every segment goes through sanitizeFilename (NFC) on the way to disk.
+    let nfd = "결과".decomposedStringWithCanonicalMapping
+    #expect(isValidWirePath(nfd + "/" + nfd + ".txt", name: nfd + ".txt"))
+    #expect(isValidWirePath(nfd + "/" + nfd + ".txt",
+                            name: "결과".precomposedStringWithCanonicalMapping + ".txt"))
+}
+
+@Test func sanitizeWirePathSanitizesEverySegment() {
+    #expect(sanitizeWirePath("docs/CON/a?b.txt") == "docs/_CON/a_b.txt")
+    #expect(sanitizeWirePath("docs/sub/a.txt") == "docs/sub/a.txt")
+}
+
+@Test func decodeFileEntriesCarriesPathThroughRaw() {
+    let tree = WireFileEntry(
+        name: "a.txt", content: Data("x".utf8).base64EncodedString(),
+        hash: sha256Hex(Data("x".utf8)), bytes: 1, path: "docs/a.txt")
+    #expect(decodeFileEntries([tree])?[0].relPath == "docs/a.txt")
+    // No path field -> relPath nil -> exactly today's flat behavior.
+    let flat = WireFileEntry(
+        name: "b.txt", content: Data("y".utf8).base64EncodedString(),
+        hash: sha256Hex(Data("y".utf8)), bytes: 1)
+    #expect(decodeFileEntries([flat])?[0].relPath == nil)
 }

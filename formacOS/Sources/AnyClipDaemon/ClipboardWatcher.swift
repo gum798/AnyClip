@@ -149,7 +149,7 @@ public final class ClipboardWatcher {
         // regardless of what we end up sending.
         lastFileFingerprints = fingerprints
 
-        var sendable: [(name: String, data: Data)] = []
+        var sendable: [(name: String, data: Data, relPath: String?)] = []
         var running = 0
         var skippedForSize = 0
         // Folders are collected during the loop and named in ONE notification
@@ -172,7 +172,7 @@ public final class ClipboardWatcher {
                 continue
             }
             running += fp.size
-            sendable.append((name: url.lastPathComponent, data: data))
+            sendable.append((name: url.lastPathComponent, data: data, relPath: nil))
         }
         if !skippedFolders.isEmpty, let onSkipped = callbacks.onFileSkipped {
             if skippedFolders.count == 1 {
@@ -215,7 +215,7 @@ public final class ClipboardWatcher {
 
     @discardableResult
     public func updateLocalFile(name: String, data: Data) -> Bool {
-        !updateLocalFiles([(name: name, data: data)]).isEmpty
+        !updateLocalFiles([(name: name, data: data, relPath: nil)]).isEmpty
     }
 
     /// Sanitize + uniquify, write every file into the flat receivedDir, then
@@ -223,7 +223,7 @@ public final class ClipboardWatcher {
     /// files actually PLACED (sanitized names) so the caller can baseline echo
     /// suppression to the placed set.
     @discardableResult
-    public func updateLocalFiles(_ files: [(name: String, data: Data)]) -> [(name: String, data: Data)] {
+    public func updateLocalFiles(_ files: [(name: String, data: Data, relPath: String?)]) -> [(name: String, data: Data)] {
         do {
             try FileManager.default.createDirectory(
                 at: receivedDir, withIntermediateDirectories: true)
