@@ -8,11 +8,20 @@ internal sealed class FakeClipboard : IClipboardSync
     public Func<ClipPayload, Task>? OnLocalChange { get; set; }
     public Func<string, Task>? OnFileSkipped { get; set; }
     public List<ClipPayload> Applied { get; } = new();
+    /// received/ stand-in: real placement runs in ReceivedTreeTests, so the fake
+    /// only has to report a shape the daemon can word a toast from.
+    public string ReceivedDir { get; set; } =
+        Path.Combine(Path.GetTempPath(), "anyclip-fake-recv-" + Guid.NewGuid());
     public Task RunAsync(CancellationToken ct) => Task.Delay(Timeout.Infinite, ct);
     public Task<bool> ApplyRemoteAsync(ClipPayload payload)
     {
         lock (Applied) Applied.Add(payload);
         return Task.FromResult(true);
+    }
+    public Task<ReceivedTree.PlacedFiles> ApplyFilesAsync(FilesClip clip)
+    {
+        lock (Applied) Applied.Add(clip);
+        return Task.FromResult(ReceivedTree.Write(ReceivedDir, clip.Files));
     }
 }
 
@@ -31,6 +40,8 @@ internal sealed class CompletingClipboard : IClipboardSync
         return Task.CompletedTask;
     }
     public Task<bool> ApplyRemoteAsync(ClipPayload payload) => Task.FromResult(true);
+    public Task<ReceivedTree.PlacedFiles> ApplyFilesAsync(FilesClip clip) =>
+        Task.FromResult(ReceivedTree.PlacedFiles.Empty);
 }
 
 internal sealed class FakeMdns : IMdnsService
@@ -354,14 +365,42 @@ public class DaemonTests
     }
 
     [Fact]
-    public void ClearDirectoryFilesKeepsSubdirs()
+    public void ClearReceivedDirRemovesFilesAndWholeTrees()
+    {
+        // Since protocol 1.3 received/ holds folder TREES, not just loose
+        // files. Leaving subdirectories behind would grow disk without bound
+        // AND make every restart bump the top-folder uniquify (docs-2, docs-3,
+        // ...), so the sweep is now recursive.
+        var dir = Path.Combine(Path.GetTempPath(), "anyclip-clear-" + Guid.NewGuid());
+        Directory.CreateDirectory(Path.Combine(dir, "docs", "sub"));
+        File.WriteAllText(Path.Combine(dir, "docs", "sub", "deep.txt"), "d");
+        File.WriteAllText(Path.Combine(dir, "a.txt"), "x");
+        Daemon.ClearReceivedDir(dir);
+        Assert.Empty(Directory.GetFileSystemEntries(dir));
+        Assert.True(Directory.Exists(dir));   // the directory itself survives
+    }
+
+    [Fact]
+    public void ClearReceivedDirUnlinksALinkToADirectoryWithoutDescending()
     {
         var dir = Path.Combine(Path.GetTempPath(), "anyclip-clear-" + Guid.NewGuid());
-        Directory.CreateDirectory(Path.Combine(dir, "sub"));
-        File.WriteAllText(Path.Combine(dir, "a.txt"), "x");
-        Daemon.ClearDirectoryFiles(dir);
-        Assert.Equal(new[] { "sub" },
-            Directory.GetFileSystemEntries(dir).Select(Path.GetFileName).ToArray());
+        Directory.CreateDirectory(dir);
+        var outside = Path.Combine(Path.GetTempPath(), "anyclip-keep-" + Guid.NewGuid());
+        Directory.CreateDirectory(outside);
+        var keeper = Path.Combine(outside, "keep.txt");
+        File.WriteAllText(keeper, "kept");
+        try { Directory.CreateSymbolicLink(Path.Combine(dir, "link-to-dir"), outside); }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException
+            or PlatformNotSupportedException)
+        { return; }   // symlink privilege unavailable on this runner
+
+        Daemon.ClearReceivedDir(dir);
+
+        // The LINK is gone; what it pointed at is untouched. A probe that
+        // RESOLVED the link would have called it a directory and emptied the
+        // target instead.
+        Assert.Empty(Directory.GetFileSystemEntries(dir));
+        Assert.Equal("kept", File.ReadAllText(keeper));
     }
 
     [Fact]

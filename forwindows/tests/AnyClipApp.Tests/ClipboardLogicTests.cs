@@ -343,4 +343,44 @@ public class ClipboardLogicTests
         await w.HandleClipboardUpdateAsync();
         Assert.Empty(changes);
     }
+
+    [Fact]
+    public async Task ApplyRemoteFilesClipRebuildsTreeAndPlacesTopLevelItems()
+    {
+        var dir = TempDir();
+        var (w, clip, changes, _) = Make(dir);
+        var payload = new FilesClip(new List<FileEntry>
+        {
+            new("a.txt", "aaa"u8.ToArray(), "docs/a.txt"),
+            new("b.txt", "bbb"u8.ToArray(), "docs/sub/b.txt"),
+            new("loose.txt", "lll"u8.ToArray()),
+        });
+        Assert.True(await w.ApplyRemoteAsync(payload));
+        Assert.Equal("aaa", File.ReadAllText(Path.Combine(dir, "docs", "a.txt")));
+        Assert.Equal("bbb", File.ReadAllText(Path.Combine(dir, "docs", "sub", "b.txt")));
+        Assert.Equal("lll", File.ReadAllText(Path.Combine(dir, "loose.txt")));
+        // CF_HDROP: the FOLDER once, plus the loose file — not every leaf.
+        Assert.Contains(clip.Written, x => x ==
+            $"files:{Path.Combine(dir, "docs")};{Path.Combine(dir, "loose.txt")}");
+        // Baseline is the placed items -> re-detect does not echo.
+        await w.HandleClipboardUpdateAsync();
+        Assert.Empty(changes);
+    }
+
+    [Fact]
+    public async Task ApplyFilesReturnsThePlacedShapeTheDaemonToastsFrom()
+    {
+        // The daemon words the received toast and seeds the single-file
+        // suppressor slot from THIS, never from the raw wire entries.
+        var dir = TempDir();
+        var (w, _, _, _) = Make(dir);
+        var placed = await w.ApplyFilesAsync(new FilesClip(new List<FileEntry>
+        {
+            new("a.txt", "aaa"u8.ToArray(), "docs/a.txt"),
+            new("b.txt", "bbb"u8.ToArray(), "docs/sub/b.txt"),
+        }));
+        Assert.Equal(new[] { "docs" }, placed.FolderTops.ToArray());
+        Assert.Equal("docs (2 files)", ReceivedTree.ReceivedSummary(placed));
+        Assert.False(ReceivedTree.PlacedSingleLooseFile(placed));
+    }
 }

@@ -312,7 +312,62 @@ public sealed class ClipboardWatcher : IClipboardSync
     }
 
     /// Inbound (peer → local). Baselines updated BEFORE writes.
-    public Task<bool> ApplyRemoteAsync(ClipPayload payload)
+    public async Task<bool> ApplyRemoteAsync(ClipPayload payload)
+    {
+        // kind:"files" has its own entry point (the daemon needs the placed
+        // shape); routed through it here so any other caller — and the App
+        // suite — still gets a plain answer. For a files clip that answer is
+        // "did anything land under received/": a failed CF_HDROP write is
+        // logged rather than returned, because the peer's files ARE on disk.
+        if (payload is FilesClip files)
+            return (await ApplyFilesAsync(files)).TopLevelItems.Count > 0;
+        return await ApplyOtherAsync(payload);
+    }
+
+    /// Rebuild one inbound files clip under received/ — folder entries into
+    /// their tree, everything else flat — then place the TOP-LEVEL items (each
+    /// rebuilt folder once, plus every loose file) on the clipboard in ONE
+    /// CF_HDROP write, in batch order.
+    ///
+    /// Tree rebuild, flat fallback, top-folder uniquify and the traversal
+    /// guards all live in ReceivedTree (Core, platform-neutral tests); this
+    /// layer only puts the result on the clipboard. Returns what actually
+    /// landed so the daemon can word the toast and seed echo suppression from
+    /// the PLACED shape. Port of Swift ClipboardWatcher.updateLocalFiles.
+    public async Task<ReceivedTree.PlacedFiles> ApplyFilesAsync(FilesClip clip)
+    {
+        try
+        {
+            // Every byte of disk work — up to 500 files, ~49 MB of writes, and
+            // the walk that fingerprints the placed tree — runs on a background
+            // thread; only the clipboard hand-off below needs the caller's.
+            // Mirrors Swift's offMainActor writeInbound and Python's
+            // asyncio.to_thread(watcher.update_local_files, ...).
+            var (placed, fingerprints) = await Task.Run(() =>
+            {
+                var written = ReceivedTree.Write(_receivedDir, clip.Files);
+                return (written, FingerprintList(written.TopPaths));
+            });
+            if (placed.TopPaths.Count == 0) return ReceivedTree.PlacedFiles.Empty;
+            // Baseline to exactly the paths going on the clipboard (folder
+            // expansion included) BEFORE the write, so the placement cannot
+            // echo back out. No await between the two.
+            _lastFileFingerprints = fingerprints;
+            if (!_clipboard.SetFilePaths(placed.TopPaths))
+                RotatingLog.Shared.Warning("clipboard write (files) failed");
+            // Reported even then: the bytes ARE under received/, so the toast
+            // that names the folder is still true and still useful. Matching
+            // Swift — zeroing here would toast "0 files" for a clip that landed.
+            return placed;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            RotatingLog.Shared.Warning($"files write to {_receivedDir} failed: {e.Message}");
+            return ReceivedTree.PlacedFiles.Empty;
+        }
+    }
+
+    private Task<bool> ApplyOtherAsync(ClipPayload payload)
     {
         switch (payload)
         {
@@ -338,30 +393,6 @@ public sealed class ClipboardWatcher : IClipboardSync
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     RotatingLog.Shared.Warning($"file write to {_receivedDir} failed: {e.Message}");
-                    return Task.FromResult(false);
-                }
-            case FilesClip fs:
-                try
-                {
-                    Directory.CreateDirectory(_receivedDir);
-                    var sanitized = TextHelpers.UniquifyNames(
-                        fs.Files.Select(x => TextHelpers.SanitizeFilename(x.Name)).ToList());
-                    var placed = new List<string>(fs.Files.Count);
-                    for (int i = 0; i < fs.Files.Count; i++)
-                    {
-                        string target = Path.Combine(_receivedDir, sanitized[i]);
-                        File.WriteAllBytes(target, fs.Files[i].Data);
-                        placed.Add(target);
-                    }
-                    // Baseline to the paths actually PLACED on the clipboard.
-                    _lastFileFingerprints = FingerprintList(placed);
-                    bool filesOk = _clipboard.SetFilePaths(placed);
-                    if (!filesOk) RotatingLog.Shared.Warning("clipboard write (files) failed");
-                    return Task.FromResult(filesOk);
-                }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-                {
-                    RotatingLog.Shared.Warning($"files write to {_receivedDir} failed: {e.Message}");
                     return Task.FromResult(false);
                 }
             default:

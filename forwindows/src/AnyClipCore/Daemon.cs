@@ -12,6 +12,13 @@ public interface IClipboardSync
     Task RunAsync(CancellationToken ct);
     /// Write a remote payload to the local clipboard; false = write failed.
     Task<bool> ApplyRemoteAsync(ClipPayload payload);
+    /// Apply a received kind:"files" clip: rebuild its tree under received/ and
+    /// place the TOP-LEVEL items, returning what actually landed (Empty when
+    /// nothing did). Its own entry point because the daemon words the toast and
+    /// seeds the single-file suppressor slot from the PLACED shape — which tops
+    /// are folders, how many files were really written — and a bool cannot carry
+    /// that. Mirrors Swift's ClipboardWatcher.updateLocalFiles -> PlacedFiles.
+    Task<ReceivedTree.PlacedFiles> ApplyFilesAsync(FilesClip clip);
 }
 
 public interface IPidLock
@@ -67,13 +74,33 @@ public sealed class Daemon(
         return $"clip not sent to {names.Count} peer(s) (too large for their AnyClip version)";
     }
 
-    public static void ClearDirectoryFiles(string dir)
+    /// Empty received/ without removing it. Recursive since protocol 1.3: the
+    /// directory now holds folder TREES, and leaving them behind would grow disk
+    /// without bound AND make every restart bump the top-folder uniquify
+    /// (docs-2, docs-3, ...).
+    ///
+    /// LINKS ARE NEVER FOLLOWED: the type probe is attribute-based and
+    /// link-confirmed, because a probe that RESOLVED the entry would report a
+    /// link-to-directory as a directory and empty the TARGET instead of removing
+    /// the link. A real directory goes recursively; everything else (files, and
+    /// links of every kind) is deleted as itself.
+    /// Keep in lockstep with anyclip.clear_received_dir and Swift
+    /// clearDirectoryContents.
+    public static void ClearReceivedDir(string dir)
     {
         if (!Directory.Exists(dir)) return;
-        foreach (var f in Directory.GetFiles(dir))
-            try { File.Delete(f); }
+        foreach (var entry in Directory.GetFileSystemEntries(dir))
+            try
+            {
+                var attrs = File.GetAttributes(entry);   // does not follow links
+                bool isDir = (attrs & FileAttributes.Directory) != 0;
+                if (isDir && !FolderExpander.IsRealLink(entry, attrs))
+                    Directory.Delete(entry, recursive: true);
+                else if (isDir) Directory.Delete(entry);  // the LINK, not its target
+                else File.Delete(entry);
+            }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            { RotatingLog.Shared.Debug($"could not remove {f}: {e.Message}"); }
+            { RotatingLog.Shared.Debug($"could not remove {entry}: {e.Message}"); }
     }
 
     public async Task RunForeverAsync(CancellationToken ct)
@@ -109,7 +136,7 @@ public sealed class Daemon(
     {
         pidLock.Prepare(config.Port);
         string receivedDir = Path.Combine(stateDir, "received");
-        ClearDirectoryFiles(receivedDir);
+        ClearReceivedDir(receivedDir);
 
         string nodeId = Guid.NewGuid().ToString().ToLowerInvariant();
         var coordinator = new SyncCoordinator();
@@ -125,7 +152,19 @@ public sealed class Daemon(
         manager.OnClip = async (payload, peer) =>
         {
             coordinator.MarkReceived(payload.Kind, payload.PayloadHash);
-            bool ok = await clipboard.ApplyRemoteAsync(payload);
+            // kind:"files" takes its own entry point: the toast and the echo
+            // seed below are derived from what actually LANDED under received/
+            // (which tops are folders, how many files were written), which a
+            // bool return cannot carry. Every other kind keeps the plain
+            // success/failure answer.
+            ReceivedTree.PlacedFiles? landed = null;
+            bool ok;
+            if (payload is FilesClip inbound)
+            {
+                landed = await clipboard.ApplyFilesAsync(inbound);
+                ok = landed.TopLevelItems.Count > 0;
+            }
+            else ok = await clipboard.ApplyRemoteAsync(payload);
             switch (payload)
             {
                 case TextClip t:
@@ -145,12 +184,20 @@ public sealed class Daemon(
                     toast($"AnyClip ← {peer}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
                     break;
                 case FilesClip fsc:
-                    if (fsc.Files.Count == 1)
-                        coordinator.MarkReceived("file", Hashing.Sha256Hex(fsc.Files[0].Data));
+                    var placed = landed!;
+                    // If a lone LOOSE file landed, the watcher re-detects it as a
+                    // single-file copy (kind "file"), so also suppress that hash.
+                    // Decided on the PLACED shape — a clip of one file that
+                    // rebuilt a FOLDER re-surfaces as kind:"files" and must not
+                    // burn the single-file slot.
+                    if (ReceivedTree.PlacedSingleLooseFile(placed))
+                        coordinator.MarkReceived("file", Hashing.Sha256Hex(placed.Files[0].Data));
                     RotatingLog.Shared.Info(
                         $"<- received {fsc.Files.Count} files from {peer} "
-                        + $"({(ok ? "written to clipboard" : "WRITE FAILED")})");
-                    toast($"AnyClip ← {peer}", $"{fsc.Files.Count} files");
+                        + $"({placed.Files.Count} written, {placed.FolderTops.Count} folder(s))");
+                    // Names the folder when the clip is one copied folder,
+                    // otherwise today's plain count. Never the raw wire path.
+                    toast($"AnyClip ← {peer}", ReceivedTree.ReceivedSummary(placed));
                     break;
             }
         };
@@ -263,7 +310,7 @@ public sealed class Daemon(
             manager.Shutdown();
             mdns.Stop();
             pidLock.Release();
-            ClearDirectoryFiles(receivedDir);
+            ClearReceivedDir(receivedDir);
             CurrentDirectory = null;
         }
     }

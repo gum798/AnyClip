@@ -81,27 +81,40 @@ public static class TextHelpers
     /// (no extension -> appended). Keep in lockstep with Swift/Python.
     public static IReadOnlyList<string> UniquifyNames(IReadOnlyList<string> names)
     {
-        // First occurrence keeps its name; later duplicates get " (2)", " (3)"
-        // before the LAST extension (a leading dot is not an extension:
-        // ".env" -> ".env (2)"). Candidates colliding with an already-emitted
-        // name are bumped further. Lockstep with Swift/Python.
         var used = new HashSet<string>(StringComparer.Ordinal);
         var result = new List<string>(names.Count);
-        foreach (var name in names)
-        {
-            if (used.Add(name)) { result.Add(name); continue; }
-            int dot = name.LastIndexOf('.');
-            string stem = dot <= 0 ? name : name[..dot];
-            string ext = dot <= 0 ? "" : name[dot..];
-            int n = 2;
-            string candidate = $"{stem} ({n}){ext}";
-            while (!used.Add(candidate))
-            {
-                n++;
-                candidate = $"{stem} ({n}){ext}";
-            }
-            result.Add(candidate);
-        }
+        foreach (var name in names) result.Add(UniquifyName(name, used));
         return result;
+    }
+
+    /// UniquifyNames for ONE more name against a set already taken, with an
+    /// optional second predicate for names that are taken WITHOUT being in the
+    /// set — on the receive side, what is already sitting in received/.
+    /// `used` is updated with whatever this call claims, so successive calls
+    /// cannot hand out the same name twice.
+    ///
+    /// First occurrence keeps its name; later duplicates get " (2)", " (3)"
+    /// before the LAST extension (a leading dot is not an extension:
+    /// ".env" -> ".env (2)"). Candidates colliding with an already-claimed name
+    /// are bumped further. Keep in lockstep with Swift uniquifyName and
+    /// anyclip.uniquify_against.
+    public static string UniquifyName(
+        string name, ISet<string> used, Func<string, bool>? alsoTaken = null)
+    {
+        bool IsFree(string candidate) =>
+            !used.Contains(candidate) && !(alsoTaken?.Invoke(candidate) ?? false);
+        if (IsFree(name)) { used.Add(name); return name; }
+        int dot = name.LastIndexOf('.');
+        string stem = dot <= 0 ? name : name[..dot];
+        string ext = dot <= 0 ? "" : name[dot..];
+        int n = 2;
+        string bumped = $"{stem} ({n}){ext}";
+        while (!IsFree(bumped))
+        {
+            n++;
+            bumped = $"{stem} ({n}){ext}";
+        }
+        used.Add(bumped);
+        return bumped;
     }
 }
