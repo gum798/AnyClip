@@ -189,30 +189,7 @@ public class FolderExpanderTests
     }
 
     [Fact]
-    public void WirePathForRejectsWhatTheReceiverWouldRejectAndDropsToLoose()
-    {
-        // The sender MUST NOT emit a path its own validator rejects. A real
-        // filesystem can produce one, so WirePathFor is the single choke point:
-        // null means "ship this file as a LOOSE entry", never "drop the file".
-        Assert.Equal("docs/a.txt", FolderExpander.WirePathFor("docs/a.txt", "a.txt"));
-
-        // Deeper than 32 segments (no disk tree needed — and none is BUILT here
-        // on purpose, since a 33-deep or 240-char path can blow past MAX_PATH on
-        // the windows-latest runner that executes this suite).
-        var deep33 = string.Join("/", Enumerable.Repeat("d", Wire.MaxPathSegments)) + "/a.txt";
-        Assert.Null(FolderExpander.WirePathFor(deep33, "a.txt"));
-
-        // Sanitized total over 240 characters.
-        var long241 = new string('x', 235) + "/a.txt";
-        Assert.Null(FolderExpander.WirePathFor(long241, "a.txt"));
-
-        // A backslash in a file NAME is legal on macOS/Linux and reachable on
-        // Windows via a mounted share; it is not legal on the wire.
-        Assert.Null(FolderExpander.WirePathFor("docs/back\\slash.txt", "back\\slash.txt"));
-    }
-
-    [Fact]
-    public async Task AnUnrepresentablePathShipsTheFileAsALooseEntry()
+    public async Task AnUnrepresentablePathIsKeptInThePayloadAndDroppedAtEncode()
     {
         var root = MakeTree("deep");
         // 32 nested single-character directories puts the file at 34 segments
@@ -225,16 +202,27 @@ public class FolderExpanderTests
         var plan = await FolderExpander.ExpandAsync(
             new[] { root }, ClipboardWatcher_FileBudget, 500);
 
-        // Both files still ship — the over-deep one just loses its path rather
-        // than being dropped, or shipping a path the receiver would reject.
+        // Both files still ship, and BOTH keep their folder provenance in the
+        // payload: RelPath null means LOOSE, and the fan-out reads it that way
+        // (a null here would let this tree fragment ride the first-file
+        // kind:"file" fallback onto a protocol-1.0 peer).
         Assert.Equal(2, plan.Entries.Count);
         var leaf = Assert.Single(plan.Entries, e => e.Name == "leaf.txt");
-        Assert.Null(leaf.RelPath);
+        Assert.Equal("deep/" + nested, leaf.RelPath);
         Assert.Equal("deep/shallow.txt",
             Assert.Single(plan.Entries, e => e.Name == "shallow.txt").RelPath);
         // Not counted as a skip: nothing was skipped.
         Assert.Equal(0, plan.SkippedFiles);
         Assert.Empty(plan.TooLargeFolders);
+
+        // The sender still MUST NOT emit a path its own validator rejects — that
+        // is the ENCODER's call, made per frame. The over-deep entry goes out
+        // flat; the representable one keeps its path. (Same split as
+        // anyclip.send_clip and Swift clipFiles.)
+        var wire = WireMessage.ClipFiles(plan.Entries, 1);
+        Assert.Null(Assert.Single(wire.Files!, f => f.Name == "leaf.txt").Path);
+        Assert.Equal("deep/shallow.txt",
+            Assert.Single(wire.Files!, f => f.Name == "shallow.txt").Path);
     }
 
     [Fact]

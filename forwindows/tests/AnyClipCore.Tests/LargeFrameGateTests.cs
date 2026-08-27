@@ -52,6 +52,13 @@ public sealed class GateLog : IDisposable
     }
 }
 
+/// Named collection shared with LinkManagerTests — see LogSeam.
+public static class LogSeam
+{
+    public const string Name = "anyclip-log-seam";
+}
+
+[Collection(LogSeam.Name)]
 public class LargeFrameGateTests(GateLog log) : IClassFixture<GateLog>
 {
     // Every test in the class reads the SAME log file (xUnit runs a class's

@@ -121,29 +121,6 @@ public static class FolderExpander
     internal static string WalkErrorMessage(string path, string reason) =>
         $"folder walk error under {path}: {reason}; subtree skipped";
 
-    /// The single choke point for "may this path go on the wire?". Returns
-    /// `relPath` when it passes EVERY wire rule, or null when the file must ship
-    /// as a LOOSE entry instead.
-    ///
-    /// The sender MUST NOT emit a path its own validator rejects, and a real
-    /// filesystem can produce one: a name containing '\' (legal on macOS/Linux,
-    /// reachable on Windows through a mounted share), a tree deeper than
-    /// Wire.MaxPathSegments, or a sanitized path over
-    /// Wire.MaxSanitizedPathLength characters. Dropping to loose keeps the file
-    /// syncing and lands it exactly where the receiver would have put it anyway
-    /// (an invalid path falls back to flat placement for that entry), whereas
-    /// skipping would silently lose data the user asked to copy.
-    /// Keep in lockstep with anyclip.py's watcher expansion and Swift
-    /// FolderExpander.
-    public static string? WirePathFor(string relPath, string name)
-    {
-        if (Wire.IsValidRelPath(relPath, name)) return relPath;
-        RotatingLog.Shared.Warning(
-            $"path not representable on the wire ({relPath}); "
-            + $"sending {name} as a loose file");
-        return null;
-    }
-
     /// The top-level name a folder ships under (and the name used in toasts).
     /// A drive root has no basename, so it keeps its raw path.
     public static string FolderDisplayName(string path)
@@ -177,9 +154,14 @@ public static class FolderExpander
     /// all-or-nothing admission needs to reject the folder. The caller's
     /// fingerprint is what suppresses the re-SEND, not this walk.
     ///
-    /// RelPath here is the RAW filesystem-derived path and is NOT yet known to
-    /// be wire-legal — the walk sorts on it, then ExpandAsync runs every value
-    /// through WirePathFor before it becomes a FileEntry.
+    /// RelPath here is the RAW filesystem-derived path and is NOT known to be
+    /// wire-legal: a real filesystem can produce a name containing '\' (legal on
+    /// macOS/Linux, reachable on Windows through a mounted share), a tree deeper
+    /// than Wire.MaxPathSegments, or a sanitized path over
+    /// Wire.MaxSanitizedPathLength characters. It travels into the FileEntry as
+    /// walked anyway — the encoder is the single choke point that decides what
+    /// may go on the wire, and it drops an unrepresentable path so the file
+    /// still ships (flat) instead of being silently lost.
     public static IReadOnlyList<WalkedFile> Walk(string root, long budget, int maxFiles)
     {
         var found = new List<WalkedFile>();
@@ -390,14 +372,20 @@ public static class FolderExpander
                     readBytes += data.Length;
                     // NFC, matching the path segments the walk built: the wire
                     // rules require the last segment to equal the name EXACTLY,
-                    // so a decomposed name against a composed path would send
-                    // the whole file loose for no reason.
+                    // so a decomposed name against a composed path would make
+                    // the encoder drop the path and flat-place the file for
+                    // no reason.
                     var leafName = TextHelpers.ToNfc(Path.GetFileName(w.FullPath));
-                    // The ONLY place a path reaches the wire from this sender.
-                    // A path the receiver would reject ships as a loose entry
-                    // (RelPath null) instead — the file always goes.
-                    entries.Add(new FileEntry(
-                        leafName, data, WirePathFor(w.RelPath, leafName)));
+                    // The path travels in the PAYLOAD exactly as walked, even
+                    // when no wire frame can carry it: RelPath is what marks the
+                    // entry folder-DERIVED, and the fan-out reads that mark to
+                    // keep a tree fragment off a protocol-1.0 peer and to warn
+                    // about a peer that will flatten. Validation belongs to the
+                    // encoder, which drops an unrepresentable path per frame
+                    // (WireMessage.ClipFiles) so the file still ships, flat.
+                    // Null here means LOOSE and nothing else, same as
+                    // anyclip.expand_folder and Swift FolderExpander.
+                    entries.Add(new FileEntry(leafName, data, w.RelPath));
                 }
                 used += readBytes;
                 continue;

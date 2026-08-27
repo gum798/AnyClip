@@ -3,6 +3,10 @@ using Xunit;
 
 namespace AnyClip.Core.Tests;
 
+/// Shares a collection with LargeFrameGateTests: both swap the process-wide
+/// RotatingLog.Shared to read back contract-pinned log lines, and xUnit
+/// parallelizes across collections, so they must not overlap.
+[Collection(LogSeam.Name)]
 public class LinkManagerTests
 {
     private static LinkManager MakeManager(
@@ -313,6 +317,63 @@ public class LinkManagerTests
         Assert.Equal("files", got!.Kind);
         Assert.Equal("docs/a.txt", got.Files![0].Path);
         Assert.Equal("docs/sub/b.txt", got.Files[1].Path);
+
+        cts.Cancel(); m.Shutdown();
+        try { await serve; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
+    public async Task FolderOnlyClipOfUNREPRESENTABLEPathsStillSkipsAMinorZeroPeer()
+    {
+        // Folder provenance has to survive EXPANSION, not just encoding. A tree
+        // whose every path is wire-invalid is still a folder clip: if expansion
+        // nulled those paths, the fan-out would read the clip as loose files and
+        // ride the first-file kind:"file" fallback onto a protocol-1.0 peer —
+        // exactly the stray fragment of someone's tree the folder-only rule
+        // exists to prevent. Dropping the path is the ENCODER's job (see
+        // WireMessage.ClipFiles), and it happens per FRAME, after this gate.
+        var root = Path.Combine(
+            Path.GetTempPath(), "anyclip-deeponly-" + Guid.NewGuid(), "deep");
+        // 32 nested single-character directories put every file at 34 segments
+        // ("deep" + 32 dirs + the name), past Wire.MaxPathSegments, while the
+        // ABSOLUTE path stays short enough for any platform.
+        var nested = Path.Combine(root, Path.Combine(Enumerable.Repeat("d", 32).ToArray()));
+        Directory.CreateDirectory(nested);
+        File.WriteAllText(Path.Combine(nested, "a.txt"), "one");
+        File.WriteAllText(Path.Combine(nested, "b.txt"), "two");
+
+        var plan = await FolderExpander.ExpandAsync(new[] { root }, 1 << 20, 500);
+        Assert.Equal(2, plan.Entries.Count);
+
+        using var log = new GateLog();
+        var m = MakeManager("tok", 28724, "deep-only", new(), new());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serve = m.ServeAsync(cts.Token);
+        Assert.True(await WaitUntil(() => m.IsServing));
+
+        using var oldPeer = await RawHandshake(28724, "tok", "d-old", "deep-old", 0, cts.Token);
+        using var modern = await RawHandshake(28724, "tok", "d-new", "deep-new", 3, cts.Token);
+        Assert.True(await WaitUntil(() => m.ActiveLinkCount == 2));
+
+        var res = await m.BroadcastAsync(new FilesClip(plan.Entries));
+
+        // Nothing at all on the minor-0 link, and it is KEPT.
+        Assert.Equal(new[] { "deep-new" }, res.Delivered);
+        Assert.Equal(0, res.OldPeerDrops);
+        Assert.Empty(res.SizeSkipped);
+        Assert.Equal(2, m.ActiveLinkCount);
+        Assert.Contains(LinkManager.FolderOnlyNoticeMessage("deep-old"), log.Text());
+
+        // The payload kept the raw paths — that is what classified the clip.
+        Assert.All(plan.Entries, e => Assert.NotNull(e.RelPath));
+
+        // A minor-3 peer still gets the whole clip as kind:"files"; the entries
+        // just land FLAT, because the encoder refuses a path its own validator
+        // rejects rather than poisoning the frame.
+        var got = await modern.ReceiveMessageAsync(cts.Token);
+        Assert.Equal("files", got!.Kind);
+        Assert.Equal(2, got.Files!.Count);
+        Assert.All(got.Files, f => Assert.Null(f.Path));
 
         cts.Cancel(); m.Shutdown();
         try { await serve; } catch (OperationCanceledException) { }
