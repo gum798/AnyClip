@@ -76,3 +76,26 @@ private func tempDir() -> URL {
     #expect(dropped == 0)
     if case .text(let s)? = out { #expect(s == "hi") } else { Issue.record("expected .text") }
 }
+
+@Test func downgradeExcludesFolderEntriesForAMinorZeroPeer() {
+    let payload = ClipPayload.files([
+        (name: "a.txt", data: Data([1]), relPath: "docs/a.txt"),
+        (name: "loose.txt", data: Data([2]), relPath: nil),
+    ])
+    let (out, dropped) = downgradeForPeer(payload, peerMinor: 0)
+    #expect(dropped == 1)
+    if case .file(let name, let data)? = out {
+        #expect(name == "loose.txt")            // the first LOOSE file, not the tree entry
+        #expect(data == Data([2]))
+    } else { Issue.record("expected the first loose file, got \(String(describing: out))") }
+}
+
+@Test func folderOnlyClipSendsNothingToAMinorZeroPeer() {
+    let payload = ClipPayload.files([
+        (name: "a.txt", data: Data([1]), relPath: "docs/a.txt"),
+        (name: "b.txt", data: Data([2]), relPath: "docs/b.txt"),
+    ])
+    let (out, dropped) = downgradeForPeer(payload, peerMinor: 0)
+    #expect(out == nil)         // nothing a kind:"file" frame could carry
+    #expect(dropped == 0)       // and therefore no "files not synced" toast
+}

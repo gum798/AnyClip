@@ -103,22 +103,51 @@ private func makeWatcher(
     #expect(changes.get().count == 1)
 }
 
-@Test @MainActor func folderOnClipboardIsSkippedWithToastOnce() async throws {
+/// Materialize `rel` under `dir` (creating intermediate dirs) with `body`.
+private func writeFile(_ dir: URL, _ rel: String, _ body: String) throws -> URL {
+    let target = rel.split(separator: "/").reduce(dir) { $0.appendingPathComponent(String($1)) }
+    try FileManager.default.createDirectory(
+        at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data(body.utf8).write(to: target)
+    return target
+}
+
+@Test @MainActor func folderOnClipboardExpandsIntoFilesWithPaths() async throws {
     let pb = privatePasteboard()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
-    let folder = tempDir() // a real directory
+    let root = tempDir()
+    let folder = root.appendingPathComponent("docs", isDirectory: true)
+    _ = try writeFile(folder, "a.txt", "one")
+    _ = try writeFile(folder, "sub/b.txt", "two")
+    pb.clearContents()
+    pb.writeObjects([folder as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .files(let fs) = got[0] {
+        #expect(fs.map(\.name) == ["a.txt", "b.txt"])
+        #expect(fs.map(\.relPath) == ["docs/a.txt", "docs/sub/b.txt"])
+        #expect(fs[0].data == Data("one".utf8))
+    } else { Issue.record("expected .files, got \(got)") }
+    #expect(skipped.get().isEmpty)
+    // Same copy is never re-detected (fingerprints cover the expanded tree).
+    await watcher.pollOnceForTesting()
+    #expect(changes.get().count == 1)
+}
+
+@Test @MainActor func emptyFolderToastsAndSendsNothing() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let folder = tempDir()   // a real, empty directory
     pb.clearContents()
     pb.writeObjects([folder as NSURL])
     await watcher.pollOnceForTesting()
     #expect(changes.get().isEmpty)
-    // Exactly one skip callback, singular wording naming the folder.
-    #expect(skipped.get().count == 1)
-    #expect(skipped.get()[0]
-        == "folder not synced — folders are not supported: \(folder.lastPathComponent)")
-    // Same copy is never re-detected.
+    #expect(skipped.get() == ["folder is empty; nothing to sync"])
     await watcher.pollOnceForTesting()
-    #expect(skipped.get().count == 1)
+    #expect(skipped.get().count == 1)          // not re-detected
 }
 
 @Test @MainActor func smallFileOnClipboardIsSent() async throws {
@@ -239,27 +268,28 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     #expect(changes.get().count == 1)
 }
 
-@Test @MainActor func folderMixedWithFilesSkipsFolderSyncsFiles() async throws {
+@Test @MainActor func folderMixedWithLooseFilesKeepsSelectionOrder() async throws {
     let pb = privatePasteboard()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
     let dir = tempDir()
     let folder = dir.appendingPathComponent("sub", isDirectory: true)
-    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    let f1 = dir.appendingPathComponent("a.txt"); try Data("one".utf8).write(to: f1)
-    let f2 = dir.appendingPathComponent("b.txt"); try Data("two".utf8).write(to: f2)
+    _ = try writeFile(folder, "inner.txt", "i")
+    let loose = try writeFile(dir, "a.txt", "one")
     pb.clearContents()
-    pb.writeObjects([folder as NSURL, f1 as NSURL, f2 as NSURL])
+    pb.writeObjects([folder as NSURL, loose as NSURL])
     await watcher.pollOnceForTesting()
     let got = changes.get()
     #expect(got.count == 1)
-    if case .files(let fs) = got[0] { #expect(fs.count == 2) } else { Issue.record("expected .files") }
-    // Single folder -> exactly one skip callback, singular wording with the name.
-    #expect(skipped.get().count == 1)
-    #expect(skipped.get()[0] == "folder not synced — folders are not supported: sub")
+    if case .files(let fs) = got[0] {
+        // Selection order: the folder's entries first, then the loose file.
+        #expect(fs.map(\.relPath) == ["sub/inner.txt", nil])
+        #expect(fs.map(\.name) == ["inner.txt", "a.txt"])
+    } else { Issue.record("expected .files, got \(got)") }
+    #expect(skipped.get().isEmpty)
 }
 
-@Test @MainActor func multipleFoldersEmitOneAggregatedSkip() async throws {
+@Test @MainActor func twoEmptyFoldersEmitOneEmptyToastAndTheLooseFileStillSyncs() async throws {
     let pb = privatePasteboard()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
@@ -268,18 +298,62 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     let d2 = dir.appendingPathComponent("two", isDirectory: true)
     try FileManager.default.createDirectory(at: d1, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: d2, withIntermediateDirectories: true)
-    let f1 = dir.appendingPathComponent("keep.txt"); try Data("k".utf8).write(to: f1)
+    let keep = try writeFile(dir, "keep.txt", "k")
     pb.clearContents()
-    pb.writeObjects([d1 as NSURL, d2 as NSURL, f1 as NSURL])
+    pb.writeObjects([d1 as NSURL, d2 as NSURL, keep as NSURL])
     await watcher.pollOnceForTesting()
-    // The single accepted file still syncs (legacy .file kind).
     let got = changes.get()
     #expect(got.count == 1)
     if case .file(let name, _) = got[0] { #expect(name == "keep.txt") }
-    else { Issue.record("expected single-file payload") }
-    // Exactly ONE aggregated skip notification, plural wording, no folder names.
+    else { Issue.record("expected single-file payload, got \(got)") }
+    #expect(skipped.get() == ["folder is empty; nothing to sync"])
+}
+
+@Test @MainActor func oversizeFolderIsAllOrNothingWithItsOwnToast() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let folder = dir.appendingPathComponent("huge", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    // Two sparse halves: each fits alone, the TOTAL does not -> the WHOLE
+    // folder is skipped before a single byte is read (no partial trees).
+    let each = ClipboardWatcher.fileBudget / 2 + 1
+    _ = try sparseFile(folder.appendingPathComponent("p1.bin"), size: each)
+    _ = try sparseFile(folder.appendingPathComponent("p2.bin"), size: each)
+    let loose = try writeFile(dir, "small.txt", "s")
+    pb.clearContents()
+    pb.writeObjects([folder as NSURL, loose as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .file(let name, _) = got[0] { #expect(name == "small.txt") }
+    else { Issue.record("expected the loose file only, got \(got)") }
+    #expect(skipped.get() == ["folder too large to sync: huge"])
+}
+
+@Test @MainActor func folderOverTheFileCountCapIsSkippedWholly() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let folder = dir.appendingPathComponent("many", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    for i in 0..<(ClipboardWatcher.maxFilesPerClip + 1) {
+        try Data("x".utf8).write(to: folder.appendingPathComponent("f\(i).txt"))
+    }
+    pb.clearContents()
+    pb.writeObjects([folder as NSURL])
+    await watcher.pollOnceForTesting()
+    #expect(changes.get().isEmpty)
+    #expect(skipped.get() == ["folder too large to sync: many"])
+    // The walk bails out one item past the cap, and that truncated prefix is
+    // STABLE, so re-copying the same folder yields the same fingerprint and it
+    // is neither re-detected nor re-toasted.
+    pb.clearContents()
+    pb.writeObjects([folder as NSURL])
+    await watcher.pollOnceForTesting()
     #expect(skipped.get().count == 1)
-    #expect(skipped.get()[0] == "2 folders not synced — folders are not supported")
 }
 
 @Test @MainActor func budgetGreedySkipOverflowFallsBackToSingleFile() async throws {
@@ -304,13 +378,13 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     #expect(skipped.get().contains { $0.contains("skipped") })
 }
 
-@Test @MainActor func maxFilesCapEmitsAtMostOneHundred() async throws {
+@Test @MainActor func maxFilesCapEmitsAtMostFiveHundred() async throws {
     let pb = privatePasteboard()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
     let dir = tempDir()
     var urls: [NSURL] = []
-    for i in 0..<101 {
+    for i in 0..<(ClipboardWatcher.maxFilesPerClip + 1) {
         let u = dir.appendingPathComponent("f\(i).txt")
         try Data("x".utf8).write(to: u)
         urls.append(u as NSURL)
@@ -319,8 +393,10 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     await watcher.pollOnceForTesting()
     let got = changes.get()
     #expect(got.count == 1)
-    if case .files(let fs) = got[0] { #expect(fs.count == 100) } else { Issue.record("expected .files") }
-    #expect(skipped.get().contains { $0.contains("skipped") })
+    if case .files(let fs) = got[0] { #expect(fs.count == 500) }
+    else { Issue.record("expected .files") }
+    #expect(ClipboardWatcher.maxFilesPerClip == 500)   // in lockstep with Python
+    #expect(skipped.get() == ["1 file(s) skipped (too large to sync)"])
 }
 
 @Test @MainActor func updateLocalFilesWritesUniquifiedAndDoesNotEcho() async throws {

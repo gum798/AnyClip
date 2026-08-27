@@ -396,6 +396,9 @@ public actor LinkManager {
     ///  - minor < 2: a frame over the legacy 16 MiB receive cap is SKIPPED (the
     ///    peer would close the session on it). The link stays up and the peer
     ///    name lands in `sizeSkipped` for one aggregated toast.
+    ///  - minor 1-2: folder entries are sent AS IS (the peer ignores "path" and
+    ///    writes the files flat); logged once per clip per affected link.
+    ///  - minor 0 + folder-only clip: nothing to send on that link (log only).
     ///
     /// Each distinct payload variant is encoded at most ONCE per broadcast (and
     /// shares one timestamp): the same bytes back the size gate and every send
@@ -408,11 +411,25 @@ public actor LinkManager {
         // Variant kind ("text"/"image"/"file"/"files") -> its encoded frame, or
         // nil when the payload does not fit even the 64 MiB cap.
         var frames: [String: EncodedFrame?] = [:]
+        // Evaluated ONCE per clip: does this payload carry folder entries?
+        var hasFolders = false
+        if case .files(let fs) = payload { hasFolders = fs.contains { $0.relPath != nil } }
 
         for entry in links.values {
             let link = entry.link
             let (maybe, dropped) = downgradeForPeer(payload, peerMinor: link.peerProtocolMinor)
-            guard let outPayload = maybe else { continue }
+            guard let outPayload = maybe else {
+                if hasFolders {
+                    AnyLog.shared.info(
+                        "folder clip not sent to '\(link.peerName)' "
+                        + "(peer protocol 1.0 cannot receive folders)")
+                }
+                continue
+            }
+            if hasFolders, (1...2).contains(link.peerProtocolMinor) {
+                AnyLog.shared.info(
+                    "peer \(link.peerName) will flatten folders (protocol < 1.3)")
+            }
             let variant = outPayload.kind
             let encoded: EncodedFrame?
             if let cached = frames[variant] {

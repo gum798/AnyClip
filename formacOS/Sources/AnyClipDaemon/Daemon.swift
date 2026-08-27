@@ -49,15 +49,20 @@ public func clearDirectoryFiles(_ dir: URL) {
 }
 
 /// Decide what to actually send given the peer's protocol minor. Minor >= 1
-/// understands kind:"files" (pass through, dropped == 0). Minor 0 predates
-/// multi-file sync: degrade a .files batch to its first file as legacy
-/// kind:"file"; `dropped` counts the files left behind for the notification.
-/// Returns a nil payload only for an empty .files batch (nothing to send).
+/// understands kind:"files" (pass through, dropped == 0) — including each
+/// entry's optional path, which a peer below minor 3 simply ignores and writes
+/// flat. Minor 0 predates multi-file sync: degrade to the first LOOSE file as
+/// legacy kind:"file". Folder-derived entries are EXCLUDED from that fallback
+/// (a tree cannot be expressed in one kind:"file" frame), so a folder-only
+/// clip sends NOTHING on a minor-0 link — logged, never toasted. `dropped`
+/// counts the entries left behind for the notification.
+/// Returns a nil payload for an empty .files batch and for a folder-only clip
+/// to a minor-0 peer. Keep in lockstep with anyclip.downgrade_for_peer.
 public func downgradeForPeer(
     _ payload: ClipPayload, peerMinor: Int
 ) -> (payload: ClipPayload?, dropped: Int) {
     guard case .files(let fs) = payload, peerMinor < 1 else { return (payload, 0) }
-    guard let first = fs.first else { return (nil, 0) }
+    guard let first = fs.first(where: { $0.relPath == nil }) else { return (nil, 0) }
     return (.file(name: first.name, data: first.data), fs.count - 1)
 }
 

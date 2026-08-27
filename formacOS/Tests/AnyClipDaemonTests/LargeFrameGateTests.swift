@@ -323,3 +323,67 @@ private func readingConcurrently(
     #expect(got == nil)      // invalid frame length -> end of session
     server?.cancel()
 }
+
+// ---- folder fan-out (protocol 1.3) --------------------------------------
+
+@Test func folderClipFansOutWithFlattenAndMinorZeroLogs() async throws {
+    _ = sharedGateLogURL
+    let clips = Locked<[(ClipPayload, String)]>([]); let events = Locked<[DaemonEvent]>([])
+    let a = await makeManager(token: "tok", port: 28559, name: "a", clips: clips, events: events)
+    let serve = Task { try await a.serve() }; defer { serve.cancel() }
+    #expect(await waitUntil { await a.isServing })
+
+    let old = try await rawPeer(port: 28559, token: "tok", nodeID: "o", name: "flat-old", minor: 0)
+    let mid = try await rawPeer(port: 28559, token: "tok", nodeID: "m", name: "flat-mid", minor: 2)
+    defer { old.cancel(); mid.cancel() }
+    #expect(await waitUntil { await a.activeLinkCount() == 2 })
+
+    let files: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("one".utf8), relPath: "docs/a.txt"),
+        (name: "b.txt", data: Data("two".utf8), relPath: "docs/sub/b.txt"),
+    ]
+    let result = await a.broadcast(.files(files))
+    // minor 2 gets the SAME frame, paths intact (it flattens them itself);
+    // minor 0 gets nothing at all, and neither link is dropped.
+    #expect(result.delivered.map(\.peerName) == ["flat-mid"])
+    #expect(result.maxDropped == 0)
+    #expect(result.sizeSkipped.isEmpty)
+    let got = try await withTimeout(seconds: 5) { try await mid.receiveMessage() }
+    #expect(got?.kind == "files")
+    #expect(got?.files?.count == 2)
+    #expect(got?.files?[0].path == "docs/a.txt")
+    #expect(sharedLogText().contains("peer flat-mid will flatten folders (protocol < 1.3)"))
+    #expect(sharedLogText().contains("folder clip not sent to 'flat-old'"))
+    #expect(await a.activeLinkCount() == 2)
+    await a.shutdown()
+}
+
+// ---- folder walk diagnostics -------------------------------------------
+// FolderExpander is pure logic, but its unreadable-subtree report is a LOG
+// line, and this file owns the only AnyLog.shared capture in the suite (a
+// second configure() would re-point the shared logger under the parallel
+// runner), so the assertion lives here rather than in FolderExpanderTests.
+
+@Test func folderWalkReportsAnUnreadableSubtreeInsteadOfSkippingItSilently() throws {
+    _ = sharedGateLogURL
+    try #require(geteuid() != 0, "chmod 000 is not enforceable as root")
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("anyclip-walkperm-\(UUID().uuidString)")
+    let top = root.appendingPathComponent("docs", isDirectory: true)
+    let locked = top.appendingPathComponent("locked", isDirectory: true)
+    try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+    try Data("k".utf8).write(to: top.appendingPathComponent("keep.txt"))
+    try Data("h".utf8).write(to: locked.appendingPathComponent("hidden.txt"))
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+    defer {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: locked.path)
+    }
+    // The readable part still ships (same policy as an unreadable FILE)...
+    #expect(FolderExpander.walk(top).map(\.relPath) == ["docs/keep.txt"])
+    // ...but the vanished subtree is never SILENT.
+    let text = sharedLogText()
+    #expect(text.contains("folder walk error under"))
+    #expect(text.contains("subtree skipped"))
+    #expect(text.contains("locked"))
+}
