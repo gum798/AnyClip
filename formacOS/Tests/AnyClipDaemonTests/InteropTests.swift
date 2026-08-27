@@ -317,3 +317,59 @@ private func fileContains(_ url: URL, _ needle: String) -> Bool {
 
     await manager.shutdown()
 }
+
+@Test func folderOnlyClipIsNotSentToTheMinorZeroFakePeer() async throws {
+    let port: UInt16 = 28561
+    let (proc, out) = try await startFakePeer(port: port, token: "folder-token")
+    defer { if proc.isRunning { proc.terminate() } }
+
+    let clips = Locked<[ClipPayload]>([])
+    let manager = LinkManager(
+        config: LinkManager.LinkConfig(
+            token: "folder-token", port: 28562, name: "swift-folder",
+            appVersion: "0.0.0-test"),
+        nodeID: UUID().uuidString.lowercased())
+    await manager.setHandlers(
+        onClip: { payload, _ in clips.set(clips.get() + [payload]) }, emit: { _ in })
+
+    func waitUntil(_ timeout: Double, _ cond: @escaping () async -> Bool) async -> Bool {
+        let deadline = monotonicNow() + timeout
+        while monotonicNow() < deadline {
+            if await cond() { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return await cond()
+    }
+
+    let outcome = await manager.tryConnect(
+        to: .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!),
+        label: "127.0.0.1:\(port)")
+    #expect(outcome == .routed)
+    #expect(await waitUntil(5) { await manager.activeLinkCount() == 1 })
+
+    // Folder-only clip to a protocol-1.0 peer: nothing is sent, the link stays.
+    let tree: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("tree one".utf8), relPath: "docs/a.txt"),
+        (name: "b.txt", data: Data("tree two".utf8), relPath: "docs/sub/b.txt"),
+    ]
+    let folderResult = await manager.broadcast(.files(tree))
+    #expect(folderResult.delivered.isEmpty)
+    #expect(folderResult.maxDropped == 0)          // nothing delivered -> no toast
+    try await Task.sleep(nanoseconds: 1_000_000_000)
+    #expect(recvClipCount(out) == 0)
+    #expect(await manager.activeLinkCount() == 1)
+
+    // Mixed clip: the old peer still gets the first LOOSE file, never a tree entry.
+    let mixed: [(name: String, data: Data, relPath: String?)] = [
+        (name: "a.txt", data: Data("tree one".utf8), relPath: "docs/a.txt"),
+        (name: "loose.txt", data: Data("loose body".utf8), relPath: nil),
+    ]
+    let mixedResult = await manager.broadcast(.files(mixed))
+    #expect(mixedResult.delivered.count == 1)
+    #expect(mixedResult.maxDropped == 1)
+    #expect(await waitUntil(5) {
+        fileContains(out, "loose.txt") && !fileContains(out, "docs/a.txt")
+    })
+    #expect(recvClipCount(out) == 1)
+    await manager.shutdown()
+}

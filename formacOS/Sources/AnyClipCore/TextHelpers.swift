@@ -53,37 +53,51 @@ public func sanitizeFilename(_ name: String) -> String {
     return out
 }
 
-/// De-duplicate names WITHIN one received batch, after sanitization: the first
+/// One name's uniquify step against the names already taken: the first
 /// occurrence keeps its name, later duplicates get " (2)", " (3)" … inserted
 /// before the LAST extension (a leading dot is not an extension:
-/// ".env" -> ".env (2)"). A candidate that collides with an already-emitted
-/// name is bumped further. Keep in lockstep with the Python/C# receivers.
+/// ".env" -> ".env (2)"). `used` is updated with whatever is returned, so the
+/// caller can seed it with names that are already spoken for (the rebuilt
+/// folder tops of the same clip).
+///
+/// `alsoTaken` covers the names the caller cannot enumerate into `used` —
+/// what is already sitting in received/ on disk. received/ holds TREES now,
+/// so a loose file named like a folder already there must be bumped rather
+/// than planned straight onto a directory; anyclip.py expresses the same rule
+/// as `uniquify_names(sorted(existing) + names)[len(existing):]` and
+/// `uniquify_against(name, used)`. Keep in lockstep with the Python/C#
+/// receivers.
+public func uniquifyName(
+    _ name: String, used: inout Set<String>, alsoTaken: (String) -> Bool = { _ in false }
+) -> String {
+    func isFree(_ candidate: String) -> Bool {
+        !used.contains(candidate) && !alsoTaken(candidate)
+    }
+    if isFree(name) {
+        used.insert(name)
+        return name
+    }
+    let stem: String
+    let ext: String
+    if let dot = name.lastIndex(of: "."), dot != name.startIndex {
+        stem = String(name[..<dot])
+        ext = String(name[dot...])
+    } else {
+        stem = name
+        ext = ""
+    }
+    var n = 2
+    var candidate = "\(stem) (\(n))\(ext)"
+    while !isFree(candidate) {
+        n += 1
+        candidate = "\(stem) (\(n))\(ext)"
+    }
+    used.insert(candidate)
+    return candidate
+}
+
+/// De-duplicate names WITHIN one received batch, after sanitization.
 public func uniquifyNames(_ names: [String]) -> [String] {
     var used = Set<String>()
-    var out: [String] = []
-    for name in names {
-        if !used.contains(name) {
-            used.insert(name)
-            out.append(name)
-            continue
-        }
-        let stem: String
-        let ext: String
-        if let dot = name.lastIndex(of: "."), dot != name.startIndex {
-            stem = String(name[..<dot])
-            ext = String(name[dot...])
-        } else {
-            stem = name
-            ext = ""
-        }
-        var n = 2
-        var candidate = "\(stem) (\(n))\(ext)"
-        while used.contains(candidate) {
-            n += 1
-            candidate = "\(stem) (\(n))\(ext)"
-        }
-        used.insert(candidate)
-        out.append(candidate)
-    }
-    return out
+    return names.map { uniquifyName($0, used: &used) }
 }

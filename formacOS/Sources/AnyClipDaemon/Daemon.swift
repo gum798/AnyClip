@@ -78,6 +78,26 @@ public func sizeSkipMessage(_ names: [String]) -> String? {
     return "clip not sent to \(names.count) peer(s) (too large for their AnyClip version)"
 }
 
+/// True when a received files clip ended up as exactly ONE placed top-level
+/// item and that item is a LOOSE file rather than a folder — the only case in
+/// which the watcher would re-detect it as a single-file copy (kind "file").
+/// A placed FOLDER re-surfaces as kind:"files" and needs no extra seeding.
+/// Pure so the decision itself has a unit test, exactly like
+/// anyclip.placed_single_loose_file.
+public func placedSingleLooseFile(_ placed: PlacedFiles) -> Bool {
+    placed.topLevelItems.count == 1 && placed.folderTops.isEmpty
+}
+
+/// Toast body for an inbound kind:"files" batch. A folder-only clip names the
+/// folder ("<top> (N files)"); anything else keeps today's "N files".
+/// Keep in lockstep with anyclip.received_clip_message.
+public func receivedFilesBody(_ placed: PlacedFiles) -> String {
+    if placed.folderTops.count == 1, placed.topLevelItems.count == 1 {
+        return "\(placed.folderTops[0]) (\(placed.files.count) files)"
+    }
+    return "\(placed.files.count) files"
+}
+
 /// Assembles and supervises one daemon runtime: PeerLink + MdnsBeacon +
 /// ClipboardWatcher + watchdogs, restarting with 1s -> 60s backoff on
 /// errors (improvement over the Python GUI build, where watchdog-raised
@@ -180,27 +200,33 @@ public final class Daemon: @unchecked Sendable {
                     + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
                 notify("AnyClip ← \(peer)", "image (\(png.count / 1024) KB)")
             case .file(let name, let data):
-                let ok = await MainActor.run {
-                    watcherBox.get()?.updateLocalFile(name: name, data: data) ?? false
+                // updateLocalFile(s) is async now: it does its disk work off the
+                // main actor, so it is awaited directly rather than wrapped in
+                // MainActor.run. ClipboardWatcher is @MainActor (and therefore
+                // Sendable), so the box hand-off is safe from here.
+                var ok = false
+                if let watcher = watcherBox.get() {
+                    ok = await watcher.updateLocalFile(name: name, data: data)
                 }
                 AnyLog.shared.info(
                     "<- received file \(name) \(data.count) bytes from \(peer) "
                     + "(\(ok ? "written to clipboard" : "WRITE FAILED"))")
                 notify("AnyClip ← \(peer)", "file: \(name) (\(data.count / 1024) KB)")
             case .files(let fs):
-                let placed = await MainActor.run {
-                    watcherBox.get()?.updateLocalFiles(fs) ?? []
+                var placed = PlacedFiles()
+                if let watcher = watcherBox.get() {
+                    placed = await watcher.updateLocalFiles(fs)
                 }
-                // If exactly one file landed the watcher re-detects it as a
+                // If a lone LOOSE file landed, the watcher re-detects it as a
                 // single-file copy (kind "file"), so also suppress that hash.
-                if placed.count == 1 {
+                if placedSingleLooseFile(placed), let only = placed.files.first {
                     await coordinator.markReceived(
-                        kind: "file", hash: sha256Hex(placed[0].data))
+                        kind: "file", hash: sha256Hex(only.data))
                 }
                 AnyLog.shared.info(
                     "<- received \(fs.count) files from \(peer) "
-                    + "(\(placed.count) written to clipboard)")
-                notify("AnyClip ← \(peer)", "\(placed.count) files")
+                    + "(\(placed.files.count) written, \(placed.folderTops.count) folder(s))")
+                notify("AnyClip ← \(peer)", receivedFilesBody(placed))
             }
         }
 

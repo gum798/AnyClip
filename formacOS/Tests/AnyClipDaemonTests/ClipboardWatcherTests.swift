@@ -222,7 +222,7 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     let received = tempDir()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
-    let ok = watcher.updateLocalFile(name: "in:va/lid.txt", data: Data("x".utf8))
+    let ok = await watcher.updateLocalFile(name: "in:va/lid.txt", data: Data("x".utf8))
     #expect(ok)
     // basename rule: os.path.basename("in:va/lid.txt") == "lid.txt", so the
     // ":" never reaches the sanitized name.
@@ -456,15 +456,179 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     let received = tempDir()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
     let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
-    let placed = watcher.updateLocalFiles([
+    let placed = await watcher.updateLocalFiles([
         (name: "dup.txt", data: Data("1".utf8), relPath: nil),
         (name: "dup.txt", data: Data("2".utf8), relPath: nil),
     ])
-    #expect(placed.count == 2)
-    #expect(placed.map(\.name) == ["dup.txt", "dup (2).txt"])
+    #expect(placed.files.count == 2)
+    #expect(placed.files.map(\.name) == ["dup.txt", "dup (2).txt"])
+    #expect(placed.folderTops.isEmpty)
     #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("dup.txt").path))
     #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("dup (2).txt").path))
     // Placement baselines the fingerprint list, so the next poll does not echo.
     await watcher.pollOnceForTesting()
     #expect(changes.get().isEmpty)
+}
+
+@Test @MainActor func receivedTreeIsRebuiltAndOnlyTopItemsAreOnTheClipboard() async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    let placed = await watcher.updateLocalFiles([
+        (name: "a.txt", data: Data("one".utf8), relPath: "docs/a.txt"),
+        (name: "b.txt", data: Data("two".utf8), relPath: "docs/sub/b.txt"),
+        (name: "loose.txt", data: Data("three".utf8), relPath: nil),
+    ])
+    #expect(placed.files.map(\.name) == ["docs/a.txt", "docs/sub/b.txt", "loose.txt"])
+    #expect(placed.topLevelItems == ["docs", "loose.txt"])
+    #expect(placed.folderTops == ["docs"])
+    let deep = received.appendingPathComponent("docs/sub/b.txt")
+    #expect(try Data(contentsOf: deep) == Data("two".utf8))
+    // The clipboard carries the TOP-LEVEL items in batch order: the folder
+    // once, then the loose file.
+    #expect(ClipboardWatcher.grabFileURLs(pb).map(\.lastPathComponent) == ["docs", "loose.txt"])
+    // A rebuilt tree must not echo back out on the next poll.
+    await watcher.pollOnceForTesting()
+    #expect(changes.get().isEmpty)
+}
+
+@Test @MainActor func receivedTopFolderCollisionUniquifiesTheWholeClip() async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    try FileManager.default.createDirectory(
+        at: received.appendingPathComponent("docs"), withIntermediateDirectories: true)
+    let placed = await watcher.updateLocalFiles([
+        (name: "a.txt", data: Data("1".utf8), relPath: "docs/a.txt"),
+        (name: "b.txt", data: Data("2".utf8), relPath: "docs/b.txt"),
+    ])
+    #expect(placed.topLevelItems == ["docs-2"])
+    #expect(placed.files.map(\.name) == ["docs-2/a.txt", "docs-2/b.txt"])
+    #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("docs-2/b.txt").path))
+}
+
+@Test @MainActor func traversalPathIsPlacedFlatInsideReceivedDir() async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    let placed = await watcher.updateLocalFiles([
+        (name: "evil.txt", data: Data("x".utf8), relPath: "../../evil.txt"),
+    ])
+    #expect(placed.files.map(\.name) == ["evil.txt"])
+    #expect(placed.folderTops.isEmpty)
+    #expect(FileManager.default.fileExists(atPath: received.appendingPathComponent("evil.txt").path))
+    let escaped = received.deletingLastPathComponent().appendingPathComponent("evil.txt")
+    #expect(!FileManager.default.fileExists(atPath: escaped.path))
+}
+
+@Test @MainActor func anUnwritableEntryIsDemotedToAFlatNameNotDropped() async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    // "docs/sub" arrives as a FILE, so the mkdir for "docs/sub/b.txt" cannot
+    // succeed. That costs the SECOND entry its path -- not the clip, and not
+    // the entry: it lands flat, uniquified against everything already used
+    // (the loose "b.txt" of the same batch), so one fallback cannot clobber
+    // another entry. Mirrors the per-entry try in anyclip.update_local_files.
+    let placed = await watcher.updateLocalFiles([
+        (name: "b.txt", data: Data("loose".utf8), relPath: nil),
+        (name: "sub", data: Data("i am a file".utf8), relPath: "docs/sub"),
+        (name: "b.txt", data: Data("demoted".utf8), relPath: "docs/sub/b.txt"),
+    ])
+    #expect(placed.files.map(\.name) == ["b.txt", "docs/sub", "b (2).txt"])
+    #expect(placed.topLevelItems == ["b.txt", "docs", "b (2).txt"])
+    #expect(placed.folderTops == ["docs"])
+    #expect(try Data(contentsOf: received.appendingPathComponent("b.txt")) == Data("loose".utf8))
+    #expect(try Data(contentsOf: received.appendingPathComponent("b (2).txt"))
+        == Data("demoted".utf8))
+}
+
+@Test @MainActor func aLooseNameCollidingWithAReceivedFolderIsBumpedNotWrittenOntoIt()
+    async throws {
+    let pb = privatePasteboard()
+    let received = tempDir()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: received, changes: changes, skipped: skipped)
+    let folder = received.appendingPathComponent("docs")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    try Data("kept".utf8).write(to: folder.appendingPathComponent("keep.txt"))
+    let placed = await watcher.updateLocalFiles([
+        (name: "docs", data: Data("loose docs".utf8), relPath: nil),
+    ])
+    #expect(placed.files.map(\.name) == ["docs (2)"])
+    #expect(try Data(contentsOf: received.appendingPathComponent("docs (2)"))
+        == Data("loose docs".utf8))
+    // The folder that was already there is untouched.
+    #expect(try Data(contentsOf: folder.appendingPathComponent("keep.txt")) == Data("kept".utf8))
+}
+
+@Test func writeUnderRemovesASymlinkAtTheDestinationInsteadOfFollowingIt() throws {
+    let fm = FileManager.default
+    let received = tempDir()
+    let outside = tempDir()
+    let victim = outside.appendingPathComponent("victim.txt")
+    try Data("original".utf8).write(to: victim)
+    let dest = received.appendingPathComponent("link.txt")
+    try fm.createSymbolicLink(at: dest, withDestinationURL: victim)
+
+    try ClipboardWatcher.writeUnder(Data("peer bytes".utf8), to: dest, root: received)
+
+    // The link was removed, not followed: the peer's bytes stayed in received/.
+    #expect(try Data(contentsOf: dest) == Data("peer bytes".utf8))
+    #expect(try Data(contentsOf: victim) == Data("original".utf8))
+    let type = try fm.attributesOfItem(atPath: dest.path)[.type] as? FileAttributeType
+    #expect(type == .typeRegular)
+}
+
+@Test func writeUnderRefusesADestinationThatResolvesOutsideReceived() throws {
+    let fm = FileManager.default
+    let received = tempDir()
+    let outside = tempDir()
+    // An INTERMEDIATE symlink: the destination is lexically inside received/
+    // but resolves out of it, which only the realpath re-check can catch.
+    try fm.createSymbolicLink(
+        at: received.appendingPathComponent("escape"), withDestinationURL: outside)
+    let dest = received.appendingPathComponent("escape/loot.txt")
+    #expect(throws: (any Error).self) {
+        try ClipboardWatcher.writeUnder(Data("loot".utf8), to: dest, root: received)
+    }
+    #expect(!fm.fileExists(atPath: outside.appendingPathComponent("loot.txt").path))
+}
+
+@Test func onlyALonePlacedLooseFileSeedsTheSingleFileSuppressorSlot() {
+    // One loose file: the watcher would re-detect it as kind:"file".
+    var loose = PlacedFiles()
+    loose.files = [(name: "a.txt", data: Data())]
+    loose.topLevelItems = ["a.txt"]
+    #expect(placedSingleLooseFile(loose))
+    // One FOLDER holding one file re-surfaces as kind:"files", not "file" —
+    // seeding the single-file slot there would suppress an unrelated copy of
+    // the same bytes. Mirrors anyclip.placed_single_loose_file.
+    var oneFileFolder = PlacedFiles()
+    oneFileFolder.files = [(name: "docs/a.txt", data: Data())]
+    oneFileFolder.topLevelItems = ["docs"]
+    oneFileFolder.folderTops = ["docs"]
+    #expect(!placedSingleLooseFile(oneFileFolder))
+    // Two top-level items: every re-detection is a kind:"files" clip.
+    var two = PlacedFiles()
+    two.files = [(name: "a.txt", data: Data()), (name: "b.txt", data: Data())]
+    two.topLevelItems = ["a.txt", "b.txt"]
+    #expect(!placedSingleLooseFile(two))
+    #expect(!placedSingleLooseFile(PlacedFiles()))
+}
+
+@Test func receivedToastNamesTheFolderOnlyForAFolderOnlyClip() {
+    var folderOnly = PlacedFiles()
+    folderOnly.files = [(name: "docs/a.txt", data: Data()), (name: "docs/b.txt", data: Data())]
+    folderOnly.topLevelItems = ["docs"]
+    folderOnly.folderTops = ["docs"]
+    #expect(receivedFilesBody(folderOnly) == "docs (2 files)")
+    var mixed = folderOnly
+    mixed.topLevelItems = ["docs", "loose.txt"]
+    mixed.files.append((name: "loose.txt", data: Data()))
+    #expect(receivedFilesBody(mixed) == "3 files")
 }

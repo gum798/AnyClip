@@ -22,6 +22,26 @@ public struct FileFingerprint: Equatable, Sendable {
     }
 }
 
+/// What one inbound batch put on disk and on the clipboard.
+public struct PlacedFiles: Sendable {
+    /// Every file written, in batch order; `name` is the path RELATIVE to
+    /// received/ ("<top>/<sub>/<leaf>" for tree entries).
+    public var files: [(name: String, data: Data)] = []
+    /// The items placed on the pasteboard, in batch order: each rebuilt folder
+    /// once, plus every loose file.
+    public var topLevelItems: [String] = []
+    /// The subset of topLevelItems that are rebuilt folders.
+    public var folderTops: [String] = []
+    public init() {}
+}
+
+/// A destination that would leave received/. Never fatal: the caller demotes
+/// THAT entry to a flat name and writes it anyway.
+struct ReceivedPathEscape: Error, CustomStringConvertible {
+    let path: String
+    var description: String { "resolved destination escapes received/: \(path)" }
+}
+
 /// One item of a scanned selection, in selection order: a loose file
 /// (`entries == nil`) or a folder carrying its expansion. Produced by
 /// `ClipboardWatcher.scan` so no caller ever walks the same tree twice.
@@ -266,45 +286,151 @@ public final class ClipboardWatcher {
     }
 
     @discardableResult
-    public func updateLocalFile(name: String, data: Data) -> Bool {
-        !updateLocalFiles([(name: name, data: data, relPath: nil)]).isEmpty
+    public func updateLocalFile(name: String, data: Data) async -> Bool {
+        !(await updateLocalFiles([(name: name, data: data, relPath: nil)])).files.isEmpty
     }
 
-    /// Sanitize + uniquify, write every file into the flat receivedDir, then
-    /// place ALL written URLs on the clipboard in ONE writeObjects. Returns the
-    /// files actually PLACED (sanitized names) so the caller can baseline echo
-    /// suppression to the placed set.
+    /// Rebuild one inbound batch under receivedDir — folder entries into their
+    /// tree, everything else flat — then place the TOP-LEVEL items (each folder
+    /// once, plus every loose file) on the clipboard in ONE writeObjects, in
+    /// batch order. Returns what actually landed so the caller can baseline echo
+    /// suppression and word the toast.
     @discardableResult
-    public func updateLocalFiles(_ files: [(name: String, data: Data, relPath: String?)]) -> [(name: String, data: Data)] {
-        do {
-            try FileManager.default.createDirectory(
-                at: receivedDir, withIntermediateDirectories: true)
-        } catch {
-            AnyLog.shared.warning("received dir create failed: \(error)")
-            return []
-        }
-        let names = uniquifyNames(files.map { sanitizeFilename($0.name) })
-        var placedURLs: [NSURL] = []
-        var placed: [(name: String, data: Data)] = []
-        for (i, f) in files.enumerated() {
-            let target = receivedDir.appendingPathComponent(names[i])
-            do {
-                try f.data.write(to: target)
-                placedURLs.append(target as NSURL)
-                placed.append((name: names[i], data: f.data))
-            } catch {
-                AnyLog.shared.warning("file write to \(target.path) failed: \(error)")
-            }
-        }
-        guard !placedURLs.isEmpty else { return [] }
-        // Baseline the fingerprint list to the placed paths BEFORE the clipboard
-        // write so a racing poll cannot echo.
-        lastFileFingerprints = Self.fingerprints(for: placedURLs.map { $0 as URL })
+    public func updateLocalFiles(
+        _ files: [(name: String, data: Data, relPath: String?)]
+    ) async -> PlacedFiles {
+        let dir = receivedDir
+        // Every byte of disk work — up to 500 files, ~49 MB of writes, and the
+        // walk that fingerprints them — runs OFF the main actor; only the
+        // pasteboard hand-off below needs to be here. Mirrors Python's
+        // `await asyncio.to_thread(watcher.update_local_files, ...)`.
+        let written = await Self.offMainActor { Self.writeInbound(files, into: dir) }
+        guard !written.tops.isEmpty else { return PlacedFiles() }
+        // Baseline the fingerprints (tree files included) to the placed items
+        // BEFORE the clipboard write so a racing poll cannot echo. No suspension
+        // between the two, so a poll can never observe one without the other.
+        lastFileFingerprints = written.fingerprints
         pasteboard.clearContents()
-        let ok = pasteboard.writeObjects(placedURLs)
+        let ok = pasteboard.writeObjects(written.tops.map { $0 as NSURL })
         lastChangeCount = pasteboard.changeCount
         if !ok { AnyLog.shared.warning("clipboard write (files) failed") }
-        return placed
+        return written.placed
+    }
+
+    /// Everything one inbound batch does to the filesystem: plan the layout,
+    /// rebuild it under `dir`, and fingerprint what is about to be placed.
+    /// Pure IO, so `nonisolated` — the caller runs it off the main actor.
+    /// Port of the disk half of anyclip.update_local_files.
+    nonisolated static func writeInbound(
+        _ files: [(name: String, data: Data, relPath: String?)], into dir: URL
+    ) -> (placed: PlacedFiles, tops: [URL], fingerprints: [FileFingerprint]) {
+        let fm = FileManager.default
+        let empty: (PlacedFiles, [URL], [FileFingerprint]) = (PlacedFiles(), [], [])
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            AnyLog.shared.warning("received dir create failed: \(error)")
+            return empty
+        }
+        let root = dir.standardizedFileURL
+        // What received/ already holds. Names, not stats: received/ holds TREES
+        // now, so "taken" covers directories too — a colliding tree top is
+        // bumped to "<top>-2" and a loose file that would land ON one of them
+        // gets " (2)". Mirrors anyclip's `existing = {p.name for p in ...}`.
+        let existing = Set((try? fm.contentsOfDirectory(atPath: root.path)) ?? [])
+        let plan = ReceivedTree.plan(files) { name in
+            existing.contains(name)
+                || fm.fileExists(atPath: root.appendingPathComponent(name).path)
+        }
+        // Every name already spoken for, so a demoted entry (below) can clobber
+        // neither a planned one nor another demotion. Mirrors anyclip's
+        // `used = existing | {top for _rel, top in plan}`.
+        var used = existing.union(plan.map(\.top))
+        var placed = PlacedFiles()
+        var tops: [URL] = []
+        var seenTops = Set<String>()
+        for (i, item) in plan.enumerated() {
+            var rel = item.relativePath
+            var top = item.top
+            var isFolder = item.inTree
+            do {
+                try writeEntry(files[i].data, rel: rel, root: root, makeDirs: item.inTree)
+            } catch {
+                // A destination that escapes received/, that a directory already
+                // occupies, or that simply will not open costs THAT entry its
+                // path — never the rest of the clip, and never the entry itself.
+                AnyLog.shared.warning(
+                    "received path '\(rel)' not writable (\(error)); placing flat")
+                rel = uniquifyName(sanitizeFilename(files[i].name), used: &used)
+                top = rel
+                isFolder = false
+                do {
+                    try writeEntry(files[i].data, rel: rel, root: root, makeDirs: false)
+                } catch {
+                    AnyLog.shared.warning("file write for '\(rel)' failed: \(error); entry skipped")
+                    continue
+                }
+            }
+            placed.files.append((name: rel, data: files[i].data))
+            if seenTops.insert(top).inserted {
+                tops.append(root.appendingPathComponent(top))
+                placed.topLevelItems.append(top)
+                if isFolder { placed.folderTops.append(top) }
+            }
+        }
+        guard !tops.isEmpty else { return empty }
+        return (placed, tops, fingerprints(for: tops))
+    }
+
+    /// Write one planned entry, creating its intermediate directories first.
+    /// Throws (never drops) so the caller can demote the entry to a flat name.
+    private nonisolated static func writeEntry(
+        _ data: Data, rel: String, root: URL, makeDirs: Bool
+    ) throws {
+        // Fold the components by hand: appendingPathComponent would treat
+        // "docs/sub/b.txt" as one component to escape.
+        let dest = ReceivedTree.pathSegments(rel)
+            .reduce(root) { $0.appendingPathComponent($1) }
+            .standardizedFileURL
+        // Lexical guard first — cheap, and it never touches the filesystem.
+        guard dest.path.hasPrefix(root.path + "/") else {
+            throw ReceivedPathEscape(path: dest.path)
+        }
+        if makeDirs {
+            try FileManager.default.createDirectory(
+                at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
+        try writeUnder(data, to: dest, root: root)
+    }
+
+    /// Write `data` at `dest`, refusing to leave `root`.
+    ///
+    /// A symlink sitting AT the destination is REMOVED rather than followed:
+    /// received/ is our own scratch directory, and Data.write would otherwise
+    /// open through the link and drop peer bytes outside received/. The
+    /// containment check is then re-run on the REAL path (realpath of the
+    /// parent, which exists by now) — a lexical check cannot see an
+    /// INTERMEDIATE symlink pointing out of received/. Throws when the
+    /// destination escapes or the write fails; either way the caller falls back
+    /// to a flat name, it never drops the entry. Port of anyclip._write_under.
+    nonisolated static func writeUnder(_ data: Data, to dest: URL, root: URL) throws {
+        var info = stat()
+        if lstat(dest.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFLNK {
+            AnyLog.shared.warning("removing symlink in the way of \(dest.path)")
+            try FileManager.default.removeItem(at: dest)
+        }
+        guard let rootReal = realPath(root.path),
+              let parentReal = realPath(dest.deletingLastPathComponent().path),
+              parentReal == rootReal || parentReal.hasPrefix(rootReal + "/")
+        else { throw ReceivedPathEscape(path: dest.path) }
+        try data.write(to: dest)
+    }
+
+    /// realpath(3): symlinks resolved on an EXISTING path, like Path.resolve().
+    private nonisolated static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     // MARK: - Pasteboard readers
