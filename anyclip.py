@@ -1014,7 +1014,7 @@ def is_valid_wire_path(path, name: str) -> bool:
 
     The sender emits nothing else; the receiver verifies before touching the
     filesystem and falls back to flat placement for a violating entry. Keep
-    in lockstep with Swift isValidWirePath and C# IsValidWirePath."""
+    in lockstep with Swift isValidWirePath and C# Wire.IsValidRelPath."""
     if not isinstance(path, str) or not path:
         return False
     if path != unicodedata.normalize("NFC", path):
@@ -1043,7 +1043,7 @@ def entry_relpath(entry) -> Optional[str]:
 
 
 # Sidecar files no user means to sync. Excluded from a folder walk (log only).
-# Keep in lockstep with Swift folderJunkNames and C# FolderJunkNames.
+# Keep in lockstep with Swift FolderExpander.junkNames and C# FolderJunkNames.
 FOLDER_JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 
@@ -1055,7 +1055,7 @@ def expand_folder(path: str) -> list:
     so the receiver rebuilds received/<folder>/... Symlinks are never followed
     (log only, which also makes cycles impossible), junk sidecars are skipped,
     and empty directories simply vanish -- they are not representable on the
-    wire. Keep in lockstep with Swift expandFolder and C# ExpandFolder.
+    wire. Keep in lockstep with Swift FolderExpander.walk and C# ExpandFolder.
 
     An unreadable subdirectory is reported and skipped, not silently dropped;
     a partial tree is still allowed (same policy as an unreadable FILE). The

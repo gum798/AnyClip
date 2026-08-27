@@ -16,8 +16,8 @@ public enum Wire {
     /// Minor 3 is a capability MARKER only: it gates nothing on the send path.
     public static let protocolMinor = 3
     /// Wire-path caps for a kind:"files" entry's optional "path" field.
-    /// Keep in lockstep with anyclip.MAX_PATH_SEGMENTS / MAX_PATH_LENGTH and
-    /// C# Wire.MaxPathSegments / Wire.MaxPathLength.
+    /// Keep in lockstep with anyclip.MAX_PATH_SEGMENTS / MAX_PATH_CHARS and
+    /// C# Wire.MaxPathSegments / Wire.MaxSanitizedPathLength.
     public static let maxPathSegments = 32
     public static let maxPathLength = 240
     /// Legacy single-int field old peers read; equals protocolMajor.
@@ -390,7 +390,7 @@ private func wirePathSegments(_ path: String) -> [String] {
 /// UTF-16 units, so those three disagree on any emoji/non-BMP path and the
 /// same clip would rebuild a tree on one receiver and flat-place on another;
 /// C# must count runes, not .Length. Keep in lockstep with
-/// anyclip.is_valid_wire_path and C# Wire.IsValidWirePath.
+/// anyclip.is_valid_wire_path and C# Wire.IsValidRelPath.
 public func isValidWirePath(_ path: String, name: String) -> Bool {
     guard !path.isEmpty else { return false }
     // Byte-level, because String == is canonical and would call NFD equal.

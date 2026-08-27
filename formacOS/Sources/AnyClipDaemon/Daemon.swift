@@ -76,7 +76,8 @@ public func clearDirectoryContents(_ dir: URL) {
 /// clip sends NOTHING on a minor-0 link — logged, never toasted. `dropped`
 /// counts the entries left behind for the notification.
 /// Returns a nil payload for an empty .files batch and for a folder-only clip
-/// to a minor-0 peer. Keep in lockstep with anyclip.downgrade_for_peer.
+/// to a minor-0 peer. Keep in lockstep with anyclip.files_variant_for_link
+/// plus first_loose_entry, which split the same decision in two.
 public func downgradeForPeer(
     _ payload: ClipPayload, peerMinor: Int
 ) -> (payload: ClipPayload?, dropped: Int) {
