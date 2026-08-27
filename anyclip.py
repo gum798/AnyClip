@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import stat as stat_mod
@@ -322,7 +323,9 @@ def clear_received_dir() -> None:
         return
     for entry in target.iterdir():
         try:
-            if entry.is_file() or entry.is_symlink():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
                 entry.unlink()
         except OSError as exc:
             log.debug(f"could not remove {entry}: {exc}")
@@ -1159,6 +1162,78 @@ def fingerprint_paths(paths: list) -> list:
     return scan_selection(paths)[0]
 
 
+def _writable_relpath(ent) -> Optional[str]:
+    """The wire path of an entry, re-verified at the write boundary. Decode
+    already rejected violators; the writer never trusts its caller either."""
+    rel = entry_relpath(ent)
+    if rel and is_valid_wire_path(rel, ent[0]):
+        return rel
+    return None
+
+
+def plan_received_layout(files: list, existing) -> list:
+    """Map a decoded files clip onto destinations under received/.
+
+    Returns [(relative_destination, top_level_item), ...] in batch order, one
+    per entry: ``relative_destination`` is '<top>/<sub>/<name>' for a folder
+    entry and '<name>' for a loose file (or for any entry whose path violates
+    the wire rules -- flat fallback, never a drop). Each segment goes through
+    the existing per-name sanitizer (NFC + denylist + reserved names).
+
+    ``existing`` is the set of names already present in received/. A colliding
+    top segment becomes '<top>-2', '<top>-3', ... and the SAME replacement is
+    applied to every entry sharing that top, so one clip lands in ONE folder.
+    Loose entries keep the per-file ' (2)' uniquify."""
+    loose_idx = [i for i, ent in enumerate(files) if _writable_relpath(ent) is None]
+    loose = uniquify_names([sanitize_filename(files[i][0]) for i in loose_idx])
+    used = set(existing) | set(loose)
+    tops: dict = {}
+    plan: list = [None] * len(files)
+    for pos, i in enumerate(loose_idx):
+        plan[i] = (loose[pos], loose[pos])
+    for i, ent in enumerate(files):
+        rel = _writable_relpath(ent)
+        if rel is None:
+            continue
+        segments = [sanitize_filename(seg) for seg in rel.split("/")]
+        raw_top = segments[0]
+        if raw_top not in tops:
+            candidate, n = raw_top, 2
+            while candidate in used:
+                candidate = f"{raw_top}-{n}"
+                n += 1
+            tops[raw_top] = candidate
+            used.add(candidate)
+        segments[0] = tops[raw_top]
+        plan[i] = ("/".join(segments), segments[0])
+    return plan
+
+
+def received_clip_message(files: list) -> str:
+    """Toast body for an inbound kind:"files" clip: a clip that is entirely
+    ONE folder names that folder, anything else keeps the count wording."""
+    tops = set()
+    for ent in files:
+        rel = entry_relpath(ent)
+        if rel is None:
+            return f"{len(files)} files"
+        tops.add(rel.split("/", 1)[0])
+    if len(tops) == 1:
+        return f"{tops.pop()} ({len(files)} files)"
+    return f"{len(files)} files"
+
+
+def placed_single_loose_file(files: list, placed: int) -> bool:
+    """True when a received files clip ended up as exactly ONE placed
+    top-level item and that item is a LOOSE file rather than a folder.
+
+    Lifted out of on_remote_clip (a closure inside run(), untestable in
+    isolation) so the decision itself has a unit test. Entries are in batch
+    order and plan_received_layout preserves it, so the first placed item
+    corresponds to files[0]."""
+    return placed == 1 and bool(files) and entry_relpath(files[0]) is None
+
+
 class ClipboardWatcher:
     READ_FAIL_WARN_AT = 5
     # OS screenshot tools (notably macOS Screenshot.app) drop several
@@ -1422,23 +1497,44 @@ class ClipboardWatcher:
         return ok
 
     def update_local_files(self, files: list) -> int:
-        """Write received files under ~/.anyclip/received/ and place them on
-        the clipboard in one operation. ``files`` is [(name, raw_bytes), ...].
+        """Write a received clip under ~/.anyclip/received/ and place its
+        TOP-LEVEL items on the clipboard in one operation. ``files`` is
+        [(name, raw_bytes, relpath|None), ...] as decoded from the wire.
 
-        Names are sanitized then de-duplicated within the batch before
-        writing. macOS places only the FIRST file (AppleScript furl limit);
-        Windows places all. Baselines the fingerprint to the paths actually
-        PLACED on the clipboard so the just-written files are not re-detected.
-        Returns the number of files placed on the clipboard (0 on failure)."""
-        names = uniquify_names([sanitize_filename(ent[0]) for ent in files])
+        Entries carrying a path rebuild their folder tree (protocol 1.3);
+        entries without one keep the flat behavior. Every destination is
+        re-checked to stay under received/ after sanitization -- an entry that
+        would escape is written flat instead. macOS places only the FIRST
+        top-level item (AppleScript furl limit); Windows places all. Baselines
+        the fingerprint (folders expanded) to what was actually PLACED so the
+        files we just wrote are not re-detected. Returns the number of items
+        placed on the clipboard (0 on failure)."""
         target_dir = LOG_DIR / "received"
-        written = []  # absolute path strings, in batch order
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-            for safe, ent in zip(names, files):
-                target = target_dir / safe
-                target.write_bytes(bytes(ent[1]))
-                written.append(str(target))
+            root = target_dir.resolve()
+            existing = {p.name for p in target_dir.iterdir()}
+        except OSError as exc:
+            log.warning(f"file write to {target_dir} failed: {exc}")
+            return 0
+        plan = plan_received_layout(files, existing)
+        written: list = []  # absolute top-level paths, first appearance order
+        try:
+            for ent, (rel, top) in zip(files, plan):
+                dest = target_dir / rel
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.resolve().relative_to(root)
+                except (OSError, ValueError):
+                    # Never write outside received/: fall back to flat.
+                    log.warning(
+                        f"received path {rel!r} escapes received/; placing flat")
+                    dest = target_dir / sanitize_filename(ent[0])
+                    top = dest.name
+                dest.write_bytes(bytes(ent[1]))
+                top_path = str(target_dir / top)
+                if top_path not in written:
+                    written.append(top_path)
         except OSError as exc:
             log.warning(f"file write to {target_dir} failed: {exc}")
             return 0
@@ -1455,14 +1551,7 @@ class ClipboardWatcher:
         if not ok:
             log.warning("clipboard write (files) failed or unsupported on this OS")
             placed = []
-        fp = []
-        for p in placed:
-            try:
-                st = os.stat(p)
-            except OSError:
-                continue
-            fp.append((p, st.st_size, st.st_mtime_ns))
-        self._last_file_fp = fp or None
+        self._last_file_fp = fingerprint_paths(placed) or None
         return len(placed)
 
 
@@ -2888,19 +2977,20 @@ async def run(config: Config) -> None:
             aggregate = aggregate_files_hash(hashes)
             suppressor.mark_received("files", aggregate)
             placed = await asyncio.to_thread(watcher.update_local_files, data)
-            # Python-macOS places only the FIRST file; a re-detection of a
-            # lone placed file surfaces as kind:"file", so also seed the
-            # single-file suppressor slot with that file's hash.
-            if placed == 1:
+            # Python-macOS places only the FIRST top-level item; a re-detection
+            # of a lone placed LOOSE file surfaces as kind:"file", so also seed
+            # the single-file suppressor slot with that file's hash. A placed
+            # FOLDER re-surfaces as kind:"files" and needs no extra seeding.
+            if placed_single_loose_file(data, placed):
                 suppressor.mark_received("file", hashes[0])
             log.info(
                 f"<- received {len(data)} files from {peer!r} "
-                f"({placed} placed on clipboard)"
+                f"({placed} top-level item(s) placed on clipboard)"
             )
             if notify_enabled:
                 await notify_async(
                     title=f"AnyClip ← {peer}",
-                    message=f"{len(data)} files",
+                    message=received_clip_message(data),
                 )
 
     manager = LinkManager(config, node_id, on_remote_clip, max_peers=config.max_peers)
