@@ -44,6 +44,22 @@ public sealed class LinkManager
         public int Sent => Delivered.Count;
     }
 
+    /// Logged once per clip per affected link: the peer takes the kind:"files"
+    /// frame but is on protocol &lt; 1.3, so its strict decoder reads only name +
+    /// content and the tree lands flat. Pinned wording across all three
+    /// implementations. Keep in lockstep with anyclip's broadcast_files and
+    /// Swift LinkManager.broadcast.
+    public static string FlattenNoticeMessage(string peerName) =>
+        $"peer {peerName} will flatten folders (protocol < 1.3)";
+
+    /// Logged instead of a downgraded frame when EVERY entry of a files clip
+    /// came out of a copied folder and the peer is on protocol 1.0: the legacy
+    /// kind:"file" frame has nowhere to put a path, so a folder entry would land
+    /// loose and unlabelled. Nothing is sent on that link and the link stays up.
+    /// Pinned wording, in lockstep with anyclip and Swift.
+    public static string FolderOnlyNoticeMessage(string peerName) =>
+        $"folder-only clip not sent to '{peerName}' (peer protocol 1.0)";
+
     private static double UnixNow() =>
         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
 
@@ -365,11 +381,14 @@ public sealed class LinkManager
     /// Fan out one local clip to every active link. A per-link send failure drops
     /// only that link.
     ///
-    /// Two per-link gates run here, both keyed on the peer's advertised minor:
-    ///  - minor &lt; 1: a kind:"files" clip degrades to its first file.
+    /// The per-link gates run here are all keyed on the peer's advertised minor:
+    ///  - minor &lt; 1: a kind:"files" clip degrades to its first LOOSE file.
     ///  - minor &lt; 2: a frame over the legacy 16 MiB receive cap is SKIPPED (the
     ///    peer would close the session on it). The link stays UP and the peer
     ///    name lands in SizeSkipped for one aggregated toast.
+    ///  - minor 1-2: folder entries are sent AS IS (the peer ignores "path" and
+    ///    writes the files flat); logged once per clip per affected link.
+    ///  - minor 0 + folder-only clip: nothing to send on that link (log only).
     ///
     /// Both aggregates (OldPeerDrops, SizeSkipped) are per-copy so the caller
     /// emits at most ONE toast of each kind across all peers. Delivered carries
@@ -390,16 +409,38 @@ public sealed class LinkManager
         // Variant kind ("text"/"image"/"file"/"files") -> its encoded frame, or
         // null when the payload does not fit even the 64 MiB cap.
         var frames = new Dictionary<string, EncodedFrame?>();
+        // Evaluated ONCE per clip: does this payload carry folder entries?
+        bool hasFolders = payload is FilesClip fcAll && fcAll.Files.Any(f => f.RelPath is not null);
 
         foreach (var link in targets)
         {
             var toSend = payload;
             int dropped = 0;
-            if (payload is FilesClip fc && link.PeerProtocolMinor < 1)
+            bool flattens = false;
+            if (payload is FilesClip fc)
             {
-                dropped = fc.Files.Count - 1;
-                var first = fc.Files[0];
-                toSend = new FileClip(first.Name, first.Data);
+                if (link.PeerProtocolMinor < 1)
+                {
+                    // Protocol 1.0 takes one kind:"file" frame, which has no
+                    // place to carry a path — a folder entry would land loose
+                    // and unlabelled. Folder-derived entries are therefore
+                    // EXCLUDED from the fallback: a folder-only clip sends
+                    // NOTHING on this link (log only, link kept). Loose files
+                    // keep the first-file fallback.
+                    var loose = fc.Files.FirstOrDefault(f => f.RelPath is null);
+                    if (loose is null)
+                    {
+                        // Reached only when the clip is folder-ONLY: a mixed clip
+                        // still has a loose entry for the fallback.
+                        if (hasFolders)
+                            RotatingLog.Shared.Info(FolderOnlyNoticeMessage(link.PeerName));
+                        continue;
+                    }
+                    dropped = fc.Files.Count - 1;
+                    toSend = new FileClip(loose.Name, loose.Data);
+                }
+                else
+                    flattens = hasFolders && link.PeerProtocolMinor < 3;
             }
             if (!frames.TryGetValue(toSend.Kind, out var cached))
             {
@@ -424,6 +465,9 @@ public sealed class LinkManager
                 RotatingLog.Shared.Info(
                     $"peer {link.PeerName} protocol minor {link.PeerProtocolMinor} < 1: "
                     + $"sent 1 of {dropped + 1} files");
+            // Logged only once the peer actually TOOK the frame: a size-gated or
+            // failed link has no flattened tree to warn about.
+            if (flattens) RotatingLog.Shared.Info(FlattenNoticeMessage(link.PeerName));
             // Only a DELIVERED downgrade counts toward the fallback toast: a
             // gated or failed link received nothing to leave files behind on.
             oldPeerDrops = Math.Max(oldPeerDrops, dropped);

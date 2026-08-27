@@ -85,24 +85,29 @@ public class ClipboardLogicTests
     }
 
     [Fact]
-    public async Task FolderSkippedOnceWithToastAndFileSent()
+    public async Task EmptyFolderToastsTheEmptyWordingAndIsNotReDetected()
     {
         var dir = TempDir();
         var (w, clip, changes, skipped) = Make(dir);
-        var folder = TempDir();
+        var folder = TempDir();                 // no files inside
         clip.FilePaths = new List<string> { folder };
         await w.HandleClipboardUpdateAsync();
         Assert.Empty(changes);
-        Assert.Single(skipped);
-        Assert.Contains("folders are not supported", skipped[0]);
+        Assert.Equal("folder is empty; nothing to sync", Assert.Single(skipped));
         await w.HandleClipboardUpdateAsync();
-        Assert.Single(skipped); // fingerprint recorded → never re-detected
+        Assert.Single(skipped);                 // fingerprint recorded -> no re-detect
+    }
 
-        var file = Path.Combine(TempDir(), "note.txt");
-        File.WriteAllText(file, "file-body");
-        clip.FilePaths = new List<string> { file };
+    [Fact]
+    public async Task TwoEmptyFoldersStillShareOneToast()
+    {
+        var (w, clip, changes, skipped) = Make(TempDir());
+        clip.FilePaths = new List<string> { TempDir(), TempDir() };
         await w.HandleClipboardUpdateAsync();
-        Assert.Contains(changes, c => c is FileClip f && f.Name == "note.txt");
+        Assert.Empty(changes);
+        // AGGREGATED: the wording names no folder, so a second one has nothing
+        // to add — one toast per clip however many empty folders it held.
+        Assert.Equal("folder is empty; nothing to sync", Assert.Single(skipped));
     }
 
     [Fact]
@@ -241,36 +246,79 @@ public class ClipboardLogicTests
     }
 
     [Fact]
-    public async Task FolderMixedWithFilesSkipsFolderSyncsFiles()
+    public async Task FolderIsExpandedIntoAFilesClipWithPaths()
     {
         var (w, clip, changes, skipped) = Make(TempDir());
-        var d = TempDir();
-        var folder = TempDir();
-        var f1 = Path.Combine(d, "keep.txt"); File.WriteAllText(f1, "k");
-        var f2 = Path.Combine(d, "keep2.txt"); File.WriteAllText(f2, "k2");
-        clip.FilePaths = new List<string> { folder, f1, f2 };
+        var folder = Path.Combine(TempDir(), "docs");
+        Directory.CreateDirectory(Path.Combine(folder, "sub"));
+        File.WriteAllText(Path.Combine(folder, "a.txt"), "aaa");
+        File.WriteAllText(Path.Combine(folder, "sub", "b.txt"), "bbb");
+        clip.FilePaths = new List<string> { folder };
         await w.HandleClipboardUpdateAsync();
+        Assert.Empty(skipped);
         var fc = Assert.IsType<FilesClip>(Assert.Single(changes));
-        Assert.Equal(2, fc.Files.Count);
-        // Single folder -> exactly one skip callback, singular wording with the name.
-        Assert.Equal($"folder not synced — folders are not supported: {Path.GetFileName(folder)}",
-            Assert.Single(skipped));
+        Assert.Equal(new[] { "docs/a.txt", "docs/sub/b.txt" },
+            fc.Files.Select(f => f.RelPath).ToArray());
     }
 
     [Fact]
-    public async Task MultipleFoldersEmitOneAggregatedSkip()
+    public async Task FolderMixedWithFilesShipsBothInOneClip()
     {
         var (w, clip, changes, skipped) = Make(TempDir());
         var d = TempDir();
-        var folder1 = TempDir();
-        var folder2 = TempDir();
+        var folder = Path.Combine(TempDir(), "docs");
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "inside.txt"), "i");
         var f1 = Path.Combine(d, "keep.txt"); File.WriteAllText(f1, "k");
-        clip.FilePaths = new List<string> { folder1, folder2, f1 };
+        clip.FilePaths = new List<string> { folder, f1 };
         await w.HandleClipboardUpdateAsync();
-        // The single accepted file still syncs (legacy FileClip kind).
-        Assert.IsType<FileClip>(Assert.Single(changes));
-        // Exactly ONE aggregated skip notification, plural wording, no folder names.
-        Assert.Equal("2 folders not synced — folders are not supported", Assert.Single(skipped));
+        Assert.Empty(skipped);
+        var fc = Assert.IsType<FilesClip>(Assert.Single(changes));
+        // Selection order; the loose file carries no path.
+        Assert.Equal(new string?[] { "docs/inside.txt", null },
+            fc.Files.Select(f => f.RelPath).ToArray());
+    }
+
+    [Fact]
+    public async Task OversizeFolderToastsThePinnedStringAndSendsNothing()
+    {
+        var (w, clip, changes, skipped) = Make(TempDir());
+        var folder = Path.Combine(TempDir(), "heavy");
+        Directory.CreateDirectory(folder);
+        using (var fs = File.Create(Path.Combine(folder, "big.bin")))
+            fs.SetLength((long)ClipboardWatcher.FileBudget + 1);
+        clip.FilePaths = new List<string> { folder };
+        await w.HandleClipboardUpdateAsync();
+        Assert.Empty(changes);
+        Assert.Equal("folder too large to sync: heavy", Assert.Single(skipped));
+    }
+
+    [Fact]
+    public async Task AnEditDeepInsideACopiedFolderIsNoticed()
+    {
+        var (w, clip, changes, _) = Make(TempDir());
+        var folder = Path.Combine(TempDir(), "watched");
+        Directory.CreateDirectory(Path.Combine(folder, "sub"));
+        var inner = Path.Combine(folder, "sub", "a.txt");
+        File.WriteAllText(inner, "one");
+        clip.FilePaths = new List<string> { folder };
+        await w.HandleClipboardUpdateAsync();
+        Assert.Single(changes);
+        await w.HandleClipboardUpdateAsync();
+        Assert.Single(changes);                 // unchanged tree -> no re-send
+
+        // The folder's own (path, -1, mtime) triple does NOT move when a file
+        // in a SUBdirectory changes, so the fingerprint has to cover every
+        // walked file or a deep edit would never sync.
+        File.WriteAllText(inner, "one-and-then-some");
+        await w.HandleClipboardUpdateAsync();
+        Assert.Equal(2, changes.Count);
+    }
+
+    [Fact]
+    public void MaxFilesPerClipIsFiveHundred()
+    {
+        Assert.Equal(500, ClipboardWatcher.MaxFilesPerClip);
     }
 
     [Fact]

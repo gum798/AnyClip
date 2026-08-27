@@ -233,4 +233,54 @@ public class InteropTests
             if (!procB.HasExited) procB.Kill();
         }
     }
+
+    [Fact]
+    public async Task InteropFolderOnlyClipSendsNothingToTheMinorZeroPythonPeer()
+    {
+        int port = 28641;
+        string outFile = Path.Combine(Path.GetTempPath(), $"fake-peer-{Guid.NewGuid()}.jsonl");
+        using var proc = Process.Start(FakePeerPsi(port, outFile))!;
+        try
+        {
+            var ready = await proc.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal("READY", ready);
+
+            var manager = new LinkManager(
+                new LinkConfig("interop-token", 28642, "csharp-interop", "0.0.0-test"),
+                Guid.NewGuid().ToString().ToLowerInvariant());
+            manager.OnClip = (_, _) => Task.CompletedTask;
+            manager.Emit = _ => { };
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await manager.TryConnectAsync("127.0.0.1", port, $"127.0.0.1:{port}", cts.Token);
+            Assert.True(await WaitUntil(() => manager.ActiveLinkCount == 1));
+
+            // Every entry came from a copied folder, and protocol 1.0's single
+            // kind:"file" frame has nowhere to put a path -> nothing is sent to
+            // this peer at all.
+            var res = await manager.BroadcastAsync(new FilesClip(new List<FileEntry>
+            {
+                new("a.txt", "one"u8.ToArray(), "docs/a.txt"),
+                new("b.txt", "two"u8.ToArray(), "docs/sub/b.txt"),
+            }));
+            Assert.Empty(res.Delivered);
+            Assert.Equal(0, res.OldPeerDrops);
+            // Skipping is NOT dropping the link: the peer stays connected and a
+            // following ordinary clip still reaches it.
+            Assert.Equal(1, manager.ActiveLinkCount);
+
+            // Sentinel: waiting on a clip that DOES arrive is what turns
+            // "nothing was written" into a real assertion instead of a race
+            // against a still-empty file.
+            await manager.BroadcastAsync(new TextClip("after-folder"));
+            Assert.True(await WaitUntil(() =>
+                File.Exists(outFile) && ReadShared(outFile).Contains("after-folder")));
+            var seen = ReadShared(outFile);
+            Assert.DoesNotContain("\"kind\": \"files\"", seen);
+            Assert.DoesNotContain("a.txt", seen);
+
+            manager.Shutdown();
+        }
+        finally { if (!proc.HasExited) proc.Kill(); }
+    }
 }

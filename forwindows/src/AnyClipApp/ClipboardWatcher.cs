@@ -104,7 +104,10 @@ public sealed class ClipboardWatcher : IClipboardSync
     /// Mirrors Python: FILE_BUDGET = int((MAX_PAYLOAD - 256*1024) * 0.74)
     public static readonly int FileBudget =
         (int)((Wire.MaxPayload - 256 * 1024) * 0.74);
-    public const int MaxFilesPerClip = 100; // sender-side cap; receiver stays lenient
+    /// Sender-side cap; receiver stays lenient. Raised 100 -> 500 for protocol
+    /// 1.3: a document tree passes 100 files easily and FileBudget is the real
+    /// limit (worst-case extra JSON envelope still fits the 256 KiB reservation).
+    public const int MaxFilesPerClip = 500;
 
     private readonly IWin32Clipboard _clipboard;
     private readonly string _receivedDir;
@@ -116,7 +119,8 @@ public sealed class ClipboardWatcher : IClipboardSync
     // unlike the boot-based monotonic clocks in the Python/Swift ports,
     // so 0.0 would swallow the first image copied within 1 s of startup.
     private double _lastImageSendAt = double.NegativeInfinity;
-    private List<(string Path, long Size, long MTimeTicks)> _lastFileFingerprints = new();
+    private IReadOnlyList<(string Path, long Size, long MTimeTicks)> _lastFileFingerprints =
+        Array.Empty<(string, long, long)>();
     private int _consecReadFails;
     private bool _readFailWarned;
     private bool _updateRunning;
@@ -239,98 +243,59 @@ public sealed class ClipboardWatcher : IClipboardSync
         await CheckFileClipboardAsync();
     }
 
-    private static (string Path, long Size, long MTimeTicks)? Fingerprint(string path)
-    {
-        try
-        {
-            var info = new FileInfo(path);
-            if (!info.Exists)
-            {
-                var di = new DirectoryInfo(path);
-                if (!di.Exists) return null;
-                return (path, -1, di.LastWriteTimeUtc.Ticks); // folders: size -1
-            }
-            return (path, info.Length, info.LastWriteTimeUtc.Ticks);
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        { return null; }
-    }
-
-    private static List<(string Path, long Size, long MTimeTicks)> FingerprintList(
-        IReadOnlyList<string> paths)
-    {
-        var list = new List<(string Path, long Size, long MTimeTicks)>(paths.Count);
-        foreach (var p in paths)
-            if (Fingerprint(p) is { } fp) list.Add(fp);
-        return list;
-    }
+    /// The fingerprint half of the scan, for the two baselines (startup and
+    /// inbound placement) that have no use for the expansion. Both baselines and
+    /// the change comparison go through the SAME scan, so the two sides always
+    /// see the same shape — including one triple per file inside a copied or
+    /// just-placed folder. Port of anyclip.fingerprint_paths.
+    private static IReadOnlyList<(string Path, long Size, long MTimeTicks)> FingerprintList(
+        IReadOnlyList<string> paths) =>
+        FolderExpander.ScanSelection(paths, FileBudget, MaxFilesPerClip).Fingerprints;
 
     private async Task CheckFileClipboardAsync()
     {
         var paths = SafeRead(_clipboard.GetFilePaths);
         if (paths is null || paths.Count == 0) return;
-        var fps = FingerprintList(paths);
+        // ONE stat + walk pass per clipboard change, on a BACKGROUND thread.
+        // The walk does run on every change — noticing an edit deep inside a
+        // tree requires that — but FolderExpander bails out at the absolute
+        // caps, so its cost is bounded, and a 500-file tree walk never runs on
+        // the UI thread that WM_CLIPBOARDUPDATE arrives on. What the comparison
+        // below saves is the re-SEND and the re-READ of an unchanged selection,
+        // not the walk. Mirrors asyncio.to_thread(scan_selection, paths) and
+        // Swift's off-main-actor scan.
+        var scan = await Task.Run(
+            () => FolderExpander.ScanSelection(paths, FileBudget, MaxFilesPerClip));
+        var fps = scan.Fingerprints;
         if (fps.Count == 0 || fps.SequenceEqual(_lastFileFingerprints)) return;
         // Record FIRST — the fingerprint is always taken (even if everything is
-        // skipped) so nothing retry-loops.
+        // skipped) so nothing retry-loops. A folder fingerprints as
+        // (path, -1, dir mtime) PLUS one triple per walked file, which the
+        // expansion below never mutates, so an unsyncable or just-sent folder is
+        // not re-detected on the next update.
         _lastFileFingerprints = fps;
 
-        // Split folders from files. Skipped folders are collected here and named
-        // in ONE notification afterwards (spec: one skip notification per
-        // detection pass). Mirrors the Python `skipped_folders` accumulation.
-        var files = new List<string>();
-        var skippedFolders = new List<string>();
-        foreach (var p in paths)
-        {
-            if (Directory.Exists(p))
-            {
-                var display = Path.GetFileName(p.TrimEnd('/', '\\'));
-                if (string.IsNullOrEmpty(display)) display = p; // drive roots
-                RotatingLog.Shared.Warning($"folder on clipboard not synced (unsupported): {p}");
-                skippedFolders.Add(display);
-            }
-            else files.Add(p);
-        }
-        if (skippedFolders.Count == 1)
-            await SafeSkipAsync(
-                $"folder not synced — folders are not supported: {skippedFolders[0]}");
-        else if (skippedFolders.Count >= 2)
-            await SafeSkipAsync(
-                $"{skippedFolders.Count} folders not synced — folders are not supported");
+        // Folders are EXPANDED, not skipped (protocol 1.3): each becomes a set
+        // of entries carrying a "path" relative to the copied folder. This
+        // REPLACES the old "folder on clipboard not synced (unsupported)" path.
+        // Per-folder all-or-nothing against the remaining budget/count; loose
+        // files keep the greedy per-file rule and its existing toast. The reads
+        // are async, so the UI thread is never blocked on file I/O either.
+        var plan = await FolderExpander.ExpandAsync(scan.Items, FileBudget, MaxFilesPerClip);
+        foreach (var name in plan.TooLargeFolders)
+            await SafeSkipAsync($"folder too large to sync: {name}");
+        // One toast however many folders came back empty — the wording names none.
+        if (plan.EmptyFolders.Count > 0)
+            await SafeSkipAsync("folder is empty; nothing to sync");
+        if (plan.SkippedFiles > 0)
+            await SafeSkipAsync($"{plan.SkippedFiles} file(s) skipped (too large to sync)");
 
-        // Greedy: keep files in selection order while sum(raw) <= budget and
-        // count <= cap. Skipped (too large, over-cap, or unreadable) -> one toast.
-        var sendable = new List<(string Name, byte[] Data)>();
-        long cumulative = 0;
-        int skipped = 0;
-        foreach (var path in files)
-        {
-            if (sendable.Count >= MaxFilesPerClip) { skipped++; continue; }
-            long size;
-            try { size = new FileInfo(path).Length; }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                RotatingLog.Shared.Warning($"file stat failed for {path}: {e.Message}; skipping");
-                skipped++; continue;
-            }
-            if (cumulative + size > FileBudget) { skipped++; continue; }
-            byte[] data;
-            try { data = await File.ReadAllBytesAsync(path); }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                RotatingLog.Shared.Warning($"file read failed for {path}: {e.Message}; skipping");
-                skipped++; continue;
-            }
-            cumulative += size;
-            sendable.Add((Path.GetFileName(path), data));
-        }
-        if (skipped > 0)
-            await SafeSkipAsync($"{skipped} file(s) skipped (too large to sync)");
-
-        if (sendable.Count == 0) return;
-        ClipPayload payload = sendable.Count == 1
-            ? new FileClip(sendable[0].Name, sendable[0].Data)
-            : new FilesClip(sendable);
+        if (plan.Entries.Count == 0) return;
+        // A single LOOSE file keeps the legacy kind:"file" frame; a single
+        // folder-derived file must stay kind:"files" or its path is lost.
+        ClipPayload payload = plan.Entries.Count == 1 && plan.Entries[0].RelPath is null
+            ? new FileClip(plan.Entries[0].Name, plan.Entries[0].Data)
+            : new FilesClip(plan.Entries);
         try { await (OnLocalChange?.Invoke(payload) ?? Task.CompletedTask); }
         catch (Exception e)
         { RotatingLog.Shared.Error($"on_change(files) handler failed: {e}"); }

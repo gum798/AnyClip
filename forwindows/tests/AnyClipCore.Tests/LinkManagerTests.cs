@@ -264,4 +264,94 @@ public class LinkManagerTests
         cts.Cancel(); m.Shutdown();
         try { await serve; } catch (OperationCanceledException) { }
     }
+
+    [Fact]
+    public void FlattenNoticeMessageIsThePinnedWording()
+    {
+        // Pinned across all three implementations; logged once per clip per
+        // affected link when the peer takes the frame but cannot rebuild it.
+        Assert.Equal("peer old-pc will flatten folders (protocol < 1.3)",
+            LinkManager.FlattenNoticeMessage("old-pc"));
+    }
+
+    [Fact]
+    public void FolderOnlyNoticeMessageIsThePinnedWording()
+    {
+        // The other half of the pinned pair: what a minor-0 link gets INSTEAD
+        // of a downgraded frame when every entry came out of a folder. Quoted
+        // peer name, in lockstep with anyclip and Swift LinkManager.
+        Assert.Equal("folder-only clip not sent to 'old-pc' (peer protocol 1.0)",
+            LinkManager.FolderOnlyNoticeMessage("old-pc"));
+    }
+
+    [Fact]
+    public async Task FolderOnlyClipSendsNothingToAMinorZeroPeer()
+    {
+        var m = MakeManager("tok", 28722, "folder", new(), new());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serve = m.ServeAsync(cts.Token);
+        Assert.True(await WaitUntil(() => m.IsServing));
+
+        using var oldPeer = await RawHandshake(28722, "tok", "old-node", "old", 0, cts.Token);
+        using var modern = await RawHandshake(28722, "tok", "new-node", "new", 3, cts.Token);
+        Assert.True(await WaitUntil(() => m.ActiveLinkCount == 2));
+
+        var res = await m.BroadcastAsync(new FilesClip(new List<FileEntry>
+        {
+            new("a.txt", "one"u8.ToArray(), "docs/a.txt"),
+            new("b.txt", "two"u8.ToArray(), "docs/sub/b.txt"),
+        }));
+
+        // A folder entry cannot ride the first-file kind:"file" fallback, so
+        // the minor-0 link is skipped ENTIRELY — and kept up.
+        Assert.Equal(new[] { "new" }, res.Delivered);
+        Assert.Equal(0, res.OldPeerDrops);
+        Assert.Empty(res.SizeSkipped);
+        Assert.Equal(2, m.ActiveLinkCount);
+
+        var got = await modern.ReceiveMessageAsync(cts.Token);
+        Assert.Equal("files", got!.Kind);
+        Assert.Equal("docs/a.txt", got.Files![0].Path);
+        Assert.Equal("docs/sub/b.txt", got.Files[1].Path);
+
+        cts.Cancel(); m.Shutdown();
+        try { await serve; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
+    public async Task MinorZeroFallbackPicksTheFirstLooseFileAndMinorTwoGetsTheSameFrame()
+    {
+        var m = MakeManager("tok", 28723, "mixed", new(), new());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var serve = m.ServeAsync(cts.Token);
+        Assert.True(await WaitUntil(() => m.IsServing));
+
+        using var oldPeer = await RawHandshake(28723, "tok", "o-node", "old-mix", 0, cts.Token);
+        using var mid = await RawHandshake(28723, "tok", "m-node", "mid-mix", 2, cts.Token);
+        Assert.True(await WaitUntil(() => m.ActiveLinkCount == 2));
+
+        var res = await m.BroadcastAsync(new FilesClip(new List<FileEntry>
+        {
+            new("tree.txt", "one"u8.ToArray(), "docs/tree.txt"),
+            new("loose.txt", "two"u8.ToArray()),
+        }));
+        Assert.Equal(2, res.Sent);
+        Assert.Equal(1, res.OldPeerDrops);
+
+        // Minor 0: the folder entry is excluded, so the fallback carries the
+        // first LOOSE file, not files[0].
+        var toOld = await oldPeer.ReceiveMessageAsync(cts.Token);
+        Assert.Equal("file", toOld!.Kind);
+        Assert.Equal("loose.txt", toOld.Name);
+
+        // Minor 1-2: the SAME files frame, paths intact — the peer flattens
+        // benignly because its strict decoder reads only name + content.
+        var toMid = await mid.ReceiveMessageAsync(cts.Token);
+        Assert.Equal("files", toMid!.Kind);
+        Assert.Equal(2, toMid.Files!.Count);
+        Assert.Equal("docs/tree.txt", toMid.Files[0].Path);
+
+        cts.Cancel(); m.Shutdown();
+        try { await serve; } catch (OperationCanceledException) { }
+    }
 }
