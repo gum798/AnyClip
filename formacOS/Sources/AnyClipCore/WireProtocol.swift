@@ -340,20 +340,51 @@ public func decodeFileEntries(
 /// rejoined with "/". Used for the length rule below and by the receiver when
 /// it rebuilds the tree, so both judge the same string.
 public func sanitizeWirePath(_ path: String) -> String {
-    path.split(separator: "/", omittingEmptySubsequences: false)
-        .map { sanitizeFilename(String($0)) }
+    // Split on SCALARS, not Characters: a combining mark directly after "/"
+    // forms one grapheme cluster with it, so a Character-level split would not
+    // break where Python's code-point split does. Keep in lockstep with
+    // anyclip.sanitize_relpath.
+    wirePathSegments(path)
+        .map(sanitizeFilename)
         .joined(separator: "/")
 }
 
+/// The "/"-separated segments of a wire path, split on unicode scalars so the
+/// segmentation is identical to Python's `path.split("/")`. Empty segments are
+/// preserved so the caller can reject them.
+private func wirePathSegments(_ path: String) -> [String] {
+    Array(path.unicodeScalars)
+        .split(separator: "/", omittingEmptySubsequences: false)
+        .map { slice in
+            var s = ""
+            s.unicodeScalars.append(contentsOf: slice)
+            return s
+        }
+}
+
 /// True when `path` satisfies EVERY wire rule for a folder entry's optional
-/// "path": POSIX "/" separators, relative (no leading "/", no drive letter),
-/// no "." / ".." / empty segments, no backslashes, last segment equals `name`,
-/// <= Wire.maxPathSegments segments, sanitized length <= Wire.maxPathLength.
-/// Senders MUST only emit paths that pass; receivers MUST verify before
-/// rebuilding a tree and fall back to FLAT placement for that ONE entry when
-/// they do not. NFC is not a rejection rule: Swift's String == is canonical
-/// (NFC == NFD) and sanitizeFilename normalizes every segment on the way to
-/// disk — Python and C# accept-and-normalize too, they do not reject NFD.
+/// "path": POSIX "/" separators, NFC, relative (no leading "/", no drive
+/// letter), no "." / ".." / empty segments, no backslashes, last segment equals
+/// `name`, <= Wire.maxPathSegments segments, sanitized length <=
+/// Wire.maxPathLength. Senders MUST only emit paths that pass; receivers MUST
+/// verify before rebuilding a tree and fall back to FLAT placement for that ONE
+/// entry when they do not.
+///
+/// NFC IS A REJECTION RULE, not a normalization: a decomposed path is refused
+/// outright and the entry lands flat, exactly as anyclip.is_valid_wire_path
+/// does (`if path != unicodedata.normalize("NFC", path): return False`, pinned
+/// by tests/test_wire_files.py::test_only_nfc_paths_are_accepted_on_the_wire).
+/// The comparison MUST be byte-level: Swift's String == is canonical, so
+/// `path == NFC(path)` is true for a decomposed path and cannot express this
+/// check at all. C# (Task 7) must compare ordinally for the same reason — and
+/// because its String.Normalize() throws on invalid UTF-16, a byte/ordinal
+/// comparison is also the safe construction there.
+///
+/// SEPARATOR SCANS COUNT SCALARS, not Characters: a combining mark right after
+/// "/" or "\" forms a single grapheme cluster with it, so a Character-level
+/// scan would miss the separator that Python's code-point scan finds and the
+/// two would disagree about where segments begin.
+///
 /// LENGTH IS COUNTED IN UNICODE SCALARS (code points), matching Python's
 /// len(). String.count would count grapheme clusters and C# string.Length
 /// UTF-16 units, so those three disagree on any emoji/non-BMP path and the
@@ -361,17 +392,23 @@ public func sanitizeWirePath(_ path: String) -> String {
 /// C# must count runes, not .Length. Keep in lockstep with
 /// anyclip.is_valid_wire_path and C# Wire.IsValidWirePath.
 public func isValidWirePath(_ path: String, name: String) -> Bool {
-    guard !path.isEmpty, !path.contains(where: { $0 == "\\" }) else { return false }
-    let segments = path.split(separator: "/", omittingEmptySubsequences: false)
-        .map(String.init)
+    guard !path.isEmpty else { return false }
+    // Byte-level, because String == is canonical and would call NFD equal.
+    guard Array(path.utf8)
+            == Array(path.precomposedStringWithCanonicalMapping.utf8) else { return false }
+    let scalars = Array(path.unicodeScalars)
+    guard !scalars.contains("\\") else { return false }
+    let segments = wirePathSegments(path)
     guard !segments.isEmpty, segments.count <= Wire.maxPathSegments else { return false }
     for segment in segments where segment.isEmpty || segment == "." || segment == ".." {
         return false
     }
-    let first = Array(segments[0])
-    if first.count >= 2, first[1] == ":", first[0].isASCII, first[0].isLetter {
+    let firstChar = Character(scalars[0])
+    if scalars.count > 1, scalars[1] == ":", firstChar.isASCII, firstChar.isLetter {
         return false   // drive letter ("C:/...")
     }
-    guard segments[segments.count - 1] == name else { return false }
+    // Byte-level again: Python compares segments[-1] != name exactly, so a
+    // composed path with a decomposed `name` must NOT match here either.
+    guard Array(segments[segments.count - 1].utf8) == Array(name.utf8) else { return false }
     return sanitizeWirePath(path).unicodeScalars.count <= Wire.maxPathLength
 }

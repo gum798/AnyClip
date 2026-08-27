@@ -257,13 +257,42 @@ import Foundation
     #expect(flags.count <= Wire.maxPathLength)                 // graphemes: 136
     #expect(flags.unicodeScalars.count > Wire.maxPathLength)   // scalars: 266
     #expect(!isValidWirePath(flags, name: "a.txt"))
-    // NFD is normalized, never rejected (see the shared decision in
-    // Interfaces — Tasks 1 and 7 must match): Swift's String == is canonical
-    // and every segment goes through sanitizeFilename (NFC) on the way to disk.
+    // NFC is a REJECTION rule, not a normalization: a decomposed path is
+    // refused outright and the entry lands flat. Mirrors
+    // tests/test_wire_files.py::test_only_nfc_paths_are_accepted_on_the_wire
+    // (anyclip: `if path != normalize("NFC", path): return False`). Swift's
+    // String == is canonical — it calls NFD equal to NFC — so the validator
+    // can only express this on bytes; assert the forms really do differ first.
+    let nfc = "결과".precomposedStringWithCanonicalMapping
     let nfd = "결과".decomposedStringWithCanonicalMapping
-    #expect(isValidWirePath(nfd + "/" + nfd + ".txt", name: nfd + ".txt"))
-    #expect(isValidWirePath(nfd + "/" + nfd + ".txt",
-                            name: "결과".precomposedStringWithCanonicalMapping + ".txt"))
+    #expect(Array(nfd.utf8) != Array(nfc.utf8))
+    #expect(isValidWirePath(nfc + "/" + nfc + ".txt", name: nfc + ".txt"))   // composed: ok
+    #expect(!isValidWirePath(nfd + "/" + nfd + ".txt", name: nfd + ".txt"))
+    #expect(!isValidWirePath(nfd + "/" + nfd + ".txt", name: nfc + ".txt"))
+    // Composed path + DECOMPOSED name: Python compares segments[-1] != name
+    // exactly, so a canonical == here would accept what Python rejects.
+    #expect(!isValidWirePath(nfc + "/" + nfc + ".txt", name: nfd + ".txt"))
+}
+
+@Test func wirePathSeparatorScanCountsScalarsNotGraphemes() {
+    // A combining mark directly AFTER a separator forms ONE grapheme cluster
+    // with it, so a Character-level scan cannot see the separator that
+    // Python's code-point scan does — and the two implementations would then
+    // disagree about where segments begin. Both paths below are rejected by
+    // anyclip.is_valid_wire_path, and both would be ACCEPTED by a grapheme
+    // scan, so they pin the scalar scan rather than merely passing.
+    //
+    // (Both literals are built outside #expect: the macro stringifies its
+    // argument source text and chokes on a "\\" + "\u{...}" combination.)
+    //
+    // "\" + U+0301: a Character scan finds no backslash at all.
+    let combining = "\u{0301}"
+    let hiddenBackslash = "d\\" + combining + "ocs/a.txt"
+    #expect(!isValidWirePath(hiddenBackslash, name: "a.txt"))
+    // "/" + U+0301: a Character scan finds no separator, sees ONE segment, and
+    // would accept that whole string as its own last segment.
+    let hiddenSlash = "docs/" + combining + "a.txt"
+    #expect(!isValidWirePath(hiddenSlash, name: hiddenSlash))
 }
 
 @Test func sanitizeWirePathSanitizesEverySegment() {

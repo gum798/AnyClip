@@ -110,12 +110,22 @@ private func decodeGoldenFrame(_ name: String) throws -> WireMessage {
             #expect(isValidWirePath(path, name: e.name))  // our rules accept Python's
         }
         let data = try #require(strictBase64Decode(e.content))
-        #expect(sha256Hex(data) == hashes[i])
+        #expect(sha256Hex(data) == hashes[i])   // per-file hash recomputed from bytes
+        #expect(e.hash == hashes[i])            // wire hash matches manifest
         #expect(e.bytes == data.count)
     }
     // Both shapes must actually be exercised by the vector.
     #expect(entries.contains { $0.path != nil })
     #expect(entries.contains { $0.path == nil })
+    // The Python encoder OMITTED "path" entirely for the loose entry — it did
+    // not emit null. That omission is exactly what keeps every protocol-1.2
+    // frame byte-identical, so assert it on the raw fixture JSON, not on the
+    // decoded struct (which cannot tell "absent" from "null" apart).
+    let raw = try JSONSerialization.jsonObject(
+        with: fixture("clip_files_path.bin").dropFirst(4)) as! [String: Any]
+    let rawEntries = raw["files"] as! [[String: Any]]
+    let loose = try #require(paths.firstIndex(where: { $0 == nil }))
+    #expect(rawEntries[loose].keys.sorted() == ["bytes", "content", "hash", "name"])
     // Aggregate + total match the Python-canonical manifest values: adding
     // "path" must not change how a files clip hashes.
     #expect(m.hash == man["files_path_aggregate"] as? String)
