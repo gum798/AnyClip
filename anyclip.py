@@ -1030,6 +1030,99 @@ def entry_relpath(entry) -> Optional[str]:
     return entry[2] if len(entry) == 3 else None
 
 
+# Sidecar files no user means to sync. Excluded from a folder walk (log only).
+# Keep in lockstep with Swift folderJunkNames and C# FolderJunkNames.
+FOLDER_JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
+def expand_folder(path: str) -> list:
+    """Recursively list the syncable files under a copied folder.
+
+    Returns [(abs_path, size, mtime_ns, relpath), ...] sorted BYTE-WISE on
+    relpath. ``relpath`` is POSIX, NFC, and starts with the folder's own name
+    so the receiver rebuilds received/<folder>/... Symlinks are never followed
+    (log only, which also makes cycles impossible), junk sidecars are skipped,
+    and empty directories simply vanish -- they are not representable on the
+    wire. Keep in lockstep with Swift expandFolder and C# ExpandFolder."""
+    root = str(path).rstrip("/\\")
+    top = unicodedata.normalize("NFC", os.path.basename(root)) or "folder"
+    entries: list = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        keep_dirs = []
+        for d in sorted(dirnames):
+            if os.path.islink(os.path.join(dirpath, d)):
+                log.info(f"folder walk: skipping symlinked dir {d!r} (never followed)")
+                continue
+            keep_dirs.append(d)
+        dirnames[:] = keep_dirs
+        for fname in sorted(filenames):
+            full = os.path.join(dirpath, fname)
+            if fname in FOLDER_JUNK_NAMES:
+                log.debug(f"folder walk: skipping junk file {full!r}")
+                continue
+            if os.path.islink(full):
+                log.info(f"folder walk: skipping symlink {full!r} (never followed)")
+                continue
+            try:
+                st = os.stat(full)
+            except OSError as exc:
+                log.warning(f"folder walk: stat failed for {full!r}: {exc}; skipping")
+                continue
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            entries.append((full, st.st_size, st.st_mtime_ns,
+                            unicodedata.normalize("NFC", f"{top}/{rel}")))
+    entries.sort(key=lambda e: e[3].encode("utf-8"))
+    return entries
+
+
+def folder_fits(entries: list, total: int, count: int) -> bool:
+    """Per-folder ALL-OR-NOTHING admission against what the clip has left.
+
+    A folder is accepted only if its ENTIRE expansion fits the remaining
+    budget and file count -- no partial trees. An empty expansion never
+    "fits" (the caller toasts it separately)."""
+    if not entries:
+        return False
+    if count + len(entries) > MAX_FILES_PER_CLIP:
+        return False
+    return total + sum(size for _p, size, _m, _rel in entries) <= FILE_BUDGET
+
+
+def scan_selection(paths: list) -> tuple:
+    """Stat a clipboard selection ONCE, expanding any folder in it.
+
+    Returns ``(fp, items)``:
+      fp    -- ordered [(path, size, mtime_ns), ...] fingerprint. A folder
+               contributes its OWN entry plus one per file in its expanded
+               tree, so a folder we just sent (or just wrote into received/)
+               is not re-detected and a change INSIDE the tree is.
+      items -- [(path, os.stat_result, entries | None), ...] in selection
+               order; ``entries`` is expand_folder()'s output for a folder and
+               None for a plain file, so no caller ever walks twice.
+    A path that vanished between grab and stat drops out of both lists."""
+    fp: list = []
+    items: list = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        fp.append((path, st.st_size, st.st_mtime_ns))
+        if stat_mod.S_ISDIR(st.st_mode):
+            entries = expand_folder(path)
+            fp.extend((p, size, mtime) for p, size, mtime, _rel in entries)
+            items.append((path, st, entries))
+        else:
+            items.append((path, st, None))
+    return fp, items
+
+
+def fingerprint_paths(paths: list) -> list:
+    """Just the fingerprint half of scan_selection() -- used to baseline the
+    watcher against files/folders we placed on the clipboard ourselves."""
+    return scan_selection(paths)[0]
+
+
 class ClipboardWatcher:
     READ_FAIL_WARN_AT = 5
     # OS screenshot tools (notably macOS Screenshot.app) drop several
@@ -1067,16 +1160,10 @@ class ClipboardWatcher:
         # re-read bytes every poll nor re-detect an unchanged selection.
         self._last_file_fp: Optional[list] = None
         self._last_file_hash: Optional[str] = None
-        # Seed the baseline from whatever is already on the clipboard so we
-        # do not fire a spurious initial send at startup.
-        seed = []
-        for _path in grab_clipboard_files() or []:
-            try:
-                stat = os.stat(_path)
-            except OSError:
-                continue
-            seed.append((_path, stat.st_size, stat.st_mtime_ns))
-        self._last_file_fp = seed or None
+        # Seed the baseline from whatever is already on the clipboard so we do
+        # not fire a spurious initial send at startup. A folder contributes its
+        # expanded tree, exactly like _check_file_clipboard computes it.
+        self._last_file_fp = fingerprint_paths(grab_clipboard_files() or []) or None
 
     def _safe_paste(self) -> Optional[str]:
         try:
@@ -1152,18 +1239,9 @@ class ClipboardWatcher:
         paths = await asyncio.to_thread(grab_clipboard_files)
         if not paths:
             return
-        # Build the ORDERED fingerprint for the WHOLE selection. A path that
-        # vanished between grab and stat drops out of both fingerprint and
-        # candidate list.
-        fp = []
-        statted = []  # (path, os.stat_result) in selection order
-        for path in paths:
-            try:
-                stat = await asyncio.to_thread(os.stat, path)
-            except OSError:
-                continue
-            fp.append((path, stat.st_size, stat.st_mtime_ns))
-            statted.append((path, stat))
+        # One stat pass over the selection, expanding folders as we go, so a
+        # tree is walked once per CHANGED selection, not once per poll.
+        fp, items = await asyncio.to_thread(scan_selection, paths)
         if not fp:
             return
         if fp == self._last_file_fp:
@@ -1172,15 +1250,36 @@ class ClipboardWatcher:
         # never re-detected and retried every poll cycle (folder-skip design).
         self._last_file_fp = fp
 
-        # Filter folders (each named once), then greedily accept files in
-        # selection order while sum(raw) <= FILE_BUDGET and count <= cap.
-        skipped_folders = []
-        accepted = []  # (name, raw_bytes)
+        # Selection order, each item consuming the remaining budget/count: a
+        # folder is ALL-OR-NOTHING, loose files stay greedy per file.
+        accepted = []  # (name, raw_bytes, relpath | None)
         skipped_count = 0
         total = 0
-        for path, stat in statted:
-            if stat_mod.S_ISDIR(stat.st_mode):
-                skipped_folders.append(os.path.basename(path.rstrip("/\\")) or path)
+        for path, stat, entries in items:
+            if entries is not None:
+                folder_name = os.path.basename(path.rstrip("/\\")) or path
+                if not entries:
+                    await self._notify_file_skipped(
+                        "folder is empty; nothing to sync")
+                    continue
+                if not folder_fits(entries, total, len(accepted)):
+                    await self._notify_file_skipped(
+                        f"folder too large to sync: {folder_name}")
+                    continue
+                for full, size, _mtime, rel in entries:
+                    try:
+                        data = await asyncio.to_thread(Path(full).read_bytes)
+                    except OSError as exc:
+                        # Admission already passed on the pre-flight sizes; a
+                        # single unreadable file is logged and dropped from the
+                        # tree rather than failing the whole folder.
+                        log.warning(f"file read failed for {full!r}: {exc}; skipping")
+                        continue
+                    total += size
+                    accepted.append((
+                        unicodedata.normalize("NFC", os.path.basename(full)),
+                        data, rel,
+                    ))
                 continue
             if len(accepted) >= MAX_FILES_PER_CLIP:
                 skipped_count += 1
@@ -1200,17 +1299,6 @@ class ClipboardWatcher:
             name = unicodedata.normalize("NFC", os.path.basename(path))
             accepted.append((name, data, None))
 
-        if skipped_folders:
-            if len(skipped_folders) == 1:
-                await self._notify_file_skipped(
-                    "folder not synced — folders are not supported: "
-                    f"{skipped_folders[0]}"
-                )
-            else:
-                await self._notify_file_skipped(
-                    f"{len(skipped_folders)} folders not synced — "
-                    "folders are not supported"
-                )
         if skipped_count:
             await self._notify_file_skipped(
                 f"{skipped_count} file(s) skipped (too large to sync)"
@@ -1218,7 +1306,9 @@ class ClipboardWatcher:
 
         if not accepted:
             return
-        if len(accepted) == 1:
+        # A lone LOOSE file keeps the legacy kind:"file" frame; a one-file
+        # folder must stay kind:"files" or its path would be dropped.
+        if len(accepted) == 1 and accepted[0][2] is None:
             self._last_file_hash = sha256_bytes(accepted[0][1])
             try:
                 await self.on_change("file", (accepted[0][0], accepted[0][1]))
@@ -1446,6 +1536,22 @@ def files_variant_for_link(link) -> str:
     """Which payload variant a multi-file clip takes on this link:
     "files" for a protocol >= 1.1 peer, else the first-file "file" fallback."""
     return "files" if (link.peer_protocol_minor or 0) >= 1 else "file"
+
+
+def clip_has_folder_entries(data: list) -> bool:
+    """True when any entry of a files clip came out of a copied folder."""
+    return any(entry_relpath(ent) for ent in data)
+
+
+def first_loose_entry(data: list) -> Optional[tuple]:
+    """The (name, raw) a protocol-1.0 peer gets as the legacy first-file
+    fallback. Folder-derived entries are EXCLUDED -- a stray fragment of
+    someone's tree is worse than nothing -- so a folder-only clip yields None
+    and that link is skipped (log only)."""
+    for ent in data:
+        if entry_relpath(ent) is None:
+            return (ent[0], ent[1])
+    return None
 
 
 def size_skip_message(names: list) -> Optional[str]:
@@ -2166,18 +2272,24 @@ class LinkManager:
         across links for a single toast each. The global echo check is done by
         the caller. Each distinct payload variant ("files" for a protocol >=
         1.1 peer, the first-file "file" fallback otherwise) is encoded at most
-        once per broadcast and reused for both the size gate and the send."""
+        once per broadcast and reused for both the size gate and the send.
+
+        Folder-derived entries are excluded from the minor-0 fallback, so a
+        folder-only clip sends NOTHING on such a link; a minor 1-2 peer gets
+        the same frame and flattens it (logged once per clip per link)."""
         sent_full = sent_fallback = max_dropped = 0
         skipped: list = []
         frames: dict = {}
+        folder_clip = clip_has_folder_entries(data)
 
         def frame_for(variant: str) -> Optional[bytes]:
             if variant not in frames:
                 if variant == "files":
                     payload = build_clip_payload("files", data)
                 else:
-                    payload = build_clip_payload(
-                        "file", (data[0][0], bytes(data[0][1])))
+                    loose = first_loose_entry(data)
+                    payload = None if loose is None else build_clip_payload(
+                        "file", (loose[0], bytes(loose[1])))
                 frames[variant] = None if payload is None else encode_frame(payload)
             return frames[variant]
 
@@ -2187,7 +2299,16 @@ class LinkManager:
             variant = files_variant_for_link(link)
             frame = frame_for(variant)
             if frame is None:
+                if variant == "file" and folder_clip:
+                    log.info(
+                        f"folder-only clip not sent to {link.peer_name!r} "
+                        "(peer protocol 1.0)"
+                    )
                 continue
+            if (folder_clip and variant == "files"
+                    and (link.peer_protocol_minor or 0) < 3):
+                log.info(
+                    f"peer {link.peer_name} will flatten folders (protocol < 1.3)")
             if not self._gate(link, frame, skipped):
                 continue
             try:
@@ -2625,7 +2746,9 @@ async def send_files_to_link(link, data) -> tuple:
     """Per-link minor gating for a multi-file clip (NO echo check), on ONE
     link:
       minor >= 1 -> one kind:"files" clip, returns ("files", len(data)).
-      minor 0    -> first file as legacy kind:"file", returns ("file", dropped).
+      minor 0    -> first LOOSE file as legacy kind:"file", returns
+                    ("file", dropped); a folder-only clip has no loose file,
+                    so nothing is sent and it returns ("skipped", 0).
 
     The mesh fan-out does not call this -- LinkManager.broadcast_files picks
     the same variant via files_variant_for_link() but encodes each variant
@@ -2635,17 +2758,24 @@ async def send_files_to_link(link, data) -> tuple:
     if files_variant_for_link(link) == "files":
         await link.send_clip("files", data)
         return ("files", len(data))
-    await link.send_clip("file", (data[0][0], bytes(data[0][1])))
+    loose = first_loose_entry(data)
+    if loose is None:
+        log.info(
+            f"folder-only clip not sent to {link.peer_name!r} (peer protocol 1.0)")
+        return ("skipped", 0)
+    await link.send_clip("file", (loose[0], bytes(loose[1])))
     return ("file", len(data) - 1)
 
 
 async def emit_files_clip(link, suppressor, data) -> tuple:
     """Single-link send decision + echo suppression. ``data`` is
-    [(name, raw_bytes), ...] with len >= 2. Returns:
+    [(name, raw_bytes, relpath|None), ...] with len >= 2. Returns:
       ("suppressed", 0) -- echo of a just-received set; nothing sent.
       ("files", n)      -- sent all n files as one kind:"files" clip.
-      ("file", dropped) -- peer protocol_minor 0; sent the first file as a
-                           legacy kind:"file" clip; ``dropped`` others not sent.
+      ("file", dropped) -- peer protocol_minor 0; sent the first LOOSE file as
+                           a legacy kind:"file" clip; ``dropped`` others not sent.
+      ("skipped", 0)    -- peer protocol_minor 0 and the clip is folder-only;
+                           nothing sent on this link.
     """
     hashes = [sha256_bytes(bytes(ent[1])) for ent in data]
     aggregate = aggregate_files_hash(hashes)

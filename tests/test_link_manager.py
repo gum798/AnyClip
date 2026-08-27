@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import socket
 import types
 
@@ -281,3 +282,68 @@ def test_idle_link_watchdog_fires_only_at_zero_active_links():
         assert beacon2.refreshes >= 1
         assert raised  # escalated to a daemon bounce after the refresh budget
     asyncio.run(go())
+
+
+# ---- folder fallback matrix (protocol 1.3) -----------------------------
+
+def test_folder_entries_are_excluded_from_the_minor0_fallback(caplog):
+    async def go():
+        caplog.set_level(logging.INFO, logger="anyclip")
+        mgr = LinkManager(_cfg(), "node-self", None)
+        old = FakeLink(minor=0, name="old")
+        mid = FakeLink(minor=1, name="mid")
+        new = FakeLink(minor=3, name="new")
+        mgr._links = {"o": old, "m": mid, "n": new}
+        data = [("a.txt", b"one", "docs/a.txt"), ("loose.txt", b"two", None)]
+
+        full, fallback, dropped, skipped = await mgr.broadcast_files(data)
+
+        assert full == 2 and fallback == 1 and dropped == 1 and skipped == []
+        kind, payload = old.sent[0]
+        assert kind == "file" and payload["name"] == "loose.txt"  # NOT a.txt
+        # Minor 1-2 peers get the SAME frame and flatten it benignly.
+        kind, payload = mid.sent[0]
+        assert kind == "files" and payload["files"][0]["path"] == "docs/a.txt"
+        assert "peer mid will flatten folders (protocol < 1.3)" in caplog.text
+        assert "peer new will flatten folders" not in caplog.text
+    asyncio.run(go())
+
+
+def test_folder_only_clip_sends_nothing_to_a_minor0_peer(caplog):
+    async def go():
+        caplog.set_level(logging.INFO, logger="anyclip")
+        mgr = LinkManager(_cfg(), "node-self", None)
+        old = FakeLink(minor=0, name="old")
+        new = FakeLink(minor=3, name="new")
+        mgr._links = {"o": old, "n": new}
+        data = [("a.txt", b"one", "docs/a.txt")]
+
+        full, fallback, dropped, skipped = await mgr.broadcast_files(data)
+
+        assert full == 1 and fallback == 0 and dropped == 0 and skipped == []
+        assert old.sent == [] and old.active and not old.closed  # link kept
+        assert "folder-only clip not sent to 'old'" in caplog.text
+    asyncio.run(go())
+
+
+def test_no_flatten_log_for_a_clip_without_folders(caplog):
+    async def go():
+        caplog.set_level(logging.INFO, logger="anyclip")
+        mgr = LinkManager(_cfg(), "node-self", None)
+        mid = FakeLink(minor=1, name="mid")
+        mgr._links = {"m": mid}
+        await mgr.broadcast_files([("a.txt", b"one"), ("b.txt", b"two")])
+        assert "will flatten folders" not in caplog.text
+    asyncio.run(go())
+
+
+def test_first_loose_entry_and_folder_detection():
+    folder_only = [("a.txt", b"one", "docs/a.txt")]
+    mixed = folder_only + [("b.txt", b"two", None)]
+    legacy = [("a.txt", b"one"), ("b.txt", b"two")]
+    assert anyclip.first_loose_entry(folder_only) is None
+    assert anyclip.first_loose_entry(mixed) == ("b.txt", b"two")
+    assert anyclip.first_loose_entry(legacy) == ("a.txt", b"one")
+    assert anyclip.clip_has_folder_entries(folder_only)
+    assert anyclip.clip_has_folder_entries(mixed)
+    assert not anyclip.clip_has_folder_entries(legacy)

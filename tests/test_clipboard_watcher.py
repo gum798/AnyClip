@@ -42,12 +42,10 @@ def _make_watcher(on_change=None, on_file_skipped=None) -> ClipboardWatcher:
 
 
 @pytest.mark.asyncio
-async def test_directory_skipped_with_single_notice(monkeypatch, tmp_path):
-    """A directory on the clipboard is skipped once, with feedback,
-    and is NOT retried on subsequent polls (regression: infinite
-    EISDIR retry loop)."""
-    changes = []
-    skipped = []
+async def test_empty_folder_toasts_and_sends_nothing(monkeypatch, tmp_path):
+    """A folder with nothing syncable in it toasts once and is NOT retried
+    on subsequent polls (regression: infinite EISDIR retry loop)."""
+    changes, skipped = [], []
 
     async def on_change(kind, data):
         changes.append((kind, data))
@@ -56,17 +54,14 @@ async def test_directory_skipped_with_single_notice(monkeypatch, tmp_path):
         skipped.append(message)
 
     watcher = _make_watcher(on_change, on_file_skipped=on_skip)
-    folder = tmp_path / "TODO"
+    folder = tmp_path / "Inbox"
     folder.mkdir()
     monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(folder)])
 
     await watcher._check_file_clipboard()
     assert changes == []
-    assert len(skipped) == 1
-    assert "TODO" in skipped[0]
+    assert skipped == ["folder is empty; nothing to sync"]
 
-    # Second poll with the same directory: fingerprint must have been
-    # updated, so no re-detection, no second notice.
     await watcher._check_file_clipboard()
     assert changes == []
     assert len(skipped) == 1
@@ -211,6 +206,8 @@ async def test_multiple_files_emitted_as_files_kind(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_folder_mixed_with_files(monkeypatch, tmp_path):
+    """A folder now EXPANDS instead of being skipped; loose files in the same
+    selection keep their flat (pathless) entries, in selection order."""
     changes, skipped = [], []
 
     async def on_change(kind, data):
@@ -220,15 +217,21 @@ async def test_folder_mixed_with_files(monkeypatch, tmp_path):
         skipped.append(message)
 
     watcher = _make_watcher(on_change, on_file_skipped=on_skip)
-    folder = tmp_path / "docs"; folder.mkdir()
+    folder = tmp_path / "docs"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "one.txt").write_bytes(b"1")
+    (folder / "sub" / "two.txt").write_bytes(b"2")
     f1 = tmp_path / "a.txt"; f1.write_bytes(b"one")
-    f2 = tmp_path / "b.txt"; f2.write_bytes(b"two")
     monkeypatch.setattr(anyclip, "grab_clipboard_files",
-                        lambda: [str(folder), str(f1), str(f2)])
+                        lambda: [str(folder), str(f1)])
 
     await watcher._check_file_clipboard()
-    assert changes == [("files", [("a.txt", b"one", None), ("b.txt", b"two", None)])]
-    assert any("docs" in m for m in skipped)
+    assert changes == [("files", [
+        ("one.txt", b"1", "docs/one.txt"),
+        ("two.txt", b"2", "docs/sub/two.txt"),
+        ("a.txt", b"one", None),
+    ])]
+    assert skipped == []
 
 
 @pytest.mark.asyncio
@@ -342,3 +345,127 @@ async def test_single_survivor_falls_back_to_file_kind(monkeypatch, tmp_path):
     await watcher._check_file_clipboard()
     assert changes == [("file", ("a.txt", b"12345678"))]
     assert any("skipped" in m for m in skipped)
+
+
+@pytest.mark.asyncio
+async def test_folder_expansion_is_not_re_detected_but_edits_are(
+    monkeypatch, tmp_path,
+):
+    changes = []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    watcher = _make_watcher(on_change)
+    folder = tmp_path / "docs"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "sub" / "b.txt").write_bytes(b"two")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(folder)])
+
+    await watcher._check_file_clipboard()
+    assert len(changes) == 1
+    # Unchanged selection -> the expanded fingerprint matches -> no re-send.
+    await watcher._check_file_clipboard()
+    assert len(changes) == 1
+    # A change DEEP inside the tree does not move the top dir's mtime, but the
+    # expanded fingerprint covers it, so it is picked up.
+    (folder / "sub" / "b.txt").write_bytes(b"two-changed")
+    await watcher._check_file_clipboard()
+    assert len(changes) == 2
+    assert changes[1] == ("files", [("b.txt", b"two-changed", "docs/sub/b.txt")])
+
+
+@pytest.mark.asyncio
+async def test_single_file_folder_stays_a_files_clip(monkeypatch, tmp_path):
+    """A one-file folder must NOT collapse to the legacy kind:"file" frame --
+    that frame has nowhere to carry the path."""
+    changes = []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    watcher = _make_watcher(on_change)
+    folder = tmp_path / "one"
+    folder.mkdir()
+    (folder / "only.txt").write_bytes(b"x")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(folder)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("files", [("only.txt", b"x", "one/only.txt")])]
+
+
+@pytest.mark.asyncio
+async def test_folder_over_budget_is_skipped_whole(monkeypatch, tmp_path):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    monkeypatch.setattr(anyclip, "FILE_BUDGET", 10)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.txt").write_bytes(b"123456")
+    (folder / "b.txt").write_bytes(b"789012")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(folder)])
+
+    await watcher._check_file_clipboard()
+    assert changes == []                       # no partial tree
+    assert skipped == ["folder too large to sync: docs"]
+
+
+@pytest.mark.asyncio
+async def test_loose_files_stay_greedy_while_a_folder_is_all_or_nothing(
+    monkeypatch, tmp_path,
+):
+    """Selection order decides: the loose file eats the budget first, then the
+    folder no longer fits ENTIRELY and is dropped whole."""
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    monkeypatch.setattr(anyclip, "FILE_BUDGET", 10)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    loose = tmp_path / "a.txt"; loose.write_bytes(b"123456")
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "x.txt").write_bytes(b"111")
+    (folder / "y.txt").write_bytes(b"222")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files",
+                        lambda: [str(loose), str(folder)])
+
+    await watcher._check_file_clipboard()
+    assert changes == [("file", ("a.txt", b"123456"))]
+    assert skipped == ["folder too large to sync: docs"]
+
+
+@pytest.mark.asyncio
+async def test_folder_over_the_file_count_cap_is_skipped_whole(
+    monkeypatch, tmp_path,
+):
+    changes, skipped = [], []
+
+    async def on_change(kind, data):
+        changes.append((kind, data))
+
+    async def on_skip(message):
+        skipped.append(message)
+
+    monkeypatch.setattr(anyclip, "MAX_FILES_PER_CLIP", 2)
+    watcher = _make_watcher(on_change, on_file_skipped=on_skip)
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    for i in range(3):
+        (folder / f"{i}.txt").write_bytes(b"x")
+    monkeypatch.setattr(anyclip, "grab_clipboard_files", lambda: [str(folder)])
+
+    await watcher._check_file_clipboard()
+    assert changes == []
+    assert skipped == ["folder too large to sync: docs"]

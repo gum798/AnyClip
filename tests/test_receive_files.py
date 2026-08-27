@@ -97,3 +97,13 @@ def test_update_local_files_writes_uniquifies_and_baselines(monkeypatch, tmp_pat
     assert os.path.basename(placed["path"]) == "dup.txt"
     assert isinstance(watcher._last_file_fp, list) and len(watcher._last_file_fp) == 1
     assert watcher._last_file_fp[0][0].endswith("dup.txt")
+
+
+def test_emit_files_old_peer_skips_a_folder_only_clip():
+    async def go():
+        link = _FakeLink(minor=0)
+        data = [("a.txt", b"one", "docs/a.txt")]
+        assert await anyclip.emit_files_clip(
+            link, EchoSuppressor(), data) == ("skipped", 0)
+        assert link.sent == []
+    asyncio.run(go())
