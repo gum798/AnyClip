@@ -983,6 +983,15 @@ def uniquify_names(names: list) -> list:
     return result
 
 
+def uniquify_against(name: str, used) -> str:
+    """``uniquify_names`` for ONE more name against a set of names already
+    taken. Returns ``name`` when it is free, else the first ' (2)', ' (3)', ...
+    variant that is not, with the counter placed exactly where uniquify_names
+    puts it, so a collision with the batch and a collision with what is already
+    on disk read the same on screen."""
+    return uniquify_names(sorted(used) + [name])[-1]
+
+
 # Wire "path" limits for folder entries (protocol 1.3). Keep in lockstep
 # with Swift WireMessage and C# WireMessage.
 MAX_PATH_SEGMENTS = 32
@@ -1183,10 +1192,16 @@ def plan_received_layout(files: list, existing) -> list:
     ``existing`` is the set of names already present in received/. A colliding
     top segment becomes '<top>-2', '<top>-3', ... and the SAME replacement is
     applied to every entry sharing that top, so one clip lands in ONE folder.
-    Loose entries keep the per-file ' (2)' uniquify."""
+    Loose entries keep the per-file ' (2)' uniquify, applied against the batch
+    AND against ``existing``: received/ holds TREES now, so a loose file named
+    like a folder already sitting there would otherwise plan a write straight
+    onto a directory."""
+    existing = set(existing)
     loose_idx = [i for i, ent in enumerate(files) if _writable_relpath(ent) is None]
-    loose = uniquify_names([sanitize_filename(files[i][0]) for i in loose_idx])
-    used = set(existing) | set(loose)
+    loose = uniquify_names(
+        sorted(existing) + [sanitize_filename(files[i][0]) for i in loose_idx]
+    )[len(existing):]
+    used = existing | set(loose)
     tops: dict = {}
     plan: list = [None] * len(files)
     for pos, i in enumerate(loose_idx):
@@ -1207,6 +1222,22 @@ def plan_received_layout(files: list, existing) -> list:
         segments[0] = tops[raw_top]
         plan[i] = ("/".join(segments), segments[0])
     return plan
+
+
+def _write_under(dest, root, data: bytes) -> None:
+    """Write ``data`` to ``dest``, refusing to leave ``root``.
+
+    A symlink sitting AT the destination is removed rather than followed:
+    received/ is our own scratch directory, and write_bytes() would otherwise
+    open through the link and drop peer bytes outside received/. Raises
+    ValueError when the resolved destination escapes ``root`` and OSError when
+    it cannot be written -- either way the caller falls back to a flat name,
+    it never drops the entry."""
+    if dest.is_symlink():
+        log.warning(f"removing symlink in the way of {dest}")
+        dest.unlink()
+    dest.resolve().relative_to(root)
+    dest.write_bytes(data)
 
 
 def received_clip_message(files: list) -> str:
@@ -1504,8 +1535,10 @@ class ClipboardWatcher:
         Entries carrying a path rebuild their folder tree (protocol 1.3);
         entries without one keep the flat behavior. Every destination is
         re-checked to stay under received/ after sanitization -- an entry that
-        would escape is written flat instead. macOS places only the FIRST
-        top-level item (AppleScript furl limit); Windows places all. Baselines
+        would escape (or whose write fails for any other reason) is written
+        flat instead -- a failure costs THAT entry its path, never the rest of
+        the clip. macOS places only the FIRST top-level item (AppleScript furl
+        limit); Windows places all. Baselines
         the fingerprint (folders expanded) to what was actually PLACED so the
         files we just wrote are not re-detected. Returns the number of items
         placed on the clipboard (0 on failure)."""
@@ -1518,26 +1551,32 @@ class ClipboardWatcher:
             log.warning(f"file write to {target_dir} failed: {exc}")
             return 0
         plan = plan_received_layout(files, existing)
+        used = existing | {top for _rel, top in plan}
         written: list = []  # absolute top-level paths, first appearance order
-        try:
-            for ent, (rel, top) in zip(files, plan):
-                dest = target_dir / rel
+        for ent, (rel, top) in zip(files, plan):
+            dest = target_dir / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                _write_under(dest, root, bytes(ent[1]))
+            except (OSError, ValueError) as exc:
+                # A destination that escapes received/, that a directory
+                # already occupies, or that simply will not open costs THAT
+                # entry its path -- not the rest of the clip. The flat name is
+                # uniquified against the batch and against what is on disk, so
+                # one fallback can never clobber another entry.
+                log.warning(
+                    f"received path {rel!r} not writable ({exc}); placing flat")
+                top = uniquify_against(sanitize_filename(ent[0]), used)
+                used.add(top)
+                dest = target_dir / top
                 try:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.resolve().relative_to(root)
-                except (OSError, ValueError):
-                    # Never write outside received/: fall back to flat.
-                    log.warning(
-                        f"received path {rel!r} escapes received/; placing flat")
-                    dest = target_dir / sanitize_filename(ent[0])
-                    top = dest.name
-                dest.write_bytes(bytes(ent[1]))
-                top_path = str(target_dir / top)
-                if top_path not in written:
-                    written.append(top_path)
-        except OSError as exc:
-            log.warning(f"file write to {target_dir} failed: {exc}")
-            return 0
+                    _write_under(dest, root, bytes(ent[1]))
+                except (OSError, ValueError) as exc2:
+                    log.warning(f"file write to {dest} failed: {exc2}; entry skipped")
+                    continue
+            top_path = str(target_dir / top)
+            if top_path not in written:
+                written.append(top_path)
         if not written:
             return 0
         if sys.platform == "darwin":

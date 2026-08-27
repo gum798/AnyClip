@@ -215,3 +215,91 @@ def test_only_a_lone_placed_loose_file_seeds_the_single_file_slot():
     assert not anyclip.placed_single_loose_file([], 1)      # no entries
     # Legacy 2-tuples read as loose, exactly like entry_relpath().
     assert anyclip.placed_single_loose_file([("a.txt", b"one")], 1)
+
+
+# ---- the write-loop fallback branch -------------------------------------
+
+def test_a_directory_in_the_way_never_aborts_the_rest_of_the_clip(
+    monkeypatch, tmp_path,
+):
+    """A hostile peer can send a file entry whose destination the clip's own
+    earlier entry already created as a DIRECTORY. That one entry must fall
+    back to a flat name; the clip is still written and still placed."""
+    monkeypatch.setattr(anyclip, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(anyclip.sys, "platform", "darwin")
+    placed = {}
+    monkeypatch.setattr(anyclip, "set_clipboard_file",
+                        lambda p: placed.setdefault("path", p) or True)
+    watcher = _make_watcher()
+
+    n = watcher.update_local_files([
+        ("b.txt", b"2", "docs/sub/b.txt"),  # creates the directory docs/sub
+        ("sub", b"1", "docs/sub"),          # ... which is now in the way
+    ])
+
+    received = tmp_path / "received"
+    assert (received / "docs" / "sub" / "b.txt").read_bytes() == b"2"
+    assert (received / "sub").read_bytes() == b"1"  # flat fallback, not dropped
+    assert n == 1
+    assert placed["path"] == str(received / "docs")
+    assert watcher._last_file_fp is not None
+
+
+def test_a_loose_file_named_like_an_existing_folder_is_uniquified(
+    monkeypatch, tmp_path,
+):
+    """No hostile peer needed: received/ can hold TREES now, so a loose file
+    named like one of them used to plan a write straight onto a directory and
+    abort the whole clip."""
+    monkeypatch.setattr(anyclip, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(anyclip.sys, "platform", "darwin")
+    monkeypatch.setattr(anyclip, "set_clipboard_file", lambda p: True)
+    received = tmp_path / "received"
+    (received / "docs").mkdir(parents=True)
+    watcher = _make_watcher()
+
+    n = watcher.update_local_files([("docs", b"x", None), ("ok.txt", b"y", None)])
+
+    assert (received / "docs").is_dir()          # untouched
+    assert (received / "docs (2)").read_bytes() == b"x"
+    assert (received / "ok.txt").read_bytes() == b"y"  # rest of the clip lands
+    assert n == 1
+
+
+def test_a_planted_symlink_never_redirects_received_bytes(monkeypatch, tmp_path):
+    """A symlink sitting at a destination must not carry peer bytes outside
+    received/ -- write_bytes() would happily open through it."""
+    monkeypatch.setattr(anyclip, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(anyclip.sys, "platform", "darwin")
+    monkeypatch.setattr(anyclip, "set_clipboard_file", lambda p: True)
+    received = tmp_path / "received"
+    received.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"original")
+    (received / "notes.txt").symlink_to(outside)
+    watcher = _make_watcher()
+
+    n = watcher.update_local_files([("notes.txt", b"secret", None)])
+
+    assert outside.read_bytes() == b"original"
+    assert n == 1
+    inside = {p.read_bytes() for p in received.iterdir() if p.is_file()
+              and not p.is_symlink()}
+    assert b"secret" in inside
+
+
+def test_write_under_removes_a_symlink_and_refuses_to_leave_the_root(tmp_path):
+    root = (tmp_path / "received")
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"original")
+    link = root / "notes.txt"
+    link.symlink_to(outside)
+
+    anyclip._write_under(link, root.resolve(), b"secret")
+
+    assert outside.read_bytes() == b"original"
+    assert not link.is_symlink()
+    assert link.read_bytes() == b"secret"
+    with pytest.raises(ValueError):
+        anyclip._write_under(tmp_path / "elsewhere.txt", root.resolve(), b"x")
