@@ -96,7 +96,9 @@ def _bare_link(writer=None, send_timeout=1.0):
 def test_frame_caps_and_protocol_minor():
     assert anyclip.MAX_PAYLOAD == 64 * 1024 * 1024 == 67108864
     assert anyclip.LEGACY_MAX_PAYLOAD == 16 * 1024 * 1024 == 16777216
-    assert anyclip.PROTOCOL_MINOR == 2
+    # Cumulative feature level: >= 1 files, >= 2 64 MiB frames (this file),
+    # >= 3 rebuilds folder trees from the per-entry "path".
+    assert anyclip.PROTOCOL_MINOR == 3
 
 
 def test_file_budget_formula_unchanged_against_new_cap():

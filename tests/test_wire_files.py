@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import unicodedata
+
+import pytest
 
 import anyclip
 
@@ -26,10 +29,58 @@ def _capture_link():
     return link, sent
 
 
-def test_protocol_minor_covers_files_and_64mib_frames():
-    # Cumulative feature level: >= 1 accepts kind:"files", >= 2 accepts
-    # frames up to 64 MiB (see tests/test_large_frames.py).
-    assert anyclip.PROTOCOL_MINOR == 2
+def test_protocol_minor_is_three_and_cap_is_five_hundred():
+    # Cumulative feature level: >= 1 accepts kind:"files", >= 2 accepts 64 MiB
+    # frames (tests/test_large_frames.py), >= 3 rebuilds folder trees from the
+    # per-entry "path".
+    assert anyclip.PROTOCOL_MINOR == 3
+    assert anyclip.MAX_FILES_PER_CLIP == 500
+    assert anyclip.FILE_BUDGET == 49_466_572  # formula untouched
+
+
+@pytest.mark.parametrize("path,name", [
+    ("docs/a.txt", "a.txt"),
+    ("docs/sub dir/a.txt", "a.txt"),
+    ("보고서/1분기/요약.pdf", "요약.pdf"),
+    ("a.txt", "a.txt"),                                # single segment is legal
+    ("/".join(["d"] * 31 + ["a.txt"]), "a.txt"),       # exactly 32 segments
+])
+def test_valid_wire_paths(path, name):
+    assert anyclip.is_valid_wire_path(path, name)
+
+
+@pytest.mark.parametrize("path,name", [
+    ("/docs/a.txt", "a.txt"),                          # absolute
+    ("../a.txt", "a.txt"),                             # traversal
+    ("docs/../a.txt", "a.txt"),
+    ("docs/./a.txt", "a.txt"),
+    ("docs//a.txt", "a.txt"),                          # empty segment
+    ("docs\\a.txt", "a.txt"),                          # backslash
+    ("C:/docs/a.txt", "a.txt"),                        # drive letter
+    ("docs/a.txt", "b.txt"),                           # last segment != name
+    ("", "a.txt"),
+    (None, "a.txt"),
+    (42, "a.txt"),
+    ("/".join(["d"] * 32 + ["a.txt"]), "a.txt"),       # 33 segments
+    ("d/" + "x" * 240 + ".txt", "x" * 240 + ".txt"),   # sanitized length > 240
+])
+def test_invalid_wire_paths(path, name):
+    assert not anyclip.is_valid_wire_path(path, name)
+
+
+def test_only_nfc_paths_are_accepted_on_the_wire():
+    nfc = "보고서/요약.pdf"
+    nfd = unicodedata.normalize("NFD", nfc)
+    assert nfd != nfc
+    assert anyclip.is_valid_wire_path(nfc, "요약.pdf")
+    assert not anyclip.is_valid_wire_path(
+        nfd, unicodedata.normalize("NFD", "요약.pdf"))
+
+
+def test_sanitize_relpath_is_per_segment():
+    assert anyclip.sanitize_relpath("docs/con/a:b.txt") == "docs/_con/a_b.txt"
+    assert anyclip.sanitize_relpath(
+        unicodedata.normalize("NFD", "보고서/요약.pdf")) == "보고서/요약.pdf"
 
 
 def test_aggregate_is_order_independent_and_known():
@@ -45,7 +96,64 @@ def test_decode_files_payload_valid():
         {"name": "a", "content": "YWxwaGE=", "hash": "x", "bytes": 5},
         {"name": "b", "content": "YmV0YQ==", "hash": "y", "bytes": 4},
     ]}
-    assert anyclip.decode_files_payload(msg) == [("a", b"alpha"), ("b", b"beta")]
+    assert anyclip.decode_files_payload(msg) == [
+        ("a", b"alpha", None), ("b", b"beta", None),
+    ]
+
+
+def test_decode_files_payload_keeps_a_valid_path():
+    msg = {"type": "clip", "kind": "files", "files": [
+        {"name": "a.txt", "content": "YWxwaGE=", "hash": "x", "bytes": 5,
+         "path": "docs/a.txt"},
+        {"name": "b.txt", "content": "YmV0YQ==", "hash": "y", "bytes": 4},
+    ]}
+    assert anyclip.decode_files_payload(msg) == [
+        ("a.txt", b"alpha", "docs/a.txt"),
+        ("b.txt", b"beta", None),
+    ]
+
+
+@pytest.mark.parametrize("bad", [
+    "../evil.txt", "/etc/evil.txt", "C:/evil.txt", "docs\\evil.txt", 7,
+])
+def test_decode_files_payload_falls_back_to_flat_on_a_bad_path(bad):
+    """A violating path NEVER drops the frame -- that one entry goes flat."""
+    msg = {"type": "clip", "kind": "files", "files": [
+        {"name": "evil.txt", "content": "YWxwaGE=", "hash": "x", "bytes": 5,
+         "path": bad},
+    ]}
+    assert anyclip.decode_files_payload(msg) == [("evil.txt", b"alpha", None)]
+
+
+def test_send_clip_files_emits_path_last_and_only_when_valid():
+    async def go():
+        link, sent = _capture_link()
+        data = [
+            ("a.txt", b"alpha", "docs/a.txt"),
+            ("b.txt", b"beta", None),
+            ("c.txt", b"gamma", "../c.txt"),   # invalid -> field omitted
+        ]
+        await link.send_clip("files", data)
+        entries = sent[0]["files"]
+        assert list(entries[0].keys()) == [
+            "name", "content", "hash", "bytes", "path"]
+        assert entries[0]["path"] == "docs/a.txt"
+        assert list(entries[1].keys()) == ["name", "content", "hash", "bytes"]
+        assert "path" not in entries[2]
+    asyncio.run(go())
+
+
+def test_two_tuple_entries_still_encode_byte_identically():
+    """Loose-file clips keep the exact 1.3.0 wire shape (golden vectors)."""
+    async def go():
+        link, sent = _capture_link()
+        await link.send_clip("files", [("a.bin", b"alpha"), ("b.bin", b"beta")])
+        payload = sent[0]
+        assert list(payload.keys()) == [
+            "type", "kind", "files", "hash", "ts", "bytes"]
+        for ent in payload["files"]:
+            assert list(ent.keys()) == ["name", "content", "hash", "bytes"]
+    asyncio.run(go())
 
 
 def test_decode_files_payload_bad_base64_drops_whole_frame():

@@ -202,7 +202,7 @@ async def test_multiple_files_emitted_as_files_kind(monkeypatch, tmp_path):
                         lambda: [str(f1), str(f2)])
 
     await watcher._check_file_clipboard()
-    assert changes == [("files", [("a.txt", b"one"), ("b.txt", b"two")])]
+    assert changes == [("files", [("a.txt", b"one", None), ("b.txt", b"two", None)])]
 
     # Same selection again -> fingerprint list matches -> no second emission.
     await watcher._check_file_clipboard()
@@ -227,7 +227,7 @@ async def test_folder_mixed_with_files(monkeypatch, tmp_path):
                         lambda: [str(folder), str(f1), str(f2)])
 
     await watcher._check_file_clipboard()
-    assert changes == [("files", [("a.txt", b"one"), ("b.txt", b"two")])]
+    assert changes == [("files", [("a.txt", b"one", None), ("b.txt", b"two", None)])]
     assert any("docs" in m for m in skipped)
 
 
@@ -250,7 +250,7 @@ async def test_budget_greedy_partial_send(monkeypatch, tmp_path):
                         lambda: [str(f1), str(f2), str(f3)])
 
     await watcher._check_file_clipboard()
-    assert changes == [("files", [("a.txt", b"123456"), ("c.txt", b"XY")])]
+    assert changes == [("files", [("a.txt", b"123456", None), ("c.txt", b"XY", None)])]
     assert any("skipped" in m for m in skipped)
 
 
@@ -275,7 +275,7 @@ async def test_sum_exactly_at_budget_is_accepted(monkeypatch, tmp_path):
                         lambda: [str(f1), str(f2)])
 
     await watcher._check_file_clipboard()
-    assert changes == [("files", [("a.bin", b"a" * 6), ("b.bin", b"b" * 6)])]
+    assert changes == [("files", [("a.bin", b"a" * 6, None), ("b.bin", b"b" * 6, None)])]
     assert skipped == []
 
 

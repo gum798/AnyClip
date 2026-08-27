@@ -65,12 +65,14 @@ SERVICE_TYPE = "_anyclip._tcp.local."
 # with releases. PROTOCOL_MAJOR/MINOR are independent: PROTOCOL_MAJOR is the
 # wire-compat key (mismatch = refuse link), PROTOCOL_MINOR is a cumulative
 # feature level: minor >= 1 accepts kind:"files", minor >= 2 accepts frames
-# up to MAX_PAYLOAD (64 MiB) instead of the legacy 16 MiB.
+# up to MAX_PAYLOAD (64 MiB) instead of the legacy 16 MiB, minor >= 3
+# rebuilds folder trees from the optional per-entry "path" field. Minor 3 is
+# a capability MARKER only -- it gates nothing on the send path.
 # CI exports ANYCLIP_BUILD_VERSION from the git tag (without leading "v");
 # local source runs default to a dev marker so handshake logs stay readable.
 APP_VERSION = os.environ.get("ANYCLIP_BUILD_VERSION", "0.0.0-dev")
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 2
+PROTOCOL_MINOR = 3
 # Legacy alias: pre-1.0 peers send a single `version` int. New code treats
 # it as equivalent to protocol_major so old<->new handshakes still link.
 PROTOCOL_VERSION = PROTOCOL_MAJOR
@@ -83,8 +85,10 @@ LEGACY_MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB
 # "files" clip (reserves ~256 KB for the JSON envelope + base64 1.34x). Same
 # value the single-file path used inline. Keep in lockstep with Swift/C#.
 FILE_BUDGET = int((MAX_PAYLOAD - 256 * 1024) * 0.74)  # 49,466,572
-# Sender-side cap on files per clip; the receiver stays lenient.
-MAX_FILES_PER_CLIP = 100
+# Sender-side cap on files per clip; the receiver stays lenient. Raised
+# 100 -> 500 in 1.4.0 because document trees pass 100 easily; FILE_BUDGET
+# is the real limit and its formula is untouched.
+MAX_FILES_PER_CLIP = 500
 DEFAULT_PORT = 24816
 HANDSHAKE_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 5.0
@@ -382,13 +386,16 @@ def aggregate_files_hash(hashes: list) -> str:
 
 
 def decode_files_payload(msg: dict) -> Optional[list]:
-    """Decode a kind:"files" clip into [(name, raw_bytes), ...].
+    """Decode a kind:"files" clip into [(name, raw_bytes, relpath|None), ...].
 
     Strict: any entry with a missing/non-str/non-strict-base64 ``content``,
     a non-object entry, or an empty/missing ``files`` array returns None so
     the caller drops the WHOLE frame (no partial apply). Names come straight
     off the wire (already NFC per the sender); sanitization happens on write.
-    Wire hashes are never trusted -- recomputed downstream from decoded bytes."""
+    The optional ``path`` (protocol 1.3) is verified against every wire rule
+    here: a violating path is downgraded to None -- that entry lands flat --
+    and NEVER drops the frame. Wire hashes are never trusted -- recomputed
+    downstream from decoded bytes."""
     entries = msg.get("files")
     if not isinstance(entries, list) or not entries:
         log.warning("ignoring files clip: empty or non-list 'files' array")
@@ -410,7 +417,14 @@ def decode_files_payload(msg: dict) -> Optional[list]:
         name = ent.get("name")
         if not isinstance(name, str) or not name:
             name = "received.bin"
-        decoded.append((name, raw))
+        relpath = ent.get("path")
+        if relpath is not None and not is_valid_wire_path(relpath, name):
+            log.warning(
+                f"files clip: rejecting path {relpath!r} for {name!r}; "
+                "placing that file flat"
+            )
+            relpath = None
+        decoded.append((name, raw, relpath))
     return decoded
 
 
@@ -966,6 +980,56 @@ def uniquify_names(names: list) -> list:
     return result
 
 
+# Wire "path" limits for folder entries (protocol 1.3). Keep in lockstep
+# with Swift WireMessage and C# WireMessage.
+MAX_PATH_SEGMENTS = 32
+MAX_PATH_CHARS = 240
+
+
+def sanitize_relpath(path: str) -> str:
+    """Per-segment sanitize_filename() over a wire "path", rejoined with '/'.
+    Used for the length rule on both sides and for the on-disk destination."""
+    return "/".join(sanitize_filename(seg) for seg in path.split("/"))
+
+
+def is_valid_wire_path(path, name: str) -> bool:
+    """True when ``path`` obeys EVERY folder-entry rule of protocol 1.3:
+
+    POSIX '/' separators, NFC, relative (no leading '/', no drive letter, no
+    '.'/'..' segments, no empty segments, no backslashes), last segment equal
+    to the entry's ``name``, at most MAX_PATH_SEGMENTS segments, and a
+    sanitized total length of at most MAX_PATH_CHARS characters.
+
+    The sender emits nothing else; the receiver verifies before touching the
+    filesystem and falls back to flat placement for a violating entry. Keep
+    in lockstep with Swift isValidWirePath and C# IsValidWirePath."""
+    if not isinstance(path, str) or not path:
+        return False
+    if path != unicodedata.normalize("NFC", path):
+        return False
+    if "\\" in path or path.startswith("/"):
+        return False
+    if len(path) > 1 and path[1] == ":" and path[0].isalpha():
+        return False
+    segments = path.split("/")
+    if len(segments) > MAX_PATH_SEGMENTS:
+        return False
+    for seg in segments:
+        if not seg or seg in (".", ".."):
+            return False
+    if segments[-1] != name:
+        return False
+    return len(sanitize_relpath(path)) <= MAX_PATH_CHARS
+
+
+def entry_relpath(entry) -> Optional[str]:
+    """The folder path of a files-clip entry, or None for a loose file.
+
+    Canonical entry shape is (name, data, relpath|None); the 2-tuple
+    (name, data) built by older call sites is read as "loose"."""
+    return entry[2] if len(entry) == 3 else None
+
+
 class ClipboardWatcher:
     READ_FAIL_WARN_AT = 5
     # OS screenshot tools (notably macOS Screenshot.app) drop several
@@ -1134,7 +1198,7 @@ class ClipboardWatcher:
             # NFC on the wire (macOS reads filenames in NFD). Keep in lockstep
             # with Swift WireMessage and C# WireMessage.
             name = unicodedata.normalize("NFC", os.path.basename(path))
-            accepted.append((name, data))
+            accepted.append((name, data, None))
 
         if skipped_folders:
             if len(skipped_folders) == 1:
@@ -1157,7 +1221,7 @@ class ClipboardWatcher:
         if len(accepted) == 1:
             self._last_file_hash = sha256_bytes(accepted[0][1])
             try:
-                await self.on_change("file", accepted[0])
+                await self.on_change("file", (accepted[0][0], accepted[0][1]))
             except Exception as exc:
                 log.exception(f"on_change(file) handler failed: {exc}")
         else:
@@ -1237,14 +1301,14 @@ class ClipboardWatcher:
         Windows places all. Baselines the fingerprint to the paths actually
         PLACED on the clipboard so the just-written files are not re-detected.
         Returns the number of files placed on the clipboard (0 on failure)."""
-        names = uniquify_names([sanitize_filename(n) for n, _ in files])
+        names = uniquify_names([sanitize_filename(ent[0]) for ent in files])
         target_dir = LOG_DIR / "received"
         written = []  # absolute path strings, in batch order
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-            for safe, (_orig, data) in zip(names, files):
+            for safe, ent in zip(names, files):
                 target = target_dir / safe
-                target.write_bytes(bytes(data))
+                target.write_bytes(bytes(ent[1]))
                 written.append(str(target))
         except OSError as exc:
             log.warning(f"file write to {target_dir} failed: {exc}")
@@ -1690,19 +1754,31 @@ def build_clip_payload(kind: str, content) -> Optional[dict]:
         hashes = []
         total = 0
         for ent in content:
-            if not isinstance(ent, tuple) or len(ent) != 2:
+            if not isinstance(ent, tuple) or len(ent) not in (2, 3):
                 return
-            name, raw = ent
+            name, raw = ent[0], ent[1]
+            relpath = entry_relpath(ent)
             if not isinstance(name, str) or not isinstance(raw, (bytes, bytearray)):
                 return
             raw_b = bytes(raw)
             h = sha256_bytes(raw_b)
-            files_arr.append({
+            entry = {
                 "name": name,
                 "content": base64.b64encode(raw_b).decode("ascii"),
                 "hash": h,
                 "bytes": len(raw_b),
-            })
+            }
+            # Optional folder path (protocol 1.3), appended LAST and emitted
+            # only when it obeys every wire rule -- so a loose file's entry
+            # stays byte-identical to what 1.3.0 sent and a malformed local
+            # path degrades to flat placement instead of poisoning the frame.
+            if relpath is not None:
+                if is_valid_wire_path(relpath, name):
+                    entry["path"] = relpath
+                else:
+                    log.warning(
+                        f"dropping invalid folder path {relpath!r} for {name!r}")
+            files_arr.append(entry)
             hashes.append(h)
             total += len(raw_b)
         payload = {
@@ -2100,9 +2176,8 @@ class LinkManager:
                 if variant == "files":
                     payload = build_clip_payload("files", data)
                 else:
-                    first_name, first_raw = data[0]
                     payload = build_clip_payload(
-                        "file", (first_name, bytes(first_raw)))
+                        "file", (data[0][0], bytes(data[0][1])))
                 frames[variant] = None if payload is None else encode_frame(payload)
             return frames[variant]
 
@@ -2560,8 +2635,7 @@ async def send_files_to_link(link, data) -> tuple:
     if files_variant_for_link(link) == "files":
         await link.send_clip("files", data)
         return ("files", len(data))
-    first_name, first_raw = data[0]
-    await link.send_clip("file", (first_name, bytes(first_raw)))
+    await link.send_clip("file", (data[0][0], bytes(data[0][1])))
     return ("file", len(data) - 1)
 
 
@@ -2573,7 +2647,7 @@ async def emit_files_clip(link, suppressor, data) -> tuple:
       ("file", dropped) -- peer protocol_minor 0; sent the first file as a
                            legacy kind:"file" clip; ``dropped`` others not sent.
     """
-    hashes = [sha256_bytes(bytes(raw)) for _name, raw in data]
+    hashes = [sha256_bytes(bytes(ent[1])) for ent in data]
     aggregate = aggregate_files_hash(hashes)
     if not suppressor.should_send("files", aggregate):
         return ("suppressed", 0)
@@ -2641,7 +2715,7 @@ async def run(config: Config) -> None:
         elif kind == "files":
             assert isinstance(data, list)
             # data: [(name, raw_bytes), ...] already decoded from the wire.
-            hashes = [sha256_bytes(bytes(raw)) for _name, raw in data]
+            hashes = [sha256_bytes(bytes(ent[1])) for ent in data]
             aggregate = aggregate_files_hash(hashes)
             suppressor.mark_received("files", aggregate)
             placed = await asyncio.to_thread(watcher.update_local_files, data)
@@ -2712,7 +2786,7 @@ async def run(config: Config) -> None:
         elif kind == "files":
             assert isinstance(data, list)
             # Global echo check once; per-link minor gating inside the loop.
-            hashes = [sha256_bytes(bytes(raw)) for _name, raw in data]
+            hashes = [sha256_bytes(bytes(ent[1])) for ent in data]
             aggregate = aggregate_files_hash(hashes)
             if not suppressor.should_send("files", aggregate):
                 log.debug("skip echo of just-received files")
