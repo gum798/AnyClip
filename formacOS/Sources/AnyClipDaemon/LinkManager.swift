@@ -420,9 +420,12 @@ public actor LinkManager {
             let (maybe, dropped) = downgradeForPeer(payload, peerMinor: link.peerProtocolMinor)
             guard let outPayload = maybe else {
                 if hasFolders {
+                    // Reached only when the clip is folder-ONLY: a mixed clip
+                    // still has a loose entry for the fallback. Wording pinned
+                    // in lockstep with anyclip's fan-out.
                     AnyLog.shared.info(
-                        "folder clip not sent to '\(link.peerName)' "
-                        + "(peer protocol 1.0 cannot receive folders)")
+                        "folder-only clip not sent to '\(link.peerName)' "
+                        + "(peer protocol 1.0)")
                 }
                 continue
             }

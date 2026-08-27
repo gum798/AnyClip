@@ -85,9 +85,17 @@ public enum FolderExpander {
             }
             if values?.isDirectory == true {
                 dirs.append((url: child, name: name))
-            } else {
-                files.append((url: child, name: name, size: values?.fileSize ?? 0))
+                continue
             }
+            // A child we could not stat is DROPPED, never shipped as a
+            // zero-size file — an empty file is a lie the receiver cannot tell
+            // from a real one. Mirrors anyclip.expand_folder's
+            // "folder walk: stat failed for ...; skipping".
+            guard let size = values?.fileSize else {
+                AnyLog.shared.warning("folder walk: stat failed for \(child.path); skipping")
+                continue
+            }
+            files.append((url: child, name: name, size: size))
         }
         // Byte-wise per directory, this level's files before its subdirectories:
         // the traversal order is then fully deterministic, which is what makes

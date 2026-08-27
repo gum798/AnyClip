@@ -335,26 +335,35 @@ private func readingConcurrently(
 
     let old = try await rawPeer(port: 28559, token: "tok", nodeID: "o", name: "flat-old", minor: 0)
     let mid = try await rawPeer(port: 28559, token: "tok", nodeID: "m", name: "flat-mid", minor: 2)
-    defer { old.cancel(); mid.cancel() }
-    #expect(await waitUntil { await a.activeLinkCount() == 2 })
+    // Minor 3 is the UPPER bound of the flatten range: it rebuilds trees itself,
+    // so it takes the same frame with NO flatten log. Minor 3 gates nothing.
+    let new = try await rawPeer(port: 28559, token: "tok", nodeID: "n", name: "flat-new", minor: 3)
+    defer { old.cancel(); mid.cancel(); new.cancel() }
+    #expect(await waitUntil { await a.activeLinkCount() == 3 })
 
     let files: [(name: String, data: Data, relPath: String?)] = [
         (name: "a.txt", data: Data("one".utf8), relPath: "docs/a.txt"),
         (name: "b.txt", data: Data("two".utf8), relPath: "docs/sub/b.txt"),
     ]
     let result = await a.broadcast(.files(files))
-    // minor 2 gets the SAME frame, paths intact (it flattens them itself);
-    // minor 0 gets nothing at all, and neither link is dropped.
-    #expect(result.delivered.map(\.peerName) == ["flat-mid"])
+    // minor 2 and minor 3 get the SAME frame, paths intact (minor 2 flattens
+    // them itself); minor 0 gets nothing at all, and no link is dropped.
+    // Link iteration order is dictionary order, so compare as a set.
+    #expect(Set(result.delivered.map(\.peerName)) == ["flat-mid", "flat-new"])
     #expect(result.maxDropped == 0)
     #expect(result.sizeSkipped.isEmpty)
-    let got = try await withTimeout(seconds: 5) { try await mid.receiveMessage() }
-    #expect(got?.kind == "files")
-    #expect(got?.files?.count == 2)
-    #expect(got?.files?[0].path == "docs/a.txt")
-    #expect(sharedLogText().contains("peer flat-mid will flatten folders (protocol < 1.3)"))
-    #expect(sharedLogText().contains("folder clip not sent to 'flat-old'"))
-    #expect(await a.activeLinkCount() == 2)
+    for peer in [mid, new] {
+        let got = try await withTimeout(seconds: 5) { try await peer.receiveMessage() }
+        #expect(got?.kind == "files")
+        #expect(got?.files?.count == 2)
+        #expect(got?.files?[0].path == "docs/a.txt")
+    }
+    let text = sharedLogText()
+    #expect(text.contains("peer flat-mid will flatten folders (protocol < 1.3)"))
+    #expect(!text.contains("peer flat-new will flatten"))   // minor 3 gates nothing
+    // Exact Python wording — cross-implementation contract.
+    #expect(text.contains("folder-only clip not sent to 'flat-old' (peer protocol 1.0)"))
+    #expect(await a.activeLinkCount() == 3)
     await a.shutdown()
 }
 

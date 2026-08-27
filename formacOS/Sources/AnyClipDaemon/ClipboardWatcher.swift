@@ -22,6 +22,16 @@ public struct FileFingerprint: Equatable, Sendable {
     }
 }
 
+/// One item of a scanned selection, in selection order: a loose file
+/// (`entries == nil`) or a folder carrying its expansion. Produced by
+/// `ClipboardWatcher.scan` so no caller ever walks the same tree twice.
+/// Port of the `items` half of anyclip.scan_selection.
+public struct ScannedItem: Sendable {
+    public let url: URL
+    public let size: Int
+    public let entries: [FolderFile]?
+}
+
 /// Polls NSPasteboard for text/image/file changes and applies inbound
 /// updates without echoing them back. Port of anyclip.ClipboardWatcher.
 /// changeCount gating means unchanged clipboards cost one property read
@@ -148,16 +158,17 @@ public final class ClipboardWatcher {
     private func checkFileClipboard() async {
         let urls = Self.grabFileURLs(pasteboard)
         guard !urls.isEmpty else { return }
-        // This stats the selection and re-walks every folder in it, on EVERY
-        // poll — noticing an edit deep inside a tree requires that, and
-        // FolderExpander bails out at the absolute caps so the cost is bounded.
-        // What the comparison below saves is the re-SEND and the re-READ of an
-        // unchanged selection, not the walk.
-        let fingerprints = Self.fingerprints(for: urls)
-        guard fingerprints != lastFileFingerprints else { return }
+        // ONE stat + walk pass per poll, OFF the main actor. The walk does run
+        // on every poll — noticing an edit deep inside a tree requires that —
+        // but FolderExpander bails out at the absolute caps, so its cost is
+        // bounded, and it never blocks the UI. What the comparison below saves
+        // is the re-SEND and the re-READ of an unchanged selection, not the
+        // walk. Mirrors asyncio.to_thread(scan_selection, paths).
+        let scanned = await Self.offMainActor { Self.scan(urls) }
+        guard scanned.fingerprints != lastFileFingerprints else { return }
         // Record FIRST so the same selection is never re-detected (no retry loop),
         // regardless of what we end up sending.
-        lastFileFingerprints = fingerprints
+        lastFileFingerprints = scanned.fingerprints
 
         var sendable: [(name: String, data: Data, relPath: String?)] = []
         var running = 0
@@ -166,11 +177,9 @@ public final class ClipboardWatcher {
         // carries the folder name); empty folders share ONE generic toast.
         var oversizeFolders: [String] = []
         var emptyFolders = 0
-        for url in urls {
-            guard let fp = FileFingerprint(url: url) else { continue }
-            if fp.isDirectory {
-                let top = url.lastPathComponent.precomposedStringWithCanonicalMapping
-                let entries = FolderExpander.walk(url)
+        for item in scanned.items {
+            if let entries = item.entries {
+                let top = item.url.lastPathComponent.precomposedStringWithCanonicalMapping
                 if entries.isEmpty {
                     AnyLog.shared.info("folder \(top) has nothing syncable; skipping")
                     emptyFolders += 1
@@ -190,28 +199,31 @@ public final class ClipboardWatcher {
                 }
                 running += total
                 for entry in entries {
-                    guard let data = try? Data(contentsOf: entry.url) else {
+                    let url = entry.url
+                    guard let data = await Self.offMainActor({ try? Data(contentsOf: url) })
+                    else {
                         // A read failure is per-file, exactly like a loose file:
                         // the rest of the tree still goes.
-                        AnyLog.shared.warning("file read failed for \(entry.url.path); skipping")
+                        AnyLog.shared.warning("file read failed for \(url.path); skipping")
                         continue
                     }
                     sendable.append((
-                        name: entry.url.lastPathComponent.precomposedStringWithCanonicalMapping,
+                        name: url.lastPathComponent.precomposedStringWithCanonicalMapping,
                         data: data, relPath: entry.relPath))
                 }
                 continue
             }
             // Loose files keep today's greedy per-file behaviour.
-            if sendable.count >= Self.maxFilesPerClip || running + fp.size > Self.fileBudget {
+            if sendable.count >= Self.maxFilesPerClip || running + item.size > Self.fileBudget {
                 skippedForSize += 1
                 continue
             }
-            guard let data = try? Data(contentsOf: url) else {
+            let url = item.url
+            guard let data = await Self.offMainActor({ try? Data(contentsOf: url) }) else {
                 AnyLog.shared.warning("file read failed for \(url.path); skipping")
                 continue
             }
-            running += fp.size
+            running += item.size
             sendable.append((name: url.lastPathComponent, data: data, relPath: nil))
         }
         if let onSkipped = callbacks.onFileSkipped {
@@ -297,23 +309,53 @@ public final class ClipboardWatcher {
 
     // MARK: - Pasteboard readers
 
-    /// Fingerprint of a whole selection: every top-level item PLUS every file
-    /// inside a copied folder, so an edit deep in a tree re-triggers a send and
-    /// a just-placed tree cannot echo. The comparison and both baselines
-    /// (startup, inbound placement) go through here, so the two sides always
-    /// see the same shape.
-    nonisolated static func fingerprints(for urls: [URL]) -> [FileFingerprint] {
-        var out: [FileFingerprint] = []
+    /// Stat a whole selection ONCE, expanding any folder in it, and return both
+    /// halves so nothing is walked twice:
+    ///   - fingerprints: every top-level item PLUS every file inside a copied
+    ///     folder, so an edit deep in a tree re-triggers a send and a
+    ///     just-placed tree cannot echo.
+    ///   - items: the same selection in selection order, each folder carrying
+    ///     the expansion the sender then reads from.
+    /// Pure filesystem work: `nonisolated`, and the poll path runs it OFF the
+    /// main actor. Port of anyclip.scan_selection.
+    nonisolated static func scan(
+        _ urls: [URL]
+    ) -> (fingerprints: [FileFingerprint], items: [ScannedItem]) {
+        var fingerprints: [FileFingerprint] = []
+        var items: [ScannedItem] = []
         for url in urls {
+            // A path that vanished between grab and stat drops out of both.
             guard let fp = FileFingerprint(url: url) else { continue }
-            out.append(fp)
-            if fp.isDirectory {
-                for entry in FolderExpander.walk(url) {
-                    if let sub = FileFingerprint(url: entry.url) { out.append(sub) }
-                }
+            fingerprints.append(fp)
+            guard fp.isDirectory else {
+                items.append(ScannedItem(url: url, size: fp.size, entries: nil))
+                continue
             }
+            let entries = FolderExpander.walk(url)
+            for entry in entries {
+                if let sub = FileFingerprint(url: entry.url) { fingerprints.append(sub) }
+            }
+            items.append(ScannedItem(url: url, size: fp.size, entries: entries))
         }
-        return out
+        return (fingerprints, items)
+    }
+
+    /// The fingerprint half of `scan`, for the two baselines (startup and
+    /// inbound placement) that have no use for the expansion. The comparison
+    /// and both baselines go through the same scan, so the two sides always see
+    /// the same shape. Port of anyclip.fingerprint_paths.
+    nonisolated static func fingerprints(for urls: [URL]) -> [FileFingerprint] {
+        scan(urls).fingerprints
+    }
+
+    /// Filesystem work never runs on the main actor: a 500-file tree walk or a
+    /// ~49 MB read would freeze the menu bar for as long as it takes. Mirrors
+    /// the asyncio.to_thread() calls Python wraps scan_selection and
+    /// read_bytes in.
+    private static func offMainActor<T: Sendable>(
+        _ work: @escaping @Sendable () -> T
+    ) async -> T {
+        await Task.detached(priority: .utility) { work() }.value
     }
 
     static func grabFileURLs(_ pb: NSPasteboard) -> [URL] {

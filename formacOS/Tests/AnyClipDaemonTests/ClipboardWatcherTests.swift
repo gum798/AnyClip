@@ -332,6 +332,58 @@ private func sparseFile(_ url: URL, size: Int) throws -> URL {
     #expect(skipped.get() == ["folder too large to sync: huge"])
 }
 
+/// All-or-nothing is measured against what the selection has LEFT, not against
+/// an empty budget: a folder that would fit on its own is still rejected whole
+/// once an earlier item in the selection has eaten the room. Byte-budget arm,
+/// with a nonzero `running`.
+@Test @MainActor func folderThatFitsAloneIsRejectedOnceAPriorFileAteTheBudget() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    let half = ClipboardWatcher.fileBudget / 2 + 1
+    let loose = try sparseFile(dir.appendingPathComponent("first.bin"), size: half)
+    let folder = dir.appendingPathComponent("later", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    // Fits the budget comfortably ON ITS OWN — but not after "first.bin".
+    _ = try sparseFile(folder.appendingPathComponent("inner.bin"), size: half)
+    pb.clearContents()
+    pb.writeObjects([loose as NSURL, folder as NSURL])   // loose file consumes first
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .file(let name, _) = got[0] { #expect(name == "first.bin") }
+    else { Issue.record("expected the loose file only, got \(got)") }
+    #expect(skipped.get() == ["folder too large to sync: later"])
+}
+
+/// Same, file-count arm, with a nonzero `sendable.count`.
+@Test @MainActor func folderThatFitsAloneIsRejectedOncePriorFilesAteTheFileCount() async throws {
+    let pb = privatePasteboard()
+    let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
+    let watcher = makeWatcher(pb, received: tempDir(), changes: changes, skipped: skipped)
+    let dir = tempDir()
+    var urls: [NSURL] = []
+    for i in 0..<(ClipboardWatcher.maxFilesPerClip - 1) {          // 499 loose files
+        let u = dir.appendingPathComponent("f\(i).txt")
+        try Data("x".utf8).write(to: u)
+        urls.append(u as NSURL)
+    }
+    let folder = dir.appendingPathComponent("later", isDirectory: true)
+    _ = try writeFile(folder, "a.txt", "a")                        // 2 files: fits alone,
+    _ = try writeFile(folder, "b.txt", "b")                        // 499 + 2 > 500 does not
+    pb.clearContents()
+    pb.writeObjects(urls + [folder as NSURL])
+    await watcher.pollOnceForTesting()
+    let got = changes.get()
+    #expect(got.count == 1)
+    if case .files(let fs) = got[0] {
+        #expect(fs.count == ClipboardWatcher.maxFilesPerClip - 1)
+        #expect(fs.allSatisfy { $0.relPath == nil })                // no partial tree slipped in
+    } else { Issue.record("expected .files, got \(got)") }
+    #expect(skipped.get() == ["folder too large to sync: later"])
+}
+
 @Test @MainActor func folderOverTheFileCountCapIsSkippedWholly() async throws {
     let pb = privatePasteboard()
     let changes = Locked<[ClipPayload]>([]); let skipped = Locked<[String]>([])
