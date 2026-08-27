@@ -64,6 +64,53 @@ public static class FolderExpander
     public static int CompareUtf8(string a, string b) =>
         Encoding.UTF8.GetBytes(a).AsSpan().SequenceCompareTo(Encoding.UTF8.GetBytes(b));
 
+    /// Pinned toast for a folder whose expansion does not fit the clip. The
+    /// wording is fixed by the design constraints and shared by all three
+    /// implementations, so it lives here rather than inline in the WinForms
+    /// watcher — the platform-neutral suite is the only one that runs everywhere.
+    public static string TooLargeToastMessage(string folderName) =>
+        $"folder too large to sync: {folderName}";
+
+    /// Pinned toast for a selection that held one or more folders with nothing
+    /// syncable in them. AGGREGATED on purpose: the wording names no folder, so
+    /// ONE toast covers however many empty folders a single clip held.
+    public static string EmptyToastMessage() => "folder is empty; nothing to sync";
+
+    /// True only for a REAL symlink or junction — the thing that must never be
+    /// followed. The ReparsePoint ATTRIBUTE is only a cheap PREFILTER, never the
+    /// decision: on Windows it is also set on OneDrive Files On-Demand
+    /// placeholders (the default Windows 11 configuration — hydrated files AND
+    /// directories carry it) and on deduplicated files. Skipping on the
+    /// attribute alone would walk a OneDrive-backed Documents folder as EMPTY
+    /// and fire "folder is empty; nothing to sync" while the Python and Swift
+    /// senders sync the same folder fine.
+    ///
+    /// LinkTarget is what CONFIRMS it: non-null only for a real symlink or
+    /// junction (a DANGLING one included), and reading it never opens, follows
+    /// or hydrates the target. That is exactly the os.path.islink() semantics
+    /// (CPython >= 3.8) the Python sender inherits, so a non-link reparse point
+    /// traverses as an ordinary file or directory on all three.
+    internal static bool IsRealLink(string path, FileAttributes attrs)
+    {
+        if ((attrs & FileAttributes.ReparsePoint) == 0) return false;   // cheap prefilter
+        try
+        {
+            FileSystemInfo info = (attrs & FileAttributes.Directory) != 0
+                ? new DirectoryInfo(path)
+                : new FileInfo(path);
+            return info.LinkTarget is not null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Cannot tell -> refuse to traverse. Treating an unresolvable reparse
+            // point as ordinary could walk straight off the far side of a link.
+            RotatingLog.Shared.Warning(
+                $"folder walk: cannot resolve reparse point {path}: {e.Message}; "
+                + "treating it as a link");
+            return true;
+        }
+    }
+
     /// Pinned wording for an unreadable subdirectory. os.walk swallows scandir
     /// failures by default and Directory.GetFileSystemEntries throws, so
     /// without this an unreadable subtree would simply vanish and a PARTIAL
@@ -173,10 +220,12 @@ public static class FolderExpander
                         $"folder walk: stat failed for {child}: {e.Message}; skipping");
                     continue;
                 }
-                // Checked BEFORE the directory branch: Directory.Exists FOLLOWS
-                // a symlink to a folder, and following one would both leak files
-                // from outside the selection and reintroduce cycles.
-                if ((attrs & FileAttributes.ReparsePoint) != 0)
+                // Checked BEFORE the directory branch: a symlink to a folder
+                // carries Directory|ReparsePoint, and descending into one would
+                // both leak files from outside the selection and reintroduce
+                // cycles. Attribute-prefiltered, LinkTarget-confirmed — see
+                // IsRealLink for why the attribute alone is not the decision.
+                if (IsRealLink(child, attrs))
                 {
                     RotatingLog.Shared.Info(
                         $"folder walk: skipping symlink {child} (never followed)");

@@ -110,6 +110,85 @@ public class FolderExpanderTests
     }
 
     [Fact]
+    public async Task ADirectorySymlinkIsSkippedSoNothingLeaksAndCyclesAreImpossible()
+    {
+        var root = MakeTree("cyclic");
+        Write(root, "keep.txt", "k");
+        var outsideDir = MakeTree("elsewhere");
+        Write(outsideDir, "secret.txt", "s");
+        try
+        {
+            // One link OUT of the selection and one link back to the folder
+            // itself: the first would leak files the user never copied, the
+            // second is an infinite descent.
+            Directory.CreateSymbolicLink(Path.Combine(root, "out"), outsideDir);
+            Directory.CreateSymbolicLink(Path.Combine(root, "self"), root);
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException
+            or PlatformNotSupportedException)
+        {
+            return;   // no symlink privilege on this runner; nothing to assert
+        }
+
+        var plan = await FolderExpander.ExpandAsync(
+            new[] { root }, ClipboardWatcher_FileBudget, 500);
+
+        // A directory symlink carries Directory|ReparsePoint, so the link check
+        // has to run BEFORE the directory branch or the walk descends through it.
+        Assert.Equal(new[] { "cyclic/keep.txt" }, plan.Entries.Select(e => e.RelPath).ToArray());
+        Assert.DoesNotContain(plan.Entries, e => e.Name == "secret.txt");
+    }
+
+    [Fact]
+    public void IsRealLinkTreatsTheAttributeAsAPrefilterNotAsTheDecision()
+    {
+        var dir = TempDir();
+        var ordinary = Path.Combine(dir, "ordinary.txt");
+        File.WriteAllText(ordinary, "x");
+
+        // THE REGRESSION GUARD. Windows sets ReparsePoint on things that are not
+        // links at all — OneDrive Files On-Demand placeholders (the default
+        // Windows 11 configuration, hydrated files and directories alike) and
+        // deduplicated files. A walk that skipped on the attribute ALONE would
+        // see a OneDrive-backed Documents folder as empty and toast
+        // "folder is empty; nothing to sync" while Python and Swift sync it.
+        // Such a placeholder cannot be constructed on this (or any) runner, so
+        // the attribute is injected instead: an ordinary file that merely CLAIMS
+        // the attribute must still not count as a link.
+        Assert.False(FolderExpander.IsRealLink(ordinary, FileAttributes.ReparsePoint));
+        Assert.False(FolderExpander.IsRealLink(
+            dir, FileAttributes.Directory | FileAttributes.ReparsePoint));
+
+        // Without the attribute the prefilter short-circuits — no disk access at all.
+        Assert.False(FolderExpander.IsRealLink(ordinary, FileAttributes.Normal));
+
+        // And a REAL link is still a link, confirmed through LinkTarget (which
+        // never opens, follows or hydrates the target).
+        var link = Path.Combine(dir, "link.txt");
+        try { File.CreateSymbolicLink(link, ordinary); }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException
+            or PlatformNotSupportedException)
+        { return; }
+        Assert.True(FolderExpander.IsRealLink(link, File.GetAttributes(link)));
+
+        // A DANGLING link too: LinkTarget reports the target of a broken link
+        // without throwing, so a walk never has to stat through it to find out.
+        var dangling = Path.Combine(dir, "dangling.txt");
+        File.CreateSymbolicLink(dangling, Path.Combine(dir, "no-such-file.txt"));
+        Assert.True(FolderExpander.IsRealLink(dangling, File.GetAttributes(dangling)));
+    }
+
+    [Fact]
+    public void FolderToastsAreThePinnedWording()
+    {
+        // Constraints-pinned user-facing strings. Asserted HERE (and not only in
+        // the Windows-CI-only watcher suite) so every runner checks the wording.
+        Assert.Equal("folder too large to sync: docs",
+            FolderExpander.TooLargeToastMessage("docs"));
+        Assert.Equal("folder is empty; nothing to sync", FolderExpander.EmptyToastMessage());
+    }
+
+    [Fact]
     public void WirePathForRejectsWhatTheReceiverWouldRejectAndDropsToLoose()
     {
         // The sender MUST NOT emit a path its own validator rejects. A real

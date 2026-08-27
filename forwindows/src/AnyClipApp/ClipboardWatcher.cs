@@ -282,11 +282,14 @@ public sealed class ClipboardWatcher : IClipboardSync
         // files keep the greedy per-file rule and its existing toast. The reads
         // are async, so the UI thread is never blocked on file I/O either.
         var plan = await FolderExpander.ExpandAsync(scan.Items, FileBudget, MaxFilesPerClip);
+        // Both strings are constraints-pinned and built in Core, so the
+        // platform-neutral suite pins the wording even though these dispatch
+        // sites only RUN on Windows.
         foreach (var name in plan.TooLargeFolders)
-            await SafeSkipAsync($"folder too large to sync: {name}");
+            await SafeSkipAsync(FolderExpander.TooLargeToastMessage(name));
         // One toast however many folders came back empty — the wording names none.
         if (plan.EmptyFolders.Count > 0)
-            await SafeSkipAsync("folder is empty; nothing to sync");
+            await SafeSkipAsync(FolderExpander.EmptyToastMessage());
         if (plan.SkippedFiles > 0)
             await SafeSkipAsync($"{plan.SkippedFiles} file(s) skipped (too large to sync)");
 
