@@ -904,6 +904,9 @@ class _BoolSignal:
 _token_loaded_from_config = _BoolSignal()
 
 
+ECHO_SUPPRESS_WINDOW_S = 30.0
+
+
 class EchoSuppressor:
     """Tracks the hash of the last item received from a peer per kind.
 
@@ -911,16 +914,33 @@ class EchoSuppressor:
     bounce a peer's update right back at them. Text and image are
     tracked separately so an inbound text never accidentally masks
     an outbound image (and vice versa).
+
+    Suppression is bounded to ECHO_SUPPRESS_WINDOW_S after the receive:
+    the mechanical echo (our own clipboard write re-observed) always
+    lands within seconds — and each implementation's watcher pre-filters
+    it anyway (content baseline here and in C#, changeCount in Swift),
+    so this class is the backstop for races. Without the window, a user
+    DELIBERATELY re-copying the exact string they last received could
+    never send it back (it hashes identically to the echo), for as long
+    as no other clip arrived. Keep in lockstep with Swift EchoSuppressor
+    and C# EchoSuppressor.
     """
 
     def __init__(self) -> None:
-        self._last: dict = {}  # kind -> hash
+        self._last: dict = {}  # kind -> (hash, monotonic seconds)
 
-    def mark_received(self, kind: str, payload_hash: str) -> None:
-        self._last[kind] = payload_hash
+    def mark_received(self, kind: str, payload_hash: str,
+                      now: Optional[float] = None) -> None:
+        self._last[kind] = (
+            payload_hash, time.monotonic() if now is None else now)
 
-    def should_send(self, kind: str, payload_hash: str) -> bool:
-        return self._last.get(kind) != payload_hash
+    def should_send(self, kind: str, payload_hash: str,
+                    now: Optional[float] = None) -> bool:
+        entry = self._last.get(kind)
+        if entry is None or entry[0] != payload_hash:
+            return True
+        t = time.monotonic() if now is None else now
+        return t - entry[1] > ECHO_SUPPRESS_WINDOW_S
 
 
 _WIN_RESERVED = {

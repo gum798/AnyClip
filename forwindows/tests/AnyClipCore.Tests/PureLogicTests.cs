@@ -6,15 +6,56 @@ namespace AnyClip.Core.Tests;
 
 public class EchoSuppressorTests
 {
+    private const double Window = EchoSuppressor.SuppressWindowSeconds;
+
     [Fact]
     public void TracksPerKind()
     {
         var s = new EchoSuppressor();
-        Assert.True(s.ShouldSend("text", "h1"));
+        Assert.True(s.ShouldSend("text", "h1", now: 0));
+        s.MarkReceived("text", "h1", now: 0);
+        Assert.False(s.ShouldSend("text", "h1", now: 0));
+        Assert.True(s.ShouldSend("text", "h2", now: 0));
+        Assert.True(s.ShouldSend("image", "h1", now: 0));
+    }
+
+    [Fact]
+    public void SuppressesEchoWithinWindow()
+    {
+        var s = new EchoSuppressor();
+        s.MarkReceived("text", "h1", now: 0);
+        Assert.False(s.ShouldSend("text", "h1", now: Window));
+    }
+
+    [Fact]
+    public void DeliberateRecopySendsAfterWindow()
+    {
+        // The 2026-09-02 password bug: the exact string last received from the
+        // peer could never be re-sent, however much later the user re-copied it.
+        var s = new EchoSuppressor();
+        s.MarkReceived("text", "h1", now: 0);
+        Assert.True(s.ShouldSend("text", "h1", now: Window + 0.001));
+        Assert.True(s.ShouldSend("text", "h1", now: 87));
+    }
+
+    [Fact]
+    public void RemarkRearmsWindow()
+    {
+        var s = new EchoSuppressor();
+        s.MarkReceived("text", "h1", now: 0);
+        s.MarkReceived("text", "h1", now: 40);
+        Assert.False(s.ShouldSend("text", "h1", now: 60));
+        Assert.True(s.ShouldSend("text", "h1", now: 40 + Window + 0.001));
+    }
+
+    [Fact]
+    public void DefaultClockSuppressesFreshReceive()
+    {
+        // No explicit now: the real monotonic clock applies; a receive marked
+        // an instant ago must still be suppressed.
+        var s = new EchoSuppressor();
         s.MarkReceived("text", "h1");
         Assert.False(s.ShouldSend("text", "h1"));
-        Assert.True(s.ShouldSend("text", "h2"));
-        Assert.True(s.ShouldSend("image", "h1"));
     }
 }
 
