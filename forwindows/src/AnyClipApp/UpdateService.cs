@@ -5,7 +5,7 @@ using AnyClip.Core;
 namespace AnyClip.App;
 
 /// Real network + process side of updates. Keeps TrayIcon free of IO.
-public sealed class UpdateService(string appVersion)
+public sealed class UpdateService(string appVersion, string stateDir)
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(8) };
 
@@ -23,19 +23,23 @@ public sealed class UpdateService(string appVersion)
     }
 
     /// Spawn the detached upgrade helper, then the caller quits. The helper
-    /// outlives us, runs `scoop update anyclip`, and relaunches the new exe.
+    /// outlives us as a VISIBLE console (see UpdateCommand.WindowsHelperBatch
+    /// for why hidden PowerShell was abandoned), refreshes the Scoop buckets,
+    /// updates anyclip, and relaunches the exe via the `current` junction.
     public void InstallAndRelaunch()
     {
-        string exe = (Environment.ProcessPath ?? Application.ExecutablePath).Replace("'", "''");
-        string script = UpdateCommand.WindowsHelperScript(
-            Environment.ProcessId, "scoop", exe, UpdateChecker.ReleasesPageUrl);
         try
         {
-            Process.Start(new ProcessStartInfo("powershell.exe",
-                $"-NoProfile -WindowStyle Hidden -Command \"{script}\"")
+            string exe = UpdateCommand.ScoopCurrentPath(
+                Environment.ProcessPath ?? Application.ExecutablePath);
+            string logPath = Path.Combine(stateDir, "update.log");
+            string batchPath = Path.Combine(stateDir, "update.cmd");
+            File.WriteAllText(batchPath, UpdateCommand.WindowsHelperBatch(
+                Environment.ProcessId, "scoop", exe,
+                UpdateChecker.ReleasesPageUrl, logPath));
+            Process.Start(new ProcessStartInfo(batchPath)
             {
-                UseShellExecute = false,
-                CreateNoWindow = true,
+                UseShellExecute = true,
             });
         }
         catch (Exception e)

@@ -43,7 +43,7 @@ internal static class Program
         }
 
         var notificationSettings = new NotificationSettings();
-        var updateService = new UpdateService(appVersion);
+        var updateService = new UpdateService(appVersion, stateDir);
         void InstallUpdate() { updateService.InstallAndRelaunch(); Quit(); }
         tray = new TrayIcon(logFile, notificationSettings, appVersion,
             updateService.CheckAsync, InstallUpdate, updateService.OpenReleasesPage, Quit);
