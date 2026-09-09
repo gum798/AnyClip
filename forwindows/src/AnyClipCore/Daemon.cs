@@ -168,20 +168,27 @@ public sealed class Daemon(
             switch (payload)
             {
                 case TextClip t:
-                    RotatingLog.Shared.Info($"<- received text {t.Text.Length} chars from {peer}");
-                    toast($"AnyClip ← {peer}", TextHelpers.Preview(t.Text));
+                    RotatingLog.Shared.Info(
+                        $"<- received text {t.Text.Length} chars from {peer} "
+                        + $"({(ok ? "written to clipboard" : "WRITE FAILED")})");
+                    toast($"AnyClip ← {peer}", ok ? TextHelpers.Preview(t.Text)
+                        : "clipboard write FAILED — see anyclip.log");
                     break;
                 case ImageClip i:
                     RotatingLog.Shared.Info(
                         $"<- received image {i.Png.Length} bytes from {peer} "
                         + $"({(ok ? "written to clipboard" : "WRITE FAILED")})");
-                    toast($"AnyClip ← {peer}", $"image ({i.Png.Length / 1024} KB)");
+                    toast($"AnyClip ← {peer}", ok
+                        ? $"image ({i.Png.Length / 1024} KB)"
+                        : "clipboard write FAILED — see anyclip.log");
                     break;
                 case FileClip f:
                     RotatingLog.Shared.Info(
                         $"<- received file {f.Name} {f.Data.Length} bytes from {peer} "
                         + $"({(ok ? "written to clipboard" : "WRITE FAILED")})");
-                    toast($"AnyClip ← {peer}", $"file: {f.Name} ({f.Data.Length / 1024} KB)");
+                    toast($"AnyClip ← {peer}", ok
+                        ? $"file: {f.Name} ({f.Data.Length / 1024} KB)"
+                        : "clipboard write FAILED — see anyclip.log");
                     break;
                 case FilesClip fsc:
                     var placed = landed!;

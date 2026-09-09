@@ -62,32 +62,78 @@ public sealed class WinFormsClipboard : IWin32Clipboard
         return result.Count > 0 ? result : null;
     });
 
-    public bool SetText(string text) => OnSta(() =>
-    { try { Clipboard.SetText(text); return true; } catch (Exception) { return false; } });
+    public bool SetText(string text) => TrySet("text", () =>
+    {
+        Clipboard.SetText(text);
+        // Read-back: a DLP/security agent that clears or rewrites the
+        // clipboard right after a successful write would otherwise be
+        // indistinguishable from a good sync.
+        if (Clipboard.GetText() != text)
+            throw new InvalidOperationException(
+                "clipboard cleared or altered immediately after write");
+    });
 
-    public bool SetImagePng(byte[] png) => OnSta(() =>
+    public bool SetImagePng(byte[] png) => TrySet("image", () =>
+    {
+        using var ms = new MemoryStream(png);
+        using var image = Image.FromStream(ms);
+        Clipboard.SetImage(image);
+    });
+
+    public bool SetFilePaths(IReadOnlyList<string> paths) => TrySet("files", () =>
+    {
+        var sc = new System.Collections.Specialized.StringCollection();
+        foreach (var p in paths) sc.Add(p);
+        Clipboard.SetFileDropList(sc);
+    });
+
+    /// WinForms Set* already retries CLIPBRD_E_CANT_OPEN internally
+    /// (10 x 100 ms) before throwing; one further beat outlasts agents that
+    /// hold the clipboard just over a second. Failures were swallowed
+    /// unlogged through 1.4.2 — a locked clipboard looked exactly like a
+    /// successful sync — so name the failure and, when possible, the process
+    /// holding the clipboard open. Each attempt is its own STA hop and the
+    /// backoff runs on the calling (daemon) thread: sleeping inside the
+    /// Invoke would stall the message pump while this process may be the
+    /// clipboard owner with unrendered formats, hanging anyone who pastes.
+    private bool TrySet(string kind, Action write)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            Exception? failure = null;
+            bool ok = OnSta(() =>
+            {
+                try { write(); return true; }
+                catch (Exception e) { failure = e; return false; }
+            });
+            if (ok) return true;
+            RotatingLog.Shared.Warning(ClipboardDiagnostics.DescribeWriteFailure(
+                kind, failure!, OpenClipboardOwnerProcess()) + $" (attempt {attempt}/2)");
+            if (attempt >= 2 || !ClipboardDiagnostics.IsRetryable(failure!)) return false;
+            Thread.Sleep(300);
+        }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetOpenClipboardWindow();
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+    /// Name the process that has the clipboard open right now, if any —
+    /// immediately after a failed write this is usually the culprit.
+    private static string? OpenClipboardOwnerProcess()
     {
         try
         {
-            using var ms = new MemoryStream(png);
-            using var image = Image.FromStream(ms);
-            Clipboard.SetImage(image);
-            return true;
+            var h = GetOpenClipboardWindow();
+            if (h == IntPtr.Zero) return null;
+            _ = GetWindowThreadProcessId(h, out uint pid);
+            if (pid == 0) return null;
+            using var p = Process.GetProcessById((int)pid);
+            return $"{p.ProcessName} (pid {pid})";
         }
-        catch (Exception) { return false; }
-    });
-
-    public bool SetFilePaths(IReadOnlyList<string> paths) => OnSta(() =>
-    {
-        try
-        {
-            var sc = new System.Collections.Specialized.StringCollection();
-            foreach (var p in paths) sc.Add(p);
-            Clipboard.SetFileDropList(sc);
-            return true;
-        }
-        catch (Exception) { return false; }
-    });
+        catch { return null; }
+    }
 }
 
 /// Clipboard-change handling with the exact baselines/cooldown/budget
@@ -353,11 +399,12 @@ public sealed class ClipboardWatcher : IClipboardSync
             // expansion included) BEFORE the write, so the placement cannot
             // echo back out. No await between the two.
             _lastFileFingerprints = fingerprints;
-            if (!_clipboard.SetFilePaths(placed.TopPaths))
-                RotatingLog.Shared.Warning("clipboard write (files) failed");
-            // Reported even then: the bytes ARE under received/, so the toast
-            // that names the folder is still true and still useful. Matching
-            // Swift — zeroing here would toast "0 files" for a clip that landed.
+            // A failed CF_HDROP write is logged (in detail, by the clipboard
+            // layer), not returned. `placed` is reported even then: the bytes
+            // ARE under received/, so the toast that names the folder is still
+            // true and still useful. Matching Swift — zeroing here would toast
+            // "0 files" for a clip that landed.
+            _clipboard.SetFilePaths(placed.TopPaths);
             return placed;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -376,9 +423,7 @@ public sealed class ClipboardWatcher : IClipboardSync
                 return Task.FromResult(_clipboard.SetText(t.Text));
             case ImageClip i:
                 _lastImageHash = Hashing.Sha256Hex(i.Png);
-                bool ok = _clipboard.SetImagePng(i.Png);
-                if (!ok) RotatingLog.Shared.Warning("clipboard write (image) failed");
-                return Task.FromResult(ok);
+                return Task.FromResult(_clipboard.SetImagePng(i.Png));
             case FileClip f:
                 try
                 {
@@ -386,9 +431,7 @@ public sealed class ClipboardWatcher : IClipboardSync
                     string target = Path.Combine(_receivedDir, TextHelpers.SanitizeFilename(f.Name));
                     File.WriteAllBytes(target, f.Data);
                     _lastFileFingerprints = FingerprintList(new[] { target });
-                    bool fileOk = _clipboard.SetFilePaths(new[] { target });
-                    if (!fileOk) RotatingLog.Shared.Warning("clipboard write (file) failed");
-                    return Task.FromResult(fileOk);
+                    return Task.FromResult(_clipboard.SetFilePaths(new[] { target }));
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {

@@ -8,6 +8,9 @@ internal sealed class FakeClipboard : IClipboardSync
     public Func<ClipPayload, Task>? OnLocalChange { get; set; }
     public Func<string, Task>? OnFileSkipped { get; set; }
     public List<ClipPayload> Applied { get; } = new();
+    /// When set, ApplyRemoteAsync reports placement failure (the Windows
+    /// clipboard-locked case) while still recording the payload.
+    public bool FailApplies { get; set; }
     /// received/ stand-in: real placement runs in ReceivedTreeTests, so the fake
     /// only has to report a shape the daemon can word a toast from.
     public string ReceivedDir { get; set; } =
@@ -16,7 +19,7 @@ internal sealed class FakeClipboard : IClipboardSync
     public Task<bool> ApplyRemoteAsync(ClipPayload payload)
     {
         lock (Applied) Applied.Add(payload);
-        return Task.FromResult(true);
+        return Task.FromResult(!FailApplies);
     }
     public Task<ReceivedTree.PlacedFiles> ApplyFilesAsync(FilesClip clip)
     {
@@ -158,6 +161,53 @@ public class DaemonTests
             return cond();
         }
         Assert.True(await WaitUntil(() => { lock (notes) return notes.Any(n => n.Contains("1 file")); }));
+
+        cts.Cancel();
+        try { await run; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
+    public async Task InboundTextWriteFailureSurfacesInToast()
+    {
+        // A received text the clipboard layer cannot place must not look like
+        // a success: 1.4.2 and earlier toasted the preview and logged the
+        // receive with no marker, so a locked Windows clipboard was invisible.
+        var stateDir = Path.Combine(Path.GetTempPath(), "anyclip-wfail-" + Guid.NewGuid());
+        var clip = new FakeClipboard { FailApplies = true };
+        var notes = new List<string>();
+        var daemon = new Daemon(
+            new DaemonConfig("wf-token", 28629, "wf", NotificationsEnabled: true),
+            appVersion: "0.0.0-test", stateDir: stateDir,
+            clipboard: clip, mdns: new FakeMdns(), pidLock: new FakePidLock(),
+            primaryIPv4: () => "127.0.0.1",
+            notify: (_, body) => { lock (notes) notes.Add(body); }, onFatal: _ => { });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var run = daemon.RunForeverAsync(cts.Token);
+
+        using var raw = await ConnectWithRetry(28629, cts.Token);
+        await raw.SendFrameAsync(WireMessage.Hello(
+            Hashing.Sha256Hex("wf-token"), "ffffffff-wf", "wf-peer", "0.0.0-test"), cts.Token);
+        _ = await raw.ReceiveMessageAsync(cts.Token); // daemon hello
+
+        await raw.SendFrameAsync(WireMessage.ClipText("hello from peer", 1.0), cts.Token);
+
+        async Task<bool> WaitUntil(Func<bool> cond, double seconds = 10)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < deadline) { if (cond()) return true; await Task.Delay(50); }
+            return cond();
+        }
+        Assert.True(await WaitUntil(() =>
+            { lock (notes) return notes.Any(n => n.Contains("write FAILED")); }),
+            "expected a write-failure toast body");
+
+        // Image placement failures must be equally loud.
+        await raw.SendFrameAsync(
+            WireMessage.ClipImage(new byte[] { 1, 2, 3 }, 2.0), cts.Token);
+        Assert.True(await WaitUntil(() =>
+            { lock (notes) return notes.Count(n => n.Contains("write FAILED")) >= 2; }),
+            "expected an image write-failure toast body");
 
         cts.Cancel();
         try { await run; } catch (OperationCanceledException) { }
