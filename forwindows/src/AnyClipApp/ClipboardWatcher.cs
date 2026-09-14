@@ -314,12 +314,6 @@ public sealed class ClipboardWatcher : IClipboardSync
             () => FolderExpander.ScanSelection(paths, FileBudget, MaxFilesPerClip));
         var fps = scan.Fingerprints;
         if (fps.Count == 0 || fps.SequenceEqual(_lastFileFingerprints)) return;
-        // Record FIRST — the fingerprint is always taken (even if everything is
-        // skipped) so nothing retry-loops. A folder fingerprints as
-        // (path, -1, dir mtime) PLUS one triple per walked file, which the
-        // expansion below never mutates, so an unsyncable or just-sent folder is
-        // not re-detected on the next update.
-        _lastFileFingerprints = fps;
 
         // Folders are EXPANDED, not skipped (protocol 1.3): each becomes a set
         // of entries carrying a "path" relative to the copied folder. This
@@ -328,6 +322,15 @@ public sealed class ClipboardWatcher : IClipboardSync
         // files keep the greedy per-file rule and its existing toast. The reads
         // are async, so the UI thread is never blocked on file I/O either.
         var plan = await FolderExpander.ExpandAsync(scan.Items, FileBudget, MaxFilesPerClip);
+
+        // Record fingerprint only when there are no transient unreadable / locked files.
+        // If a file failed due to temporary lock contention, keeping the previous
+        // baseline allows a subsequent Ctrl+C re-copy to retry immediately once the
+        // file is released or closed. Deterministic skips (oversized folder, empty
+        // folder) have UnreadableFiles empty, so they are baselined and do not retry-loop.
+        if (plan.UnreadableFiles.Count == 0)
+            _lastFileFingerprints = fps;
+
         // Both strings are constraints-pinned and built in Core, so the
         // platform-neutral suite pins the wording even though these dispatch
         // sites only RUN on Windows.
@@ -338,6 +341,11 @@ public sealed class ClipboardWatcher : IClipboardSync
             await SafeSkipAsync(FolderExpander.EmptyToastMessage());
         if (plan.SkippedFiles > 0)
             await SafeSkipAsync($"{plan.SkippedFiles} file(s) skipped (too large to sync)");
+        if (plan.UnreadableFiles.Count == 1)
+            await SafeSkipAsync(FolderExpander.UnreadableToastMessage(
+                Path.GetFileName(plan.UnreadableFiles[0])));
+        else if (plan.UnreadableFiles.Count > 1)
+            await SafeSkipAsync(FolderExpander.UnreadableCountToastMessage(plan.UnreadableFiles.Count));
 
         if (plan.Entries.Count == 0) return;
         // A single LOOSE file keeps the legacy kind:"file" frame; a single

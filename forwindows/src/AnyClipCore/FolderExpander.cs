@@ -50,11 +50,23 @@ public static class FolderExpander
     ///  - SkippedFiles: LOOSE files dropped by the greedy budget/cap, i.e. the
     ///    existing "N file(s) skipped (too large to sync)" toast. A skipped
     ///    folder never lands here — it gets its own toast.
+    ///  - UnreadableFiles: files that failed to read due to I/O or lock contention.
     public sealed record Plan(
         IReadOnlyList<FileEntry> Entries,
         IReadOnlyList<string> TooLargeFolders,
         IReadOnlyList<string> EmptyFolders,
-        int SkippedFiles);
+        int SkippedFiles,
+        IReadOnlyList<string> UnreadableFiles)
+    {
+        public Plan(
+            IReadOnlyList<FileEntry> entries,
+            IReadOnlyList<string> tooLargeFolders,
+            IReadOnlyList<string> emptyFolders,
+            int skippedFiles)
+            : this(entries, tooLargeFolders, emptyFolders, skippedFiles, Array.Empty<string>())
+        {
+        }
+    }
 
     /// Byte-wise comparison of two strings' UTF-8 encodings. The walk order has
     /// to be identical on all three implementations, and UTF-8 byte order is
@@ -75,6 +87,16 @@ public static class FolderExpander
     /// syncable in them. AGGREGATED on purpose: the wording names no folder, so
     /// ONE toast covers however many empty folders a single clip held.
     public static string EmptyToastMessage() => "folder is empty; nothing to sync";
+
+    /// Pinned toast for an individual file that could not be read due to file lock
+    /// or I/O failure.
+    public static string UnreadableToastMessage(string fileName) =>
+        $"file in use or unreadable: {fileName}";
+
+    /// Pinned toast for multiple files that could not be read due to file lock
+    /// or I/O failure.
+    public static string UnreadableCountToastMessage(int count) =>
+        $"{count} files in use or unreadable; skipped";
 
     /// True only for a REAL symlink or junction — the thing that must never be
     /// followed. The ReparsePoint ATTRIBUTE is only a cheap PREFILTER, never the
@@ -328,6 +350,7 @@ public static class FolderExpander
         var entries = new List<FileEntry>();
         var tooLarge = new List<string>();
         var empty = new List<string>();
+        var unreadable = new List<string>();
         int skipped = 0;
         long used = 0;
 
@@ -361,12 +384,13 @@ public static class FolderExpander
                     // a file that vanishes mid-read is a race, not a budget
                     // failure, so it is dropped individually rather than
                     // discarding an otherwise-good tree.
-                    try { data = await File.ReadAllBytesAsync(w.FullPath); }
+                    try { data = await ReadFileBytesSharedAsync(w.FullPath); }
                     catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                     {
                         RotatingLog.Shared.Warning(
                             $"file read failed for {w.FullPath}: {e.Message}; "
                             + $"dropping from {display}");
+                        unreadable.Add(w.FullPath);
                         continue;
                     }
                     readBytes += data.Length;
@@ -396,16 +420,48 @@ public static class FolderExpander
             if (entries.Count >= maxFiles) { skipped++; continue; }
             if (used + item.Size > budget) { skipped++; continue; }
             byte[] bytes;
-            try { bytes = await File.ReadAllBytesAsync(item.Path); }
+            try { bytes = await ReadFileBytesSharedAsync(item.Path); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 RotatingLog.Shared.Warning(
                     $"file read failed for {item.Path}: {e.Message}; skipping");
-                skipped++; continue;
+                unreadable.Add(item.Path);
+                continue;
             }
             used += item.Size;
             entries.Add(new FileEntry(Path.GetFileName(item.Path), bytes));
         }
-        return new Plan(entries, tooLarge, empty, skipped);
+        return new Plan(entries, tooLarge, empty, skipped, unreadable);
+    }
+
+    /// Read file content with FileShare.ReadWrite | FileShare.Delete so that files
+    /// currently held open by applications with write handles (e.g. Excel, Word,
+    /// or preview handlers) can be synced without sharing violations.
+    internal static async Task<byte[]> ReadFileBytesSharedAsync(string path)
+    {
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 64 * 1024,
+            useAsync: true);
+
+        if (stream.Length > int.MaxValue)
+            throw new IOException($"File {path} exceeds maximum supported size");
+
+        int length = (int)stream.Length;
+        byte[] buffer = new byte[length];
+        int totalRead = 0;
+        while (totalRead < length)
+        {
+            int read = await stream.ReadAsync(buffer.AsMemory(totalRead, length - totalRead));
+            if (read == 0) break;
+            totalRead += read;
+        }
+        if (totalRead != length)
+            Array.Resize(ref buffer, totalRead);
+        return buffer;
     }
 }
+

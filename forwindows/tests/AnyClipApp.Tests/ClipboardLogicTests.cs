@@ -322,6 +322,31 @@ public class ClipboardLogicTests
     }
 
     [Fact]
+    public async Task LockedFileEmitsToastAndRetriesOnSubsequentCopyAfterUnlock()
+    {
+        var dir = TempDir();
+        var (w, clip, changes, skipped) = Make(dir);
+        var file = Path.Combine(dir, "locked.xlsx");
+        File.WriteAllText(file, "some data");
+
+        // First copy: file is held with exclusive lock
+        using (var lockStream = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            clip.FilePaths = new List<string> { file };
+            await w.HandleClipboardUpdateAsync();
+            Assert.Empty(changes);
+            Assert.Contains(skipped, s => s == "file in use or unreadable: locked.xlsx");
+        }
+
+        // Second copy: file is now unlocked (Excel closed)
+        // Since fingerprint was not committed on transient failure, copying the same file retries and sends
+        await w.HandleClipboardUpdateAsync();
+        Assert.Single(changes);
+        Assert.Equal("locked.xlsx", ((FileClip)changes[0]).Name);
+    }
+
+
+    [Fact]
     public async Task ApplyRemoteFilesClipWritesAllUniquifiesPlacesAllNoEcho()
     {
         var dir = TempDir();

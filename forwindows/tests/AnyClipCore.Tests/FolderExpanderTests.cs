@@ -457,4 +457,78 @@ public class FolderExpanderTests
             new[] { root, loose }, ClipboardWatcher_FileBudget, 500);
         Assert.NotEqual(first.Fingerprints, second.Fingerprints);
     }
+
+    [Fact]
+    public async Task FileWithOpenWriteHandleCanBeReadWhenShared()
+    {
+        var tempFile = Path.Combine(TempDir(), "excel-locked.xlsx");
+        File.WriteAllText(tempFile, "excel content");
+
+        // Simulate Excel holding a write handle with FileShare.ReadWrite
+        using var writeStream = new FileStream(
+            tempFile,
+            FileMode.Open,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete);
+
+        var plan = await FolderExpander.ExpandAsync(
+            new[] { tempFile }, ClipboardWatcher_FileBudget, 500);
+
+        Assert.Single(plan.Entries);
+        Assert.Equal("excel-locked.xlsx", plan.Entries[0].Name);
+        Assert.Equal("excel content", Encoding.UTF8.GetString(plan.Entries[0].Data));
+        Assert.Empty(plan.UnreadableFiles);
+        Assert.Equal(0, plan.SkippedFiles);
+    }
+
+    [Fact]
+    public async Task FolderWithOpenWriteHandleFileCanBeReadWhenShared()
+    {
+        var root = MakeTree("docs");
+        var tempFile = Write(root, "sheet.xlsx", "sheet data");
+
+        // Simulate Excel holding a write handle inside a folder
+        using var writeStream = new FileStream(
+            tempFile,
+            FileMode.Open,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete);
+
+        var plan = await FolderExpander.ExpandAsync(
+            new[] { root }, ClipboardWatcher_FileBudget, 500);
+
+        Assert.Single(plan.Entries);
+        Assert.Equal("docs/sheet.xlsx", plan.Entries[0].RelPath);
+        Assert.Equal("sheet data", Encoding.UTF8.GetString(plan.Entries[0].Data));
+        Assert.Empty(plan.UnreadableFiles);
+    }
+
+    [Fact]
+    public async Task ExclusiveLockedFileIsReportedAsUnreadableNotBudgetSkipped()
+    {
+        var tempFile = Path.Combine(TempDir(), "exclusive.bin");
+        File.WriteAllText(tempFile, "locked content");
+
+        // Exclusive lock (FileShare.None)
+        using var lockStream = new FileStream(
+            tempFile,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.None);
+
+        var plan = await FolderExpander.ExpandAsync(
+            new[] { tempFile }, ClipboardWatcher_FileBudget, 500);
+
+        Assert.Empty(plan.Entries);
+        Assert.Equal(0, plan.SkippedFiles); // NOT budget skipped
+        Assert.Single(plan.UnreadableFiles);
+        Assert.Equal(tempFile, plan.UnreadableFiles[0]);
+        Assert.Equal(
+            "file in use or unreadable: exclusive.bin",
+            FolderExpander.UnreadableToastMessage("exclusive.bin"));
+        Assert.Equal(
+            "2 files in use or unreadable; skipped",
+            FolderExpander.UnreadableCountToastMessage(2));
+    }
 }
+
