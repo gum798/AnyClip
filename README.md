@@ -66,7 +66,7 @@ anyclip
 패키지 매니저를 쓰지 않을 때의 방법입니다.
 
 1. [최신 릴리스](https://github.com/gum798/AnyClip/releases/latest)에서 OS에 맞는 파일을 다운로드합니다.
-   - macOS (native Swift, 권장): `AnyClip-vX.Y.Z-macos-arm64.zip` (Apple Silicon 전용)
+   - macOS (native Swift, 권장): `AnyClip-vX.Y.Z-macos-universal.zip` (Universal Binary: Apple Silicon 및 Intel Mac 모두 지원)
    - macOS (legacy Python): `AnyClip-vX.Y.Z.dmg` (Apple Silicon 전용)
    - Windows (native C#, 권장): `AnyClip-vX.Y.Z-windows-x64-native.zip` (x64)
    - Windows (legacy Python): `AnyClip-vX.Y.Z-windows-x64.zip` (x64)
@@ -303,7 +303,7 @@ launchctl load ~/Library/LaunchAgents/com.anyclip.plist
 - 폴더 동기화는 파일만 복원 — 빈 폴더와 심볼릭 링크는 제외, 트리 그대로 받으려면 모든 기기가 1.4.0 이상
 - Python 빌드의 macOS 쪽은 클립보드에서 여러 항목을 읽지도 올리지도 못해, 여러 항목을 복사해도 첫 항목만 전송되고 받은 클립도 첫 최상위 항목만 올라감 (네이티브 Swift/C# 빌드는 전부 처리)
 - 코드 서명 없음 — 첫 실행 시 Gatekeeper / SmartScreen 우회 절차 1회 필요
-- macOS arm64 + Windows x64 한정 (Intel Mac, Windows ARM64, Linux/Android/iOS는 향후 phase)
+- macOS (Universal: Apple Silicon + Intel) 및 Windows x64 지원 (Windows ARM64, Linux/Android/iOS는 향후 phase)
 - 평문 JSON 전송 (인증은 해시, 콘텐츠 자체는 암호화 안 됨 — 신뢰 LAN 가정)
 
 ## 네이티브 구현
