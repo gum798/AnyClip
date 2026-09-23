@@ -10,12 +10,12 @@
 
     <item>
       <title>Version 1.4.5</title>
-      <pubDate>Wed, 23 Sep 2026 09:38:27 +0000</pubDate>
+      <pubDate>Wed, 23 Sep 2026 09:43:30 +0000</pubDate>
       <!-- sparkle:version must match CFBundleVersion in the installed
            app. We render the Unix-timestamp build number here so
            Sparkle's monotonic comparison reliably detects newer
            releases regardless of semver pre-release suffixes. -->
-      <sparkle:version>1790156246</sparkle:version>
+      <sparkle:version>1790156541</sparkle:version>
       <sparkle:shortVersionString>1.4.5</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <description><![CDATA[
@@ -27,12 +27,12 @@
         url="https://github.com/gum798/AnyClip/releases/download/v1.4.5/AnyClip-v1.4.5.dmg"
         sparkle:os="macos"
         type="application/octet-stream"
-        sparkle:edSignature="WmxdRIb7lH5qTHTzY5hY8FVRD/faxGuWGdvqha8Jv18PLXsOlE3Yph95p70g7DcLT3Jg4ghFhShmV42XI3QwAQ==" length="52038014" />
+        sparkle:edSignature="BX6do6rcj7jGADrb2i+/Ljy8SmcwAEdAvkZEPjOH2kKo/n43ZJAiD8KWpAc2OF0cfgPjp4BocPIuYTYnn1PKDQ==" length="52037675" />
       <enclosure
         url="https://github.com/gum798/AnyClip/releases/download/v1.4.5/AnyClip-v1.4.5-windows-x64.zip"
         sparkle:os="windows"
         type="application/octet-stream"
-        sparkle:edSignature="Neo7WT6WPga82NwyhDleIXE5opw+Sq6TzKtf5mAzKu9BkHgEmmhhXSOGsyOxCFIQPLvE8eMVSyo7dAsfOo9FDA==" length="23326593" />
+        sparkle:edSignature="RJVbkeCkePk+Y5+VPT8cGzvnRN3175/s0JseFJ/dc4N7ApGtyRiVieT/H41PHEFoST1PxcQNG0jhIbKLAQnpAw==" length="23326902" />
     </item>
   </channel>
 </rss>
