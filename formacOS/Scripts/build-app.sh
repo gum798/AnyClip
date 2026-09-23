@@ -9,11 +9,15 @@ cd "$(dirname "$0")/.."
 VERSION="${ANYCLIP_BUILD_VERSION:-0.0.0-dev}"
 APP="dist/AnyClip.app"
 
-swift build -c release --arch arm64 --arch x86_64
+swift build -c release --arch arm64
+swift build -c release --arch x86_64
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/apple/Products/Release/AnyClipApp "$APP/Contents/MacOS/AnyClip"
+lipo -create \
+    .build/arm64-apple-macosx/release/AnyClipApp \
+    .build/x86_64-apple-macosx/release/AnyClipApp \
+    -output "$APP/Contents/MacOS/AnyClip"
 sed "s/__VERSION__/$VERSION/g" Resources/Info.plist.template \
     > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
